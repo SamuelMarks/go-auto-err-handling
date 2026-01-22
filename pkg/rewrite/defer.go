@@ -4,7 +4,6 @@ import (
 	"go/ast"
 	"go/token"
 
-	"github.com/SamuelMarks/go-auto-err-handling/pkg/imports"
 	"github.com/SamuelMarks/go-auto-err-handling/pkg/refactor"
 	"golang.org/x/tools/go/ast/astutil"
 )
@@ -23,7 +22,7 @@ import (
 // Requirements:
 // 1. The deferred call must return exactly one value of type error.
 // 2. The enclosing function must return named error 'err' (automatically enforced).
-// 3. The 'errors' package is imported (automatically added).
+// 3. The 'errors' package is imported (automatically added by post-processing).
 func (i *Injector) RewriteDefers(file *ast.File) (bool, error) {
 	applied := false
 	var err error
@@ -97,10 +96,6 @@ func (i *Injector) RewriteDefers(file *ast.File) (bool, error) {
 
 		return false
 	})
-
-	if applied {
-		imports.Add(i.Fset, file, "errors")
-	}
 
 	return applied, err
 }

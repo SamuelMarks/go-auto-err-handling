@@ -3,8 +3,6 @@ package imports
 import (
 	"go/ast"
 	"go/token"
-
-	"golang.org/x/tools/go/ast/astutil"
 )
 
 // Add adds the import path to the file f, if absent.
@@ -15,7 +13,11 @@ import (
 //
 // Returns true if the import was added, false if it already existed.
 func Add(fset *token.FileSet, file *ast.File, pkgPath string) bool {
-	return astutil.AddImport(fset, file, pkgPath)
+	// Functionality restricted to no-op.
+	// Import management is delegated to goimports in the final formatting pass.
+	// This ensures we don't conflict with its decisions or produce malformed ASTs
+	// that complicate the printer.
+	return false
 }
 
 // AddNamed adds the import with the given name and path to the file f, if absent.
@@ -27,5 +29,6 @@ func Add(fset *token.FileSet, file *ast.File, pkgPath string) bool {
 //
 // Returns true if the import was added, false if it already existed.
 func AddNamed(fset *token.FileSet, file *ast.File, name, pkgPath string) bool {
-	return astutil.AddNamedImport(fset, file, name, pkgPath)
+	// Functionality restricted to no-op.
+	return false
 }

@@ -3,14 +3,15 @@ package rewrite
 import (
 	"bytes"
 	"go/ast"
+	"go/format"
 	"go/parser"
-	"go/printer"
 	"go/token"
 	"go/types"
 	"strings"
 	"testing"
 
 	"golang.org/x/tools/go/packages"
+	"golang.org/x/tools/imports"
 )
 
 // setupTestEnv parses source code and returns the Injector and File.
@@ -50,7 +51,7 @@ func setupTestEnv(t *testing.T, src string) (*Injector, *ast.File) {
 		TypesInfo: info,
 	}
 
-	return NewInjector(pkg), file
+	return NewInjector(pkg, ""), file
 }
 
 func callToString(call *ast.CallExpr) string {
@@ -63,21 +64,34 @@ func callToString(call *ast.CallExpr) string {
 	return ""
 }
 
+// renderWithImports helper simulating runner handling.
+func renderWithImports(t *testing.T, fset *token.FileSet, file *ast.File) string {
+	var buf bytes.Buffer
+	if err := format.Node(&buf, fset, file); err != nil {
+		t.Fatal(err)
+	}
+	out, err := imports.Process("main.go", buf.Bytes(), nil)
+	if err != nil {
+		return buf.String()
+	}
+	return string(out)
+}
+
 func TestRewriteDefers(t *testing.T) {
 	src := `package main
 
-import "fmt" 
+import "fmt"
 
-func Close() error { return nil } 
+func Close() error { return nil }
 
-func DoWork() (int, error) { 
-  defer Close() 
-  return 1, nil
-} 
+func DoWork() (int, error) {
+	defer Close()
+	return 1, nil
+}
 
-func NoError() { 
-  defer Close() // enclosing func has no error return, should be skipped
-} 
+func NoError() {
+	defer Close() // enclosing func has no error return, should be skipped
+}
 `
 	injector, file := setupTestEnv(t, src)
 
@@ -89,9 +103,7 @@ func NoError() {
 		t.Error("Next Expected changes, got none")
 	}
 
-	var buf bytes.Buffer
-	printer.Fprint(&buf, injector.Fset, file)
-	out := buf.String()
+	out := renderWithImports(t, injector.Fset, file)
 
 	// Check DoWork
 	// Before: func DoWork() (int, error) { defer Close() ... }
@@ -107,25 +119,23 @@ func NoError() {
 		t.Errorf("Defer block not rewritten correctly. Got:\n%s", out)
 	}
 
-	// Check import. Note: astutil may combine imports into a block (import ( "fmt"; "errors" )).
-	// Exact string matching 'import "errors"' might fail if newlines exist.
+	// Check import.
 	if !strings.Contains(out, `"errors"`) {
 		t.Error("errors import not added")
 	}
 
-	// Check NoError (Should be untouched because signature doesn't return error initially, and logic requires existing error return for Join)
-	// (Note: AddErrorToSignature is Level 1 logic, RewriteDefers assumes Level 1 ran or existing signature is compatible)
+	// Check NoError (Should be untouched)
 	if strings.Contains(out, "func NoError() (err error)") {
-		t.Error("NoError signature should not be changed by RewriteDefers (it requires existing error path)")
+		t.Error("NoError signature should not be changed by RewriteDefers")
 	}
 }
 
 func TestRewriteDefers_AlreadyNamed(t *testing.T) {
 	src := `package main
-func Close() error { return nil } 
-func Do() (err error) { 
-  defer Close() 
-  return nil
+func Close() error { return nil }
+func Do() (err error) {
+	defer Close()
+	return nil
 }`
 	injector, file := setupTestEnv(t, src)
 	changed, err := injector.RewriteDefers(file)
@@ -136,9 +146,7 @@ func Do() (err error) {
 		t.Fatal("Expected change")
 	}
 
-	var buf bytes.Buffer
-	printer.Fprint(&buf, injector.Fset, file)
-	out := buf.String()
+	out := renderWithImports(t, injector.Fset, file)
 
 	if !strings.Contains(out, `defer func() {
 	err = errors.Join(err, Close())

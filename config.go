@@ -35,4 +35,13 @@ type Config struct {
 	// By default, commonly ignored functions like fmt.Print* are excluded from analysis to reduce noise.
 	// Setting this flag ensures all unhandled errors are reported/fixed.
 	NoDefaultExclusion bool `name:"no-default-exclusion" help:"Disable the default exclusion list (e.g., fmt.Print*, strings.Builder.Write)."`
+
+	// MainHandler specifies the strategy for handling errors in entry points (main/init).
+	// Options: "log-fatal" (default), "os-exit", "panic".
+	MainHandler string `name:"main-handler" help:"Strategy for handling errors in main/init functions. Options: 'log-fatal', 'os-exit', 'panic'." default:"log-fatal"`
+
+	// ErrorTemplate specifies the wrapping template for return statements.
+	// Placeholders: {return-zero} (zero values of other returns), {func_name} (called function), err (error var).
+	// Default: "{return-zero}, err"
+	ErrorTemplate string `name:"error-template" help:"Template for the return statement. Use {return-zero}, {func_name}, and err placeholders." default:"{return-zero}, err"`
 }

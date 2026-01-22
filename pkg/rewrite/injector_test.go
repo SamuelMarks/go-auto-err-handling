@@ -35,6 +35,7 @@ func parseAndCheck(t *testing.T, source string) (*ast.File, *packages.Package) {
 		Types:      make(map[ast.Expr]types.TypeAndValue),
 		Defs:       make(map[*ast.Ident]types.Object),
 		Uses:       make(map[*ast.Ident]types.Object),
+		Scopes:     make(map[ast.Node]*types.Scope),
 		Selections: make(map[*ast.SelectorExpr]*types.Selection),
 	}
 
@@ -127,7 +128,8 @@ func caseSkip() {
 } 
 `
 	file, pkg := parseAndCheck(t, srcUnique)
-	injector := NewInjector(pkg)
+	// Passing empty string for defaults
+	injector := NewInjector(pkg, "")
 
 	pts := []analysis.InjectionPoint{}
 
@@ -142,7 +144,7 @@ func caseSkip() {
 				assign = a
 			}
 		}
-		pts = append(pts, analysis.InjectionPoint{Stmt: s, Call: c, Assign: assign})
+		pts = append(pts, analysis.InjectionPoint{Stmt: s, Call: c, Assign: assign, Pos: s.Pos()})
 	}
 
 	addPt("f(1)", nil)
@@ -182,4 +184,72 @@ func caseSkip() {
 
 	// Case Skip: Enclosing func caseSkip() returns nothing. Should NOT contain "if err != nil" logic inserted for f(4).
 	// Since caseSkip has no return values, Injector should skip rewrite.
+}
+
+func TestRewriteFile_Shadowing(t *testing.T) {
+	// Scenario: "err" already defined in scope. Injector should use "err1".
+	// We use "err" as an argument to ensure it is in the closest function scope.
+	srcShadow := `package main
+func fail() error { return nil } 
+
+func usage(err int) error { 
+  _ = err
+  fail() // Point 1
+  return nil
+} 
+`
+	file, pkg := parseAndCheck(t, srcShadow)
+	injector := NewInjector(pkg, "")
+
+	pts := []analysis.InjectionPoint{}
+
+	// Locate fail()
+	s, c := findStmt(file, pkg.Fset, "fail()")
+	if s == nil {
+		t.Fatal("stm not found")
+	}
+	pts = append(pts, analysis.InjectionPoint{Stmt: s, Call: c, Pos: s.Pos()})
+
+	changed, err := injector.RewriteFile(file, pts)
+	if err != nil {
+		t.Fatalf("RewriteFile failed: %v", err)
+	}
+	if !changed {
+		t.Fatal("Expected changes")
+	}
+
+	var buf bytes.Buffer
+	printer.Fprint(&buf, pkg.Fset, file)
+	output := buf.String()
+
+	// Parse back the specific output to verify correctness regardless of comments
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "", output, parser.ParseComments)
+	if err != nil {
+		t.Fatalf("Failed to parse output: %v\n%s", err, output)
+	}
+
+	foundErr1Check := false
+	ast.Inspect(f, func(n ast.Node) bool {
+		if ifStmt, ok := n.(*ast.IfStmt); ok {
+			if bin, ok := ifStmt.Cond.(*ast.BinaryExpr); ok {
+				if x, ok := bin.X.(*ast.Ident); ok && x.Name == "err1" {
+					if bin.Op == token.NEQ {
+						if y, ok := bin.Y.(*ast.Ident); ok && y.Name == "nil" {
+							foundErr1Check = true
+						}
+					}
+				}
+			}
+		}
+		return true
+	})
+
+	if !foundErr1Check {
+		t.Errorf("Expected 'if err1 != nil' check. Output:\n%s", output)
+	}
+
+	if !strings.Contains(output, "return err1") {
+		t.Errorf("Expected return using 'err1'.")
+	}
 }

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"go/ast"
 	"go/format"
+	"go/token"
 	"go/types"
 	"log"
 	"os"
@@ -20,6 +21,7 @@ import (
 	"github.com/hexops/gotextdiff/span"
 	"golang.org/x/tools/go/ast/astutil"
 	"golang.org/x/tools/go/packages"
+	"golang.org/x/tools/imports"
 )
 
 type Options struct {
@@ -31,6 +33,8 @@ type Options struct {
 	DryRun              bool
 	NoDefaultExclusion  bool
 	Paths               []string
+	MainHandler         string
+	ErrorTemplate       string
 }
 
 func Run(opts Options) error {
@@ -118,7 +122,7 @@ func applyChanges(pkgMap map[string]*packages.Package, points []analysis.Injecti
 		// Level 0
 		if returnsErr {
 			if opts.LocalPreexistingErr || opts.LocalNonExistingErr || opts.ThirdPartyErr {
-				injector := rewrite.NewInjector(p.Pkg)
+				injector := rewrite.NewInjector(p.Pkg, opts.ErrorTemplate)
 				applied, err := injector.RewriteFile(p.File, []analysis.InjectionPoint{p})
 				if err != nil {
 					return changes, err
@@ -146,7 +150,7 @@ func applyChanges(pkgMap map[string]*packages.Package, points []analysis.Injecti
 
 				// 2. Atomic Body Mutation
 				// Now that signature is updated in AST (but not TypesInfo), we immediately try to fix the call site.
-				injector := rewrite.NewInjector(p.Pkg)
+				injector := rewrite.NewInjector(p.Pkg, opts.ErrorTemplate)
 				appliedBody, err := injector.RewriteFile(p.File, []analysis.InjectionPoint{p})
 				if err != nil {
 					return changes, err
@@ -163,7 +167,7 @@ func applyChanges(pkgMap map[string]*packages.Package, points []analysis.Injecti
 						for _, pkg := range pkgMap {
 							allPkgs = append(allPkgs, pkg)
 						}
-						propagated, err := refactor.PropagateCallers(allPkgs, targetFunc)
+						propagated, err := refactor.PropagateCallers(allPkgs, targetFunc, opts.MainHandler)
 						if err != nil {
 							return changes, fmt.Errorf("propagation failed: %v", err)
 						}
@@ -188,11 +192,12 @@ func printDiffs(pkgs []*packages.Package) error {
 				return fmt.Errorf("failed to read original file %s: %w", filename, err)
 			}
 
-			var buf bytes.Buffer
-			if err := format.Node(&buf, pkg.Fset, astFile); err != nil {
+			// FormatAST handles goimports
+			newContentBytes, err := formatAST(pkg.Fset, astFile, filename)
+			if err != nil {
 				return fmt.Errorf("failed to format AST for %s: %w", filename, err)
 			}
-			newContent := buf.String()
+			newContent := string(newContentBytes)
 
 			if string(originalContent) == newContent {
 				continue
@@ -242,18 +247,39 @@ func savePackageFiles(pkg *packages.Package, written map[string]bool) error {
 			continue
 		}
 
-		f, err := os.Create(filename)
+		// Use formatAST which applies goimports
+		formatted, err := formatAST(pkg.Fset, astFile, filename)
 		if err != nil {
 			return err
 		}
-		if err := format.Node(f, pkg.Fset, astFile); err != nil {
-			f.Close()
+
+		if err := os.WriteFile(filename, formatted, 0644); err != nil {
 			return err
 		}
-		f.Close()
+
 		written[filename] = true
 	}
 	return nil
+}
+
+// formatAST renders the AST to a buffer and then applies imports.Process (goimports).
+func formatAST(fset *token.FileSet, node interface{}, filename string) ([]byte, error) {
+	var buf bytes.Buffer
+	if err := format.Node(&buf, fset, node); err != nil {
+		return nil, fmt.Errorf("ast format failure: %w", err)
+	}
+
+	// Apply goimports
+	// imports.Process() can fix missing imports even if the current source is valid
+	out, err := imports.Process(filename, buf.Bytes(), nil)
+	if err != nil {
+		// If imports processing fails (e.g. syntax error in generated code),
+		// return the error but also maybe the raw code for debugging could be useful.
+		// For now, strict error return.
+		return nil, fmt.Errorf("goimports processing failure: %w", err)
+	}
+
+	return out, nil
 }
 
 func isThirdPartyCall(p analysis.InjectionPoint) bool {
