@@ -2,6 +2,7 @@ package refactor
 
 import (
 	"bytes"
+	"fmt"
 	"go/ast"
 	"go/format"
 	"go/parser"
@@ -13,6 +14,33 @@ import (
 	"golang.org/x/tools/go/packages"
 	"golang.org/x/tools/imports"
 )
+
+// mockImporter satisfies types.Importer to provide a fake "testing" package.
+type mockImporter struct{}
+
+func (m mockImporter) Import(path string) (*types.Package, error) {
+	if path == "testing" {
+		// Return a minimal "testing" package with a "T" type
+		pkg := types.NewPackage("testing", "testing")
+
+		// type T struct{}
+		// Correct way to initialize: Define Named Type matching Object
+		tName := types.NewTypeName(token.NoPos, pkg, "T", nil)
+		tType := types.NewNamed(tName, types.NewStruct(nil, nil), nil)
+
+		// Insert into package scope so it's visible to Check
+		pkg.Scope().Insert(tName)
+
+		// Ensure package is marked complete
+		pkg.MarkComplete()
+
+		// Unused vars check prevention
+		_ = tType
+
+		return pkg, nil
+	}
+	return nil, fmt.Errorf("package %q not found", path)
+}
 
 // Helper to manually construct a package with a target function reference
 func setupPropagateEnv(t *testing.T, src string) (*token.FileSet, *packages.Package, *types.Func) {
@@ -29,8 +57,11 @@ func setupPropagateEnv(t *testing.T, src string) (*token.FileSet, *packages.Pack
 	}
 
 	// We start with a dummy configuration
-	// We need to "fake" the type checking such that the 'target' function is identified.
-	conf := types.Config{Importer: nil}
+	// We use the mock importer to resolve "testing" if needed
+	conf := types.Config{
+		Importer: mockImporter{},
+		Error:    func(err error) { t.Logf("Type check error: %v", err) },
+	}
 	pkg, err := conf.Check("main", fset, []*ast.File{f}, info)
 	if err != nil {
 		t.Fatalf("check failed: %v", err)
@@ -220,6 +251,35 @@ func init() {
 		}
 		// os might not be added if the env doesn't find os.Exit package path, but checking expectation logic
 	})
+}
+
+// TestPropagateCallers_TestInjection verifies that TestX functions get t.Fatal injected.
+func TestPropagateCallers_TestInjection(t *testing.T) {
+	src := `package main
+import "testing" 
+func target() {} 
+func TestFoo(t *testing.T) { 
+  target() // call
+} 
+`
+	fset, pkg, target := setupPropagateEnv(t, src)
+
+	n, err := PropagateCallers([]*packages.Package{pkg}, target, "log-fatal") // Strategy should be ignored in favor of t.Fatal
+	if err != nil {
+		t.Fatalf("PropagateCallers failed: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("Expected 1 update")
+	}
+
+	out := renderWithImports(t, fset, pkg.Syntax[0])
+
+	if !strings.Contains(out, "t.Fatal(err)") {
+		t.Errorf("Expected t.Fatal injection, got:\n%s", out)
+	}
+	if strings.Contains(out, "log.Fatal") {
+		t.Error("Expected log.Fatal to be overridden by test strategy")
+	}
 }
 
 // TestPropagateCallers_NoEnclosingError verifies behavior when caller cannot return error.

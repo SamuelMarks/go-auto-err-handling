@@ -4,175 +4,175 @@ go-auto-err-handling
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache%202.0-blue)](https://opensource.org/license/apache-2-0)
 [![go test](https://github.com/SamuelMarks/go-auto-err-handling/actions/workflows/ci.yml/badge.svg)](https://github.com/SamuelMarks/go-auto-err-handling/actions/workflows/ci.yml)
 
-`go-auto-err-handling` is a powerful static analysis and refactoring tool designed to eliminate technical debt associated with unhandled errors in Go.
+**go-auto-err-handling** is an advanced static analysis and refactoring tool designed to eliminate technical debt
+associated with unhandled errors in Go.
 
-Unlike simple linters that only report ignored errors, this tool **automatically injects the necessary handling code**. It is capable of refactoring function signatures, propagating errors up the call stack, handling deferred errors using `errors.Join`, and intelligently generating zero-values for return statements.
+Unlike standard linters that merely report ignored errors, this tool **automatically injects idiomatic error handling**.
+It intelligently refactors function signatures, propagates errors up the call stack, handles deferred errors via
+[`errors.Join`](https://pkg.go.dev/errors#Join) (Go 1.20+), and strictly adheres to your project's coding standards
+through customizable templates.
+
+## 🏗 Architecture
+
+The tool is built upon `golang.org/x/tools/go/packages` and operates in a stabilizing loop. It modifies the AST (
+Abstract Syntax Tree), type-checks iteratively to ensure safety, and formats the output. FYI: Comments are preserved.
+
+```mermaid
+%%{init: {'theme': 'base', 'themeVariables': { 'fontFamily': 'Google Sans Normal', 'primaryColor': '#4285f4', 'primaryTextColor': '#ffffff', 'primaryBorderColor': '#20344b', 'lineColor': '#20344b', 'secondaryColor': '#f9ab00', 'tertiaryColor': '#ffffff'}}}%%
+graph TD
+%% Define Classes based on Design Codes
+%% Yellow boxes use Navy Blue text for contrast
+    classDef blueBox fill:#4285f4,stroke:#20344b,stroke-width:0px,color:#ffffff,font-family:'Google Sans Medium',rx:5,ry:5;
+    classDef greenBox fill:#34a853,stroke:#20344b,stroke-width:0px,color:#ffffff,font-family:'Google Sans Medium',rx:5,ry:5;
+    classDef yellowBox fill:#f9ab00,stroke:#20344b,stroke-width:0px,color:#20344b,font-family:'Google Sans Medium',rx:5,ry:5;
+    classDef redBox fill:#ea4335,stroke:#20344b,stroke-width:0px,color:#ffffff,font-family:'Google Sans Medium',rx:5,ry:5;
+    classDef navyBox fill:#20344b,stroke:#57caff,stroke-width:0px,color:#ffffff,font-family:'Google Sans Medium',rx:5,ry:5;
+    classDef whiteBox fill:#ffffff,stroke:#20344b,stroke-width:2px,color:#20344b,font-family:'Roboto Mono Normal',stroke-dasharray: 5 5,rx:0,ry:0;
+
+%% Nodes
+    Start([Start Run]):::navyBox
+
+    subgraph Analysis ["1. Analysis"]
+        direction TB
+        Load["Load Packages"]:::yellowBox
+        Detect["Detect Unhandled"]:::yellowBox
+    end
+
+    Decide{{"Check Failure Type"}}:::whiteBox
+
+    subgraph Modifications ["2. Refactoring"]
+        direction TB
+        Sig["1. Change Signature<br/>(Add Return error)"]:::redBox
+        Prop["2. Propagate Callers<br/>(Update Call Sites)"]:::redBox
+
+        Inject["3. Inject Handling<br/>(if err != nil)"]:::blueBox
+        Defer["4. Rewrite Defers<br/>(errors.Join)"]:::blueBox
+    end
+
+    Format["Format & Save"]:::greenBox
+    Stable{{"Is Stable?"}}:::whiteBox
+    End([Done]):::navyBox
+
+%% Edges
+    Start --> Load
+    Load --> Detect
+    Detect --> Decide
+
+%% Logic Flow
+    Decide -- "Void Function" --> Sig
+    Sig --> Prop
+    Prop --> Inject
+
+    Decide -- "Existing Error" --> Inject
+    Decide -- "Defer Stmt" --> Defer
+
+%% Convergence
+    Inject --> Format
+    Defer --> Format
+
+    Format --> Stable
+    Stable -- "Changes Made" --> Load
+    Stable -- "No Changes" --> End
+```
 
 ## 🚀 Key Features
 
-*   **Iterative Refactoring**: Runs in a loop (up to 5 passes) to ensure that changes introduced in one pass (like adding an error return to a function) are correctly handled by callers in the next pass.
-*   **Intelligent Zero-Value Generation**: using `go/types`, it generates correct zero values for return statements (e.g., `return 0, "", nil, err`) based on the specific types defined in your signatures.
-*   **Signature Propagation**: Automatically converts `func Do()` to `func Do() error` if an unhandled error is detected inside, and updates all call sites (`x := Do()` becomes `x, err := Do(); ...`).
-*   **Defer Handling**: Detects ignored errors in `defer` statements and rewrites them to use `errors.Join` (Go 1.20+) to ensure deferred errors are captured in named return variables.
-*   **Main/Init Safety**: Automatically detects entry points (`main()`, `init()`) and injects terminal handling (Log/Fatal/Panic) instead of attempting to change their signatures.
-*   **Custom Templates**: Fully customizable return handling via templates (e.g., wrapping errors with `fmt.Errorf` or generic library wrappers).
-*   **Smart Defaults**: Automatically ignores common "safe" ignored errors (like `fmt.Println` or `bytes.Buffer.Write`) unless configured otherwise.
+* **Recursive Refactoring**: Runs up to 5 passes to ensure that signature changes (adding `error` return types)
+  propagate correctly to all callers and entry points.
+* **Smart Zero-Values**: Uses `pkg/astgen` to calculate valid zero-values (e.g., `return 0, "", nil, err`) for return
+  statements based on `go/types` information.
+* **Panic Conversion**: Can automatically rewrite explicit `panic(err)` calls into `return fmt.Errorf(...)` (via
+  `--panic-to-return`).
+* **Defer Safety**: Rewrites simple `defer f()` calls that return errors into closures using `errors.Join` to ensure
+  deferred errors are captured.
+* **Filter & Compliance**:
+    * Excludes specific files (`*_test.go`, generated files) or symbols (`fmt.Println`) via globs.
+    * Checks for interface compliance to ensure refactoring doesn't break interface implementation contracts.
+* **Entry Point Safety**: Automatically detects `main()` and `init()` and injects terminal handling (Log/Fatal/Exit)
+  instead of changing signatures.
 
 ## 📦 Installation
 
 **Prerequisites**: Go 1.22 or higher.
 
 ```bash
-# Install directly
 go install github.com/SamuelMarks/go-auto-err-handling@latest
-```
-
-Or build from source:
-
-```bash
-git clone https://github.com/SamuelMarks/go-auto-err-handling.git
-cd go-auto-err-handling
-go build -o auto-err
 ```
 
 ## 🛠 Usage
 
-The tool operates in three primary "Levels" of aggressiveness.
+The tool operates with diff-like logic. By default, it runs in **Dry Run** mode to show you what will change.
+
+### Refactoring Strategies (Levels)
+
+1. **Level 0: Local Pre-existing Errors** (`--local-preexisting-err`)
+    * Fixes ignored errors in functions that *already* return an `error`.
+    * *Effect*: Injects `if err := call(); err != nil { return ..., err }`.
+
+2. **Level 1: Local Non-existing Errors** (`--local-nonexisting-err`)
+    * Targets functions that do *not* currently return an error.
+    * *Effect*: Changes signature (`func Foo()` -> `func Foo() error`), updates all returns, and propagates the
+      signature change to all callers recursively.
+
+3. **Level 2: Third Party Errors** (`--third-party-err`)
+    * Treats ignored calls to external libraries (like `os.WriteFile`) as critical, forcing the enclosing function to
+      handle or return the error.
+
+### Common Commands
+
+**Preview changes (Dry Run):**
 
 ```bash
-auto-err [flags] [path/to/packages]
+auto-err --local-nonexisting-err --dry-run ./...
 ```
 
-### Refactoring Strategies
-
-#### Level 0: Local Pre-existing Errors (`--local-preexisting-err`)
-Targets functions that **already return an error** but ignore a specific call inside.
-*   *Action*: Injects `if err := call(); err != nil { return ..., err }`.
-
-#### Level 1: Local Non-existing Errors (`--local-nonexisting-err`)
-Targets functions that **do not** currently return an error.
-*   *Action*:
-    1. Modifies signature to append `error`.
-    2. Updates all `return` statements in the function to include `nil`.
-    3. Injects error handling for the ignored call.
-    4. Recursively updates all callers of this function to handle the new return signature.
-
-#### Level 2: Third Party Errors (`--third-party-err`)
-Targets ignored errors coming from external modules or the standard library (e.g., `os.WriteFile`).
-*   *Action*: Treats 3rd party calls as critical failures and triggers the Level 1 propagation logic to hoist the error up the stack.
-
-### Deferred Error Handling
-The tool automatically scans for `defer f()` calls where `f` returns an error. It refactors the enclosing function to use **named returns** and injects `errors.Join`.
-
-**Before:**
-```go
-func process() error {
-    defer file.Close() // returns error, currently ignored
-    return nil
-}
-```
-
-**After:**
-```go
-func process() (err error) {
-    defer func() {
-        err = errors.Join(err, file.Close())
-    }()
-    return nil
-}
-```
-
-### Command Line Flags
-
-| Flag | Type | Description |
-| :--- | :--- | :--- |
-| `--dry-run` | Bool | Print diffs to stdout instead of modifying files on disk. |
-| `--local-preexisting-err` | Bool | Enable Level 0 analysis. |
-| `--local-nonexisting-err` | Bool | Enable Level 1 analysis (Signature rewriting). |
-| `--third-party-err` | Bool | Enable Level 2 analysis (External libs). |
-| `--no-default-exclusion` | Bool | Analyze ALL calls, including `fmt.Print` and `log.Print`. |
-| `--main-handler` | String | Strategy for `main`/`init`. Options: `log-fatal` (default), `os-exit`, `panic`. |
-| `--error-template` | String | Custom return template. Default: `"{return-zero}, err"`. |
-| `--exclude-glob` | List | File patterns to skip (e.g. `*_test.go`, `vendor/*`). |
-| `--exclude-symbol-glob` | List | Symbol patterns to skip (e.g. `path/to/pkg.Func`). |
-
-### Examples
-
-#### 1. Preview changes (Dry Run)
-```bash
-auto-err --local-nonexisting-err --dry-run ./pkg/...
-```
-
-#### 2. Full Refactor with Custom Wrapping
-Injects `fmt.Errorf` wrapping context instead of raw returns.
+**Apply changes recursively with custom template:**
 
 ```bash
 auto-err \
   --local-nonexisting-err \
-  --third-party-err \
   --error-template '{return-zero}, fmt.Errorf("failed in {func_name}: %w", err)' \
-  ./...
+  ./pkg/...
 ```
 
-#### 3. Strict Mode (Check everything)
-Checks standard library calls usually ignored (like `fmt.Println`).
+**Verify codebase in CI (Exit 1 if errors found):**
 
 ```bash
-auto-err --no-default-exclusion --local-preexisting-err .
+auto-err --check ./...
 ```
 
-## ⚙️ Configuration & templates
+## ⚙️ Configuration
 
-### Error Templates
-The `--error-template` string supports specific placeholders:
-- `{return-zero}`: Generates the comma-separated zero values for non-error returns (e.g., `0, "", nil`).
-- `{func_name}`: The name of the function being called that generated the error.
-- `err`: The variable name for the error (automatically resolved to avoid shadowing, e.g., `err`, `err1`).
+Options can be controlled via CLI flags.
 
-### Main Handler Strategies
-When an error propagates up to `main()` or `init()`, the signature cannot be changed (Go spec). You can choose how these are handled:
-- `log-fatal`: `if err != nil { log.Fatal(err) }`
-- `os-exit`: `if err != nil { fmt.Println(err); os.Exit(1) }`
-- `panic`: `if err != nil { panic(err) }`
+| Flag                      | Description                                                             | Default              |
+|:--------------------------|:------------------------------------------------------------------------|:---------------------|
+| `--dry-run`               | Print diffs to stdout; do not modify files.                             | `false`              |
+| `--check`                 | CI mode. Implies dry-run. Exits with 1 if issues found.                 | `false`              |
+| `--exclude-glob`          | Glob patterns for files to exclude (e.g., `*_test.go`).                 | `[]`                 |
+| `--exclude-symbol-glob`   | Symbols to ignore (e.g., `fmt.Println`, `bytes.Buffer.Write`).          | `[]`                 |
+| `--main-handler`          | Strategy for `main/init`: `log-fatal`, `os-exit`, `panic`.              | `log-fatal`          |
+| `--error-template`        | Template for returns. Variables: `{return-zero}`, `{func_name}`, `err`. | `{return-zero}, err` |
+| `--no-default-exclusions` | Disable built-in ignore list (fmt, log, etc.).                          | `false`              |
 
-## 🏗 Architecture
+### Default Exclusions
 
-The tool is built on `golang.org/x/tools/go/packages` and proceeds in the following phases:
+Unless `--no-default-exclusions` is set, the following are ignored to reduce noise:
 
-1.  **Loader**: Parses AST, Type info, and Module structure.
-2.  **Filter**: Applies glob patterns and exclusion defaults (e.g., ignoring `strings.Builder.Write`).
-3.  **Analysis**:
-    *   Walks the AST looking for `ExprStmt` (bare calls) or `AssignStmt` (assignment to `_`) where the underlying type is `error`.
-    *   Determines if the call is internal or third-party.
-4.  **Refactor & Rewrite**:
-    *   **Injector**: Calculates unique variable names (`err` vs `err1`) based on scope.
-    *   **Signature**: Uses `pkg/astgen` to calculate zero values for return types.
-    *   **Defer**: Inspects defers and applies `errors.Join` transformations.
-    *   **Propagate**: If a function signature changes, it crawls the Graph of usage to update all call sites.
-5.  **Format**: Runs `ast.Format` and `golang.org/x/tools/imports` (goimports) to fix spacing and missing imports.
-6.  **Loop**: The runner repeats this process (default 5 passes) until the codebase stabilizes, handling deep call stacks recursively.
+* `fmt.Print*`, `fmt.Sprint*`, `fmt.Scan*`
+* `log.Print*`, `log.Output`
+* `strings.Builder.Write*`
+* `bytes.Buffer.Write*`
 
-## 🛡 Exclusions
+## 🏗 Project Structure
 
-By default, the tool ignores functions that are widely accepted as safe to ignore in Go. These are defined in `pkg/filter/defaults.go`:
-
-*   `fmt.Print*`, `fmt.Sprint*`, `fmt.Scan*`
-*   `log.Print*`, `log.Output`
-*   `strings.Builder.Write*`
-*   `bytes.Buffer.Write*`
-
-disable this list with `--no-default-exclusion`.
-
-## 🤝 Contributing
-
-This project aims for **100% test coverage** on logic packages.
-
-1.  Clone the repo.
-2.  Run tests:
-    ```bash
-    go test ./... -v
-    ```
-3.  Submit a PR.
+* `pkg/analysis`: AST detection logic and `InjectionPoint` identification.
+* `pkg/astgen`: Generation of AST nodes for zero values (`0, "", nil`).
+* `pkg/filter`: Glob matching and testing logic.
+* `pkg/loader`: Wrapper around `golang.org/x/tools/go/packages` with smart module recursion.
+* `pkg/refactor`: Type-aware refactoring (signature changes, propagation).
+* `pkg/rewrite`: AST rewriting logic (injecting `if` blocks, rewriting `defer`/`go`).
+* `pkg/runner`: Main execution loop, stabilization, and formatting.
 
 ## 📄 License
 

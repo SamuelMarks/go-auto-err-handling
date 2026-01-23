@@ -11,7 +11,7 @@ import (
 
 // AddErrorToSignature modifies a function declaration signature to include an error return type.
 // It appends 'error' to the results list and updates all return statements within the function body
-// to include a 'nil' value for the new error return.
+// to include a 'nil' value for the new error return, unless it detects a naked return usage.
 //
 // It handles named return value collisions. If 'err' is already used as a parameter or return value name,
 // it generates a safe alternative (e.g., 'err1', 'err2').
@@ -114,12 +114,14 @@ func AddErrorToSignature(fset *token.FileSet, decl *ast.FuncDecl) (bool, error) 
 		// Handle Return Statements
 		if ret, isRet := node.(*ast.ReturnStmt); isRet {
 			// Logic for updating returns:
-			// - If named returns are used, result list can be empty (naked return).
-			//   In that case, the new 'err' var is implicitly returned as nil. No change needed.
-			// - If result list is NOT empty (explicit return), we must append 'nil'.
-			// - If it was previously void, result list is empty. We append 'nil'.
+			// - If named returns are used, and result list is empty (naked return),
+			//   we rely on implicit return of named vars (including our new 'err'). Do NOT append nil.
+			// - If result list is NOT empty (explicit return), we *must* append 'nil'.
+			// - If it was previously void (unnamed), result list is empty. We *must* append 'nil'.
 
-			if len(ret.Results) > 0 || wasVoid {
+			isNaked := hasNamedReturns && len(ret.Results) == 0
+
+			if !isNaked && (len(ret.Results) > 0 || wasVoid) {
 				// Append 'nil'
 				ret.Results = append(ret.Results, &ast.Ident{Name: "nil"})
 			}

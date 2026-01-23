@@ -27,6 +27,25 @@ func formatCode(fset *token.FileSet, file *ast.File) string {
 	return string(out)
 }
 
+// normalize removes whitespace and comments to ensure robust comparisons
+func normalize(s string) string {
+	// Strip comments first to avoid whitespace removal merging them with code
+	lines := strings.Split(s, "\n")
+	var codeLines []string
+	for _, line := range lines {
+		if idx := strings.Index(line, "//"); idx != -1 {
+			line = line[:idx]
+		}
+		codeLines = append(codeLines, line)
+	}
+	s = strings.Join(codeLines, "")
+
+	s = strings.ReplaceAll(s, "\n", "")
+	s = strings.ReplaceAll(s, "\t", "")
+	s = strings.ReplaceAll(s, " ", "")
+	return s
+}
+
 func TestRewritePanics(t *testing.T) {
 	// We parse and mockcheck a file to get TypesInfo populated sufficiently for panic analysis
 	src := `package main
@@ -60,7 +79,7 @@ func complex() int {
 `
 
 	file, pkg := parseAndCheck(t, src)
-	injector := NewInjector(pkg, "")
+	injector := NewInjector(pkg, "", "")
 
 	changed, err := injector.RewritePanics(file)
 	if err != nil {
@@ -71,37 +90,31 @@ func complex() int {
 	}
 
 	out := formatCode(injector.Fset, file)
+	normOut := normalize(out)
 
 	// Case 1: Panic String -> fmt.Errorf
-	expectedString := `func panicString() error { 
-  return fmt.Errorf("%s", "fail") 
-}`
-	if !strings.Contains(out, expectedString) && !strings.Contains(out, "fmt.Errorf") {
+	if !strings.Contains(normOut, `returnfmt.Errorf("%s","fail")`) {
 		t.Errorf("panicString not rewritten correctly. Got:\n%s", out)
 	}
 
 	// Case 2: Panic Error -> return err
-	// Note: We expect signature update "error" + return
-	// panicError() calls errors.New(). Checks if rewrite recognizes it as error type return.
-	// Since we used parseAndCheck with mocked type info, it should detect errors.New returns error.
 	if !strings.Contains(out, "func panicError() error") {
 		t.Error("Signature for panicError not updated")
 	}
-	// Should see "return errors.New"
-	if !strings.Contains(out, `return errors.New("fail")`) {
+	if !strings.Contains(normOut, `returnerrors.New("fail")`) {
 		t.Error("Did not return error expression directly")
 	}
 
 	// Case 3: Panic Other -> fmt.Errorf("%v")
-	if !strings.Contains(out, `return fmt.Errorf("%v", 123)`) {
+	if !strings.Contains(normOut, `returnfmt.Errorf("%v",123)`) {
 		t.Errorf("panicOther not rewritten to %%v format. Got:\n%s", out)
 	}
 
-	// Case 4: Existing Error -> Don't double signautre, just rewrite
+	// Case 4: Existing Error -> Don't double signature
 	if strings.Contains(out, "func existingError() (error, error)") {
 		t.Error("existingError signature doubled")
 	}
-	if !strings.Contains(out, `return fmt.Errorf("%s", "boom")`) {
+	if !strings.Contains(normOut, `returnfmt.Errorf("%s","boom")`) {
 		t.Error("existingError panic not rewritten")
 	}
 
@@ -109,7 +122,7 @@ func complex() int {
 	if !strings.Contains(out, "func complex() (int, error)") {
 		t.Error("complex signature not updated correctly")
 	}
-	if !strings.Contains(out, `return 0, fmt.Errorf("%s", "c")`) {
+	if !strings.Contains(normOut, `return0,fmt.Errorf("%s","c")`) {
 		t.Errorf("complex return not generating zero values correctly. Got:\n%s", out)
 	}
 }
@@ -127,7 +140,7 @@ func empty() {
 	file, _ := parser.ParseFile(fset, "", src, 0)
 
 	pkg := &packages.Package{Fset: fset, TypesInfo: nil} // No types info
-	injector := NewInjector(pkg, "")
+	injector := NewInjector(pkg, "", "")
 
 	_, err := injector.RewritePanics(file)
 	if err == nil {
@@ -145,7 +158,7 @@ func main() {
 } 
 `
 	file, pkg := parseAndCheck(t, src)
-	injector := NewInjector(pkg, "")
+	injector := NewInjector(pkg, "", "")
 
 	changed, err := injector.RewritePanics(file)
 	if err != nil {

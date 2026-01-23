@@ -7,6 +7,7 @@ import (
 	"go/types"
 
 	"github.com/SamuelMarks/go-auto-err-handling/pkg/astgen"
+	"github.com/SamuelMarks/go-auto-err-handling/pkg/filter"
 	"golang.org/x/tools/go/ast/astutil"
 	"golang.org/x/tools/go/packages"
 )
@@ -29,11 +30,11 @@ const (
 // It scans the provided packages for usages of the target function. For each call site found,
 // it:
 // 1. Updates the assignment to receive the new error value (e.g., `x := foo()` -> `x, err := foo()`).
-// 2. Checks if the enclosing function is an entry point (main/init) or a regular function.
-// 3. If entry point, injects a terminal handler (log.Fatal/panic/Exit).
+// 2. Checks if the enclosing function is an entry point (main/init) or a Test Handler (TestX).
+// 3. If entry point or Test, injects a terminal handler (log.Fatal/panic/t.Fatal).
 // 4. If regular function, checks if it returns error.
 //   - If yes, injects `if err := ...; err != nil { return ..., err }` (using collapse if possible).
-//   - If no, assigns error to `_` (or leaves for future passes if recursive propagation is intended manually, but currently silences to fix build).
+//   - If no, assigns error to `_` (or leaves for future passes).
 //
 // pkgs: The set of packages to search for callers.
 // target: The function object whose signature was modified.
@@ -89,15 +90,28 @@ func PropagateCallers(pkgs []*packages.Package, target *types.Func, strategy str
 			}
 
 			// Find enclosing function to determine behavior
-			enclosingSig, enclosingFunc := findEnclosingFuncDetails(path, pkg.TypesInfo)
+			enclosingSig, enclosingFunc, enclosingDecl := findEnclosingFuncDetails(path, pkg.TypesInfo)
 
 			entryPoint := false
+			testParam := ""
+
 			if enclosingFunc != nil {
 				entryPoint = isEntryPoint(enclosingFunc)
 			}
 
+			// Check for Test Handler context
+			if !entryPoint && enclosingDecl != nil {
+				if filter.IsTestHandler(enclosingDecl) {
+					testParam = filter.GetTestingParamName(enclosingDecl)
+					// Treat as entry point (terminal handling) if we found a valid test param
+					if testParam != "" {
+						entryPoint = true
+					}
+				}
+			}
+
 			// Perform Refactor on this call site
-			if err := refactorCallSite(call, assignment, enclosingStmt, enclosingSig, file, pkg.Fset, entryPoint, MainHandlerStrategy(strategy)); err != nil {
+			if err := refactorCallSite(call, assignment, enclosingStmt, enclosingSig, file, pkg.Fset, entryPoint, MainHandlerStrategy(strategy), testParam); err != nil {
 				return updates, err
 			}
 			updates++
@@ -117,7 +131,7 @@ func HandleEntryPoint(file *ast.File, call *ast.CallExpr, stmt ast.Stmt, strateg
 		assignment = as
 	}
 	// We pass nil for enclosingSig because terminal handling (true) bypasses the return check.
-	return refactorCallSite(call, assignment, stmt, nil, file, nil, true, MainHandlerStrategy(strategy))
+	return refactorCallSite(call, assignment, stmt, nil, file, nil, true, MainHandlerStrategy(strategy), "")
 }
 
 // isIdentFunctionInCall checks if the identifier acts as the function expression in the call.
@@ -151,29 +165,31 @@ func findFile(pkg *packages.Package, pos token.Pos) *ast.File {
 //
 // path: The AST path to the node.
 // info: Type info for resolution.
-func findEnclosingFuncDetails(path []ast.Node, info *types.Info) (*types.Signature, *types.Func) {
+//
+// Returns Signature, Func Object, and Func Decl (if available).
+func findEnclosingFuncDetails(path []ast.Node, info *types.Info) (*types.Signature, *types.Func, *ast.FuncDecl) {
 	for _, node := range path {
 		if fn, ok := node.(*ast.FuncDecl); ok {
 			// Get signature from object
 			if obj := info.ObjectOf(fn.Name); obj != nil {
 				if sig, ok := obj.Type().(*types.Signature); ok {
 					if funcObj, isFunc := obj.(*types.Func); isFunc {
-						return sig, funcObj
+						return sig, funcObj, fn
 					}
-					return sig, nil
+					return sig, nil, fn
 				}
 			}
-			return nil, nil // Should be found
+			return nil, nil, fn // Should be found
 		}
 		if lit, ok := node.(*ast.FuncLit); ok {
 			if tv, ok := info.Types[lit]; ok {
 				if sig, ok := tv.Type.(*types.Signature); ok {
-					return sig, nil // FuncLits are not named entry points
+					return sig, nil, nil // FuncLits are not named entry points
 				}
 			}
 		}
 	}
-	return nil, nil
+	return nil, nil, nil
 }
 
 // isEntryPoint determines if the function is a main or init function.
@@ -197,9 +213,10 @@ func isEntryPoint(fn *types.Func) bool {
 // enclosingSig: The signature of the function containing the call.
 // file: The AST file.
 // fset: The file set for imports.
-// isTerminal: True if enclosing function is main/init.
-// strategy: The handling strategy if isTerminal.
-func refactorCallSite(call *ast.CallExpr, assign *ast.AssignStmt, stmt ast.Stmt, enclosingSig *types.Signature, file *ast.File, fset *token.FileSet, isTerminal bool, strategy MainHandlerStrategy) error {
+// isTerminal: True if enclosing function is main/init/Test.
+// strategy: The handling strategy if isTerminal (default for main).
+// testParam: The name of the testing parameter (e.g. "t") if isTerminal is due to a test.
+func refactorCallSite(call *ast.CallExpr, assign *ast.AssignStmt, stmt ast.Stmt, enclosingSig *types.Signature, file *ast.File, fset *token.FileSet, isTerminal bool, strategy MainHandlerStrategy, testParam string) error {
 	// 1. Determine var name for error
 	errName := "err"
 
@@ -218,14 +235,14 @@ func refactorCallSite(call *ast.CallExpr, assign *ast.AssignStmt, stmt ast.Stmt,
 	} else {
 		// Expression statement: "foo()"
 		// Convert to "if err := foo(); err != nil ..." via replacement block
-		return replaceStatementInBlock(file, stmt, enclosingSig, call, isTerminal, strategy)
+		return replaceStatementInBlock(file, stmt, enclosingSig, call, isTerminal, strategy, testParam)
 	}
 
 	// 3. Inject Check
 	// If existing assignment, we kept the pointer 'assign' valid (modified in place), so we just need to insert 'if' after.
 	if assign != nil {
 		if isTerminal {
-			check := generateTerminalCheck(strategy)
+			check := generateTerminalCheck(strategy, testParam)
 			cursorReplace(file, stmt, stmt, check)
 			// Imports handled by post-processing in runner
 		} else if canReturnError(enclosingSig) {
@@ -254,7 +271,8 @@ func refactorCallSite(call *ast.CallExpr, assign *ast.AssignStmt, stmt ast.Stmt,
 // call: The call expression.
 // isTerminal: Whether to generate terminal handling.
 // strategy: The terminal handling strategy.
-func replaceStatementInBlock(file *ast.File, oldStmt ast.Stmt, sig *types.Signature, call *ast.CallExpr, isTerminal bool, strategy MainHandlerStrategy) error {
+// testParam: The testing parameter name used for terminal test handling.
+func replaceStatementInBlock(file *ast.File, oldStmt ast.Stmt, sig *types.Signature, call *ast.CallExpr, isTerminal bool, strategy MainHandlerStrategy, testParam string) error {
 	// We map unhandled returns to "err := " assuming previously void or intentionally ignored.
 	as := &ast.AssignStmt{
 		Lhs: []ast.Expr{&ast.Ident{Name: "err"}},
@@ -273,7 +291,7 @@ func replaceStatementInBlock(file *ast.File, oldStmt ast.Stmt, sig *types.Signat
 	var err error
 
 	if isTerminal {
-		check = generateTerminalCheck(strategy)
+		check = generateTerminalCheck(strategy, testParam)
 	} else if canReturn {
 		check, err = generateErrorCheck(sig)
 		if err != nil {
@@ -355,58 +373,76 @@ func generateErrorCheck(sig *types.Signature) (*ast.IfStmt, error) {
 	}, nil
 }
 
-// generateTerminalCheck generates code to handle error at entry points.
+// generateTerminalCheck generates code to handle error at entry points or tests.
 // Note: This returns an IfStmt *without* the Init field set. Caller must set Init if collapsing.
-func generateTerminalCheck(strategy MainHandlerStrategy) *ast.IfStmt {
+//
+// strategy: The main handler strategy.
+// testParam: If non-empty, triggers test logic (t.Fatal) overriding strategy.
+func generateTerminalCheck(strategy MainHandlerStrategy, testParam string) *ast.IfStmt {
 	var bodyStmts []ast.Stmt
 
-	switch strategy {
-	case HandlerPanic:
-		// panic(err)
-		bodyStmts = []ast.Stmt{
-			&ast.ExprStmt{
-				X: &ast.CallExpr{
-					Fun:  &ast.Ident{Name: "panic"},
-					Args: []ast.Expr{&ast.Ident{Name: "err"}},
-				},
-			},
-		}
-	case HandlerOsExit:
-		// fmt.Println(err); os.Exit(1)
+	if testParam != "" {
+		// t.Fatal(err)
 		bodyStmts = []ast.Stmt{
 			&ast.ExprStmt{
 				X: &ast.CallExpr{
 					Fun: &ast.SelectorExpr{
-						X:   &ast.Ident{Name: "fmt"},
-						Sel: &ast.Ident{Name: "Println"},
-					},
-					Args: []ast.Expr{&ast.Ident{Name: "err"}},
-				},
-			},
-			&ast.ExprStmt{
-				X: &ast.CallExpr{
-					Fun: &ast.SelectorExpr{
-						X:   &ast.Ident{Name: "os"},
-						Sel: &ast.Ident{Name: "Exit"},
-					},
-					Args: []ast.Expr{&ast.BasicLit{Kind: token.INT, Value: "1"}},
-				},
-			},
-		}
-	case HandlerLogFatal:
-		fallthrough
-	default:
-		// log.Fatal(err)
-		bodyStmts = []ast.Stmt{
-			&ast.ExprStmt{
-				X: &ast.CallExpr{
-					Fun: &ast.SelectorExpr{
-						X:   &ast.Ident{Name: "log"},
+						X:   &ast.Ident{Name: testParam},
 						Sel: &ast.Ident{Name: "Fatal"},
 					},
 					Args: []ast.Expr{&ast.Ident{Name: "err"}},
 				},
 			},
+		}
+	} else {
+		switch strategy {
+		case HandlerPanic:
+			// panic(err)
+			bodyStmts = []ast.Stmt{
+				&ast.ExprStmt{
+					X: &ast.CallExpr{
+						Fun:  &ast.Ident{Name: "panic"},
+						Args: []ast.Expr{&ast.Ident{Name: "err"}},
+					},
+				},
+			}
+		case HandlerOsExit:
+			// fmt.Println(err); os.Exit(1)
+			bodyStmts = []ast.Stmt{
+				&ast.ExprStmt{
+					X: &ast.CallExpr{
+						Fun: &ast.SelectorExpr{
+							X:   &ast.Ident{Name: "fmt"},
+							Sel: &ast.Ident{Name: "Println"},
+						},
+						Args: []ast.Expr{&ast.Ident{Name: "err"}},
+					},
+				},
+				&ast.ExprStmt{
+					X: &ast.CallExpr{
+						Fun: &ast.SelectorExpr{
+							X:   &ast.Ident{Name: "os"},
+							Sel: &ast.Ident{Name: "Exit"},
+						},
+						Args: []ast.Expr{&ast.BasicLit{Kind: token.INT, Value: "1"}},
+					},
+				},
+			}
+		case HandlerLogFatal:
+			fallthrough
+		default:
+			// log.Fatal(err)
+			bodyStmts = []ast.Stmt{
+				&ast.ExprStmt{
+					X: &ast.CallExpr{
+						Fun: &ast.SelectorExpr{
+							X:   &ast.Ident{Name: "log"},
+							Sel: &ast.Ident{Name: "Fatal"},
+						},
+						Args: []ast.Expr{&ast.Ident{Name: "err"}},
+					},
+				},
+			}
 		}
 	}
 

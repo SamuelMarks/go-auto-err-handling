@@ -51,7 +51,8 @@ func setupTestEnv(t *testing.T, src string) (*Injector, *ast.File) {
 		TypesInfo: info,
 	}
 
-	return NewInjector(pkg, ""), file
+	// Pass blank mainHandler logic for defer tests
+	return NewInjector(pkg, "", ""), file
 }
 
 func callToString(call *ast.CallExpr) string {
@@ -85,12 +86,12 @@ import "fmt"
 func Close() error { return nil }
 
 func DoWork() (int, error) {
-  defer Close()
-  return 1, nil
+	defer Close()
+	return 1, nil
 }
 
 func NoError() {
-  defer Close() // enclosing func has no error return, should be skipped
+	defer Close() // enclosing func has no error return, should be skipped
 }
 `
 	injector, file := setupTestEnv(t, src)
@@ -135,10 +136,10 @@ func TestRewriteDefers_Closure(t *testing.T) {
 func Close() error { return nil }
 
 func Top() {
-  _ = func() error {
-    defer Close()
-    return nil
-  }
+	_ = func() error {
+		defer Close()
+		return nil
+	}
 }
 `
 	injector, file := setupTestEnv(t, src)
@@ -172,8 +173,8 @@ func TestRewriteDefers_MixedErrorName(t *testing.T) {
 	src := `package main
 func Close() error { return nil }
 func CustomName() (e error) {
-  defer Close()
-  return nil
+	defer Close()
+	return nil
 }
 `
 	injector, file := setupTestEnv(t, src)
@@ -200,8 +201,8 @@ func TestRewriteDefers_AlreadyNamed(t *testing.T) {
 	src := `package main
 func Close() error { return nil }
 func Do() (err error) {
-  defer Close()
-  return nil
+	defer Close()
+	return nil
 }`
 	injector, file := setupTestEnv(t, src)
 	changed, err := injector.RewriteDefers(file)

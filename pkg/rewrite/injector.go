@@ -8,6 +8,7 @@ import (
 
 	"github.com/SamuelMarks/go-auto-err-handling/pkg/analysis"
 	"github.com/SamuelMarks/go-auto-err-handling/pkg/astgen"
+	"github.com/SamuelMarks/go-auto-err-handling/pkg/refactor"
 	"golang.org/x/tools/go/ast/astutil"
 	"golang.org/x/tools/go/packages"
 )
@@ -21,20 +22,27 @@ type Injector struct {
 	Pkg *packages.Package
 	// ErrorTemplate is the string template used to generate return statements (e.g. "{return-zero}, err").
 	ErrorTemplate string
+	// MainHandlerStrategy determines how terminal errors are handled (e.g. in go routines).
+	MainHandlerStrategy string
 }
 
 // NewInjector creates a new Injector for the given package.
 //
 // pkg: The package to operate on.
 // errorTemplate: Optional custom template string. If empty, defaults to "{return-zero}, err".
-func NewInjector(pkg *packages.Package, errorTemplate string) *Injector {
+// mainHandler: Optional strategy for terminal handlers (log-fatal, panic, os-exit). Defaults to log-fatal.
+func NewInjector(pkg *packages.Package, errorTemplate, mainHandler string) *Injector {
 	if errorTemplate == "" {
 		errorTemplate = "{return-zero}, err"
 	}
+	if mainHandler == "" {
+		mainHandler = "log-fatal"
+	}
 	return &Injector{
-		Fset:          pkg.Fset,
-		Pkg:           pkg,
-		ErrorTemplate: errorTemplate,
+		Fset:                pkg.Fset,
+		Pkg:                 pkg,
+		ErrorTemplate:       errorTemplate,
+		MainHandlerStrategy: mainHandler,
 	}
 }
 
@@ -103,6 +111,20 @@ func (i *Injector) RewriteFile(file *ast.File, points []analysis.InjectionPoint)
 
 		if stmt, isStmt := node.(ast.Stmt); isStmt {
 			if point, exists := pointMap[stmt]; exists {
+				// Handle Go Statements (Context agnostic refactor)
+				if _, isGo := stmt.(*ast.GoStmt); isGo {
+					newStmt, rwErr := i.generateGoRewrite(point, file)
+					if rwErr != nil {
+						err = rwErr
+						return false
+					}
+					// Replace
+					copyComments(c.Node(), newStmt)
+					c.Replace(newStmt)
+					applied = true
+					return true
+				}
+
 				if len(funcStack) == 0 {
 					return true
 				}
@@ -183,11 +205,14 @@ func copyComments(src, dst ast.Node) {
 	case *ast.IfStmt:
 		// If statements align comments to the 'if' keyword.
 		destNode.If = src.Pos()
+	case *ast.GoStmt:
+		// If wrapping a Go stmt, preserve position of 'go' keyword
+		destNode.Go = src.Pos()
 	}
 }
 
 // generateRewrite creates the AST nodes for assignment and error checking.
-// It resolves the appropriate variable name for the error (avoiding shadowing) relative to the injection point.
+// It handles simple calls, embedded calls (chains, ifs), and assignments.
 //
 // It attempts to generate the idiomatic `if err := call(); err != nil { ... }` syntax
 // if the assignment does not introduce other variables needed in the outer scope.
@@ -226,7 +251,7 @@ func (i *Injector) generateRewrite(point analysis.InjectionPoint, sig *types.Sig
 		return nil, nil // Skip - enclosing function does not return error
 	}
 
-	// Calculate unique variable name
+	// Calculate unique variable name for error
 	scope := i.getScope(point.Pos, file)
 	errName := analysis.GenerateUniqueName(scope, "err")
 
@@ -239,6 +264,12 @@ func (i *Injector) generateRewrite(point analysis.InjectionPoint, sig *types.Sig
 		return nil, err
 	}
 
+	// Check if embedded in a structure (If/Switch/Chain)
+	if isEmbedded(point) {
+		return i.generateEmbeddedRewrite(point, point.Stmt, errName, retStmt, scope)
+	}
+
+	// Case 2: Standard Assignment/Expression
 	// Generate Assignment: err := call()
 	assignStmt, err := i.generateAssignment(point, errName)
 	if err != nil {
@@ -290,6 +321,285 @@ func (i *Injector) generateRewrite(point analysis.InjectionPoint, sig *types.Sig
 	return []ast.Stmt{assignStmt, ifStmt}, nil
 }
 
+// isEmbedded checks if the call is nested within the statement (e.g. If Cond, Switch Tag, or Method Chain)
+// rather than being the direct root of the expression/assignment.
+func isEmbedded(point analysis.InjectionPoint) bool {
+	switch s := point.Stmt.(type) {
+	case *ast.IfStmt, *ast.SwitchStmt:
+		return true
+	case *ast.ExprStmt:
+		// Not embedded if the call IS the expression
+		return s.X != point.Call
+	case *ast.AssignStmt:
+		// Embedded if the call is NOT one of the direct RHS elements
+		for _, r := range s.Rhs {
+			if r == point.Call {
+				return false
+			}
+		}
+		return true
+	case *ast.GoStmt:
+		return s.Call != point.Call
+	case *ast.DeferStmt:
+		return s.Call != point.Call
+	}
+	return false
+}
+
+// generateEmbeddedRewrite handles logic for calls extracted from control structures and chains.
+// It generates:
+//  1. Assignment: var_ok, err := call()
+//  2. Check: if err != nil { return err }
+//  3. Modified Control Stmt: if var_ok { ... } OR x := var_ok.Method()
+//
+// point: The injection point.
+// stmt: The control statement.
+// errName: Resolved error name.
+// retStmt: The return statement to use on error.
+// scope: The current scope for name resolution.
+func (i *Injector) generateEmbeddedRewrite(point analysis.InjectionPoint, stmt ast.Stmt, errName string, retStmt ast.Stmt, scope *types.Scope) ([]ast.Stmt, error) {
+	call := point.Call
+
+	// Get tuple info to determine non-error return values
+	var callResultSig *types.Tuple
+	if tv, ok := i.Pkg.TypesInfo.Types[call]; ok {
+		if tuple, ok := tv.Type.(*types.Tuple); ok {
+			callResultSig = tuple
+		} else {
+			// Single return (unlikely to be embedded if it's just error, but robust check)
+			vars := []*types.Var{types.NewVar(token.NoPos, nil, "", tv.Type)}
+			callResultSig = types.NewTuple(vars...)
+		}
+	} else {
+		return nil, fmt.Errorf("type info missing for embedded call expression")
+	}
+
+	// Calculate variable names for the values (all but the last error)
+	var lhs []ast.Expr
+	var valNames []string
+
+	for k := 0; k < callResultSig.Len()-1; k++ {
+		t := callResultSig.At(k).Type()
+		baseName := refactor.NameForType(t)
+		// Unique name in scope
+		unique := analysis.GenerateUniqueName(scope, baseName)
+
+		// Simple local uniqueness check against generated list
+		count := 1
+		candidate := unique
+		for {
+			collision := false
+			for _, existing := range valNames {
+				if existing == candidate {
+					collision = true
+					break
+				}
+			}
+			if !collision {
+				break
+			}
+			candidate = fmt.Sprintf("%s%d", unique, count)
+			count++
+		}
+		valNames = append(valNames, candidate)
+		lhs = append(lhs, &ast.Ident{Name: candidate})
+	}
+	// Append error var
+	lhs = append(lhs, &ast.Ident{Name: errName})
+
+	// 2. Generate Assignment Statement
+	assignStmt := &ast.AssignStmt{
+		Lhs: lhs,
+		Tok: token.DEFINE,
+		Rhs: []ast.Expr{call},
+	}
+
+	// 3. Generate Check Statement
+	checkStmt := &ast.IfStmt{
+		Cond: &ast.BinaryExpr{
+			X:  &ast.Ident{Name: errName},
+			Op: token.NEQ,
+			Y:  &ast.Ident{Name: "nil"},
+		},
+		Body: &ast.BlockStmt{
+			List: []ast.Stmt{retStmt},
+		},
+	}
+
+	// 4. Modify Original Statement to use variable instead of call
+	if len(valNames) == 0 {
+		return nil, fmt.Errorf("embedded call has no return value to substitute condition (only error?)")
+	}
+	replacementExpr := &ast.Ident{Name: valNames[0]}
+
+	// We MUST clone the stmt structure to avoid mutating original AST nodes destructively if re-analysis runs.
+	var newStmt ast.Stmt
+
+	switch s := stmt.(type) {
+	case *ast.IfStmt:
+		newIf := *s
+		newIf.Cond = i.replaceExprInTree(s.Cond, call, replacementExpr)
+		newStmt = &newIf
+	case *ast.SwitchStmt:
+		newSwitch := *s
+		newSwitch.Tag = i.replaceExprInTree(s.Tag, call, replacementExpr)
+		newStmt = &newSwitch
+	case *ast.ExprStmt:
+		newExpr := *s
+		newExpr.X = i.replaceExprInTree(s.X, call, replacementExpr)
+		newStmt = &newExpr
+	case *ast.AssignStmt:
+		newAssign := *s
+		// Deep copy Rhs slice since we modify it
+		newRhs := make([]ast.Expr, len(s.Rhs))
+		copy(newRhs, s.Rhs)
+		for idx, r := range newRhs {
+			newRhs[idx] = i.replaceExprInTree(r, call, replacementExpr)
+		}
+		newAssign.Rhs = newRhs
+		newStmt = &newAssign
+	default:
+		// Fallback for types not explicitly extracted but flagged embedded? (Go/Defer are checked elsewhere)
+		return nil, fmt.Errorf("unsupported embedded statement type %T", stmt)
+	}
+
+	return []ast.Stmt{assignStmt, checkStmt, newStmt}, nil
+}
+
+// replaceExprInTree traverses the expression tree and replaces the target node with the replacement.
+// It handles Unary, Paren, and Selector (chains) structures.
+//
+// root: The expression root.
+// target: The expression to find (the CallExpr).
+// replacement: The expression to swap in (the variable Ident).
+func (i *Injector) replaceExprInTree(root, target, replacement ast.Expr) ast.Expr {
+	if root == target {
+		return replacement
+	}
+	switch e := root.(type) {
+	case *ast.ParenExpr:
+		newParen := *e
+		newParen.X = i.replaceExprInTree(e.X, target, replacement)
+		return &newParen
+	case *ast.UnaryExpr:
+		newUnary := *e
+		newUnary.X = i.replaceExprInTree(e.X, target, replacement)
+		return &newUnary
+	case *ast.SelectorExpr:
+		newSel := *e
+		newSel.X = i.replaceExprInTree(e.X, target, replacement)
+		return &newSel
+	}
+	return root
+}
+
+// generateGoRewrite wraps a `go myFunc()` call into `go func() { ... }()` to handle errors.
+// Since goroutines cannot return values to the caller, it creates a closure that calls the
+// function, checks the error, and invokes the terminal handler (e.g., log.Fatal).
+//
+// point: The injection point (where Stmt is *ast.GoStmt).
+// file: The AST file.
+func (i *Injector) generateGoRewrite(point analysis.InjectionPoint, file *ast.File) (*ast.GoStmt, error) {
+	// 1. Calculate safe variable name for error within the new scope (closure)
+	errName := "err"
+
+	// 2. Generate Assignment inside the closure: _, err := call()
+	assignStmt, err := i.generateAssignment(point, errName)
+	if err != nil {
+		return nil, err
+	}
+
+	// 3. Generate Terminal Handler
+	handlerBlock := i.generateTerminalHandlerSimple(errName)
+	checkStmt := &ast.IfStmt{
+		Cond: &ast.BinaryExpr{
+			X:  &ast.Ident{Name: errName},
+			Op: token.NEQ,
+			Y:  &ast.Ident{Name: "nil"},
+		},
+		Body: handlerBlock,
+	}
+
+	// 4. Construct Closure Body
+	body := &ast.BlockStmt{
+		List: []ast.Stmt{
+			assignStmt,
+			checkStmt,
+		},
+	}
+
+	// 5. Construct Wrapper: go func() { ... }()
+	return &ast.GoStmt{
+		Call: &ast.CallExpr{
+			Fun: &ast.FuncLit{
+				Type: &ast.FuncType{
+					Params:  &ast.FieldList{},
+					Results: nil, // Goroutine always void
+				},
+				Body: body,
+			},
+			Args: nil, // Args captured by closure scope
+		},
+	}, nil
+}
+
+// generateTerminalHandlerSimple generates the AST block for terminal handling.
+// Supported: log-fatal, panic, os-exit.
+func (i *Injector) generateTerminalHandlerSimple(errVar string) *ast.BlockStmt {
+	var bodyStmts []ast.Stmt
+
+	switch i.MainHandlerStrategy {
+	case "panic":
+		// panic(err)
+		bodyStmts = []ast.Stmt{
+			&ast.ExprStmt{
+				X: &ast.CallExpr{
+					Fun:  &ast.Ident{Name: "panic"},
+					Args: []ast.Expr{&ast.Ident{Name: errVar}},
+				},
+			},
+		}
+	case "os-exit":
+		// fmt.Println(err); os.Exit(1)
+		bodyStmts = []ast.Stmt{
+			&ast.ExprStmt{
+				X: &ast.CallExpr{
+					Fun: &ast.SelectorExpr{
+						X:   &ast.Ident{Name: "fmt"},
+						Sel: &ast.Ident{Name: "Println"},
+					},
+					Args: []ast.Expr{&ast.Ident{Name: errVar}},
+				},
+			},
+			&ast.ExprStmt{
+				X: &ast.CallExpr{
+					Fun: &ast.SelectorExpr{
+						X:   &ast.Ident{Name: "os"},
+						Sel: &ast.Ident{Name: "Exit"},
+					},
+					Args: []ast.Expr{&ast.BasicLit{Kind: token.INT, Value: "1"}},
+				},
+			},
+		}
+	case "log-fatal":
+		fallthrough
+	default:
+		// log.Fatal(err)
+		bodyStmts = []ast.Stmt{
+			&ast.ExprStmt{
+				X: &ast.CallExpr{
+					Fun: &ast.SelectorExpr{
+						X:   &ast.Ident{Name: "log"},
+						Sel: &ast.Ident{Name: "Fatal"},
+					},
+					Args: []ast.Expr{&ast.Ident{Name: errVar}},
+				},
+			},
+		}
+	}
+	return &ast.BlockStmt{List: bodyStmts}
+}
+
 // resolveFuncName tries to determine a readable name for the function being called.
 //
 // point: The injection point.
@@ -319,7 +629,7 @@ func (i *Injector) generateReturnStmt(sig *types.Signature, errName, funcName st
 	// If sig is nil (e.g. stale/missing), we assume 0 returns preceding error.
 	if sig != nil {
 		// Iterate all returns.
-		// NOTE: If sig includes the 'error' (TypesInfo fresh), we skip last.
+		// NOTE: if sig includes the 'error' (TypesInfo fresh), we skip last.
 		// If sig does NOT include 'error' (TypesInfo stale), we iterate all (0 to len).
 		limit := sig.Results().Len()
 		if limit > 0 {

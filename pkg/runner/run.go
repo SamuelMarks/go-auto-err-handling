@@ -220,7 +220,8 @@ func applyChanges(pkgMap map[string]*packages.Package, points []analysis.Injecti
 		// Case A: Level 0 (Preexisting Error in signature)
 		if returnsErr {
 			if opts.EnablePreexistingErr {
-				injector := rewrite.NewInjector(p.Pkg, opts.ErrorTemplate)
+				// FIX: Pass MainHandler to NewInjector
+				injector := rewrite.NewInjector(p.Pkg, opts.ErrorTemplate, opts.MainHandler)
 				applied, err := injector.RewriteFile(p.File, []analysis.InjectionPoint{p})
 				if err != nil {
 					return changes, err
@@ -255,10 +256,27 @@ func applyChanges(pkgMap map[string]*packages.Package, points []analysis.Injecti
 				return changes, err
 			}
 			if changed {
+				// SYNC: Manually patch types info so subsequent steps see the new signature
+				// Fix: Ensure we don't panic on empty params
+				var pkg *types.Package
+				if ctx.Sig.Params().Len() > 0 && ctx.Sig.Params().At(0).Pkg() != nil {
+					pkg = ctx.Sig.Params().At(0).Pkg()
+				} else {
+					pkg = p.Pkg.Types
+				}
+
+				if err := PatchSignature(p.Pkg.TypesInfo, ctx.Decl, pkg); err != nil {
+					// Fallback attempt with package types if first failed, though above check handles most cases
+					if err1 := PatchSignature(p.Pkg.TypesInfo, ctx.Decl, p.Pkg.Types); err1 != nil {
+						return changes, err1
+					}
+				}
+
 				changes++
 
 				// 2. Mutate Body
-				injector := rewrite.NewInjector(p.Pkg, opts.ErrorTemplate)
+				// FIX: Pass MainHandler to NewInjector
+				injector := rewrite.NewInjector(p.Pkg, opts.ErrorTemplate, opts.MainHandler)
 				appliedBody, err := injector.RewriteFile(p.File, []analysis.InjectionPoint{p})
 				if err != nil {
 					return changes, err

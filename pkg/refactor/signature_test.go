@@ -10,6 +10,9 @@ import (
 )
 
 // parseFuncDecl helper parses a function string into an AST FuncDecl.
+//
+// t: The testing context.
+// src: The source string of the function declaration.
 func parseFuncDecl(t *testing.T, src string) (*token.FileSet, *ast.FuncDecl) {
 	fset := token.NewFileSet()
 	// Wrap in package to be valid file
@@ -28,6 +31,9 @@ func parseFuncDecl(t *testing.T, src string) (*token.FileSet, *ast.FuncDecl) {
 }
 
 // render helper formats the node back to string.
+//
+// fset: The FileSet associated with the node.
+// node: The AST node to render.
 func render(fset *token.FileSet, node ast.Node) string {
 	var buf bytes.Buffer
 	if err := format.Node(&buf, fset, node); err != nil {
@@ -114,6 +120,18 @@ func TestAddErrorToSignature(t *testing.T) {
 			name:     "CollisionUnnamed",
 			input:    "func A(err int) int { return 1 }",
 			expected: "func A(err int) (int, error) { return 1, nil }",
+		},
+		{
+			// Naked Return Optimization Case
+			name:     "NakedReturnOptimization",
+			input:    "func A() (x int) { x=1; return }",
+			expected: "func A() (x int, err error) { x = 1; return }",
+		},
+		{
+			// Explicit return in Named function (Mixed Style)
+			name:     "MixedStyleExplicitReturn",
+			input:    "func A() (x int) { return 1 }",
+			expected: "func A() (x int, err error) { return 1, nil }",
 		},
 	}
 

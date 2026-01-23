@@ -114,31 +114,31 @@ func TestRewriteFile(t *testing.T) {
 	// NOTE: Comments removed from calls to allow clean AST rewriting verification
 	// without comment location weirdness confusing the simple string checks.
 	srcUnique := `package main
-func f(i int) error { return nil } 
-func g() (int, error) { return 0, nil } 
+func f(i int) error { return nil }
+func g() (int, error) { return 0, nil }
 
-func case1() error { 
-  f(1) 
-  return nil
-} 
+func case1() error {
+	f(1)
+	return nil
+}
 
-func case2() (string, error) { 
-  _ = f(2) 
-  return "", nil
-} 
+func case2() (string, error) {
+	_ = f(2)
+	return "", nil
+}
 
-func case3() (int, error) { 
-  i, _ := g() 
-  return i, nil
-} 
+func case3() (int, error) {
+	i, _ := g()
+	return i, nil
+}
 
-func caseSkip() { 
-  f(4) 
-} 
+func caseSkip() {
+	f(4)
+}
 `
 	file, pkg := parseAndCheck(t, srcUnique)
-	// Passing empty string for defaults
-	injector := NewInjector(pkg, "")
+	// Passing empty strings for defaults
+	injector := NewInjector(pkg, "", "")
 
 	pts := []analysis.InjectionPoint{}
 
@@ -210,16 +210,16 @@ func TestRewriteFile_Shadowing(t *testing.T) {
 	// Scenario: "err" already defined in scope. Injector should use "err1".
 	// We use "err" as an argument to ensure it is in the closest function scope.
 	srcShadow := `package main
-func fail() error { return nil } 
+func fail() error { return nil }
 
-func usage(err int) error { 
-  _ = err
-  fail() 
-  return nil
-} 
+func usage(err int) error {
+	_ = err
+	fail()
+	return nil
+}
 `
 	file, pkg := parseAndCheck(t, srcShadow)
-	injector := NewInjector(pkg, "")
+	injector := NewInjector(pkg, "", "")
 
 	pts := []analysis.InjectionPoint{}
 
@@ -284,15 +284,15 @@ func usage(err int) error {
 // TestRewriteFile_Comments ensures that comments attached to the replaced node are preserved.
 func TestRewriteFile_Comments(t *testing.T) {
 	src := `package main
-func do() error { return nil } 
+func do() error { return nil }
 func run() error { // Renamed from main to run to allow return values during typing
-  do() // IMPORTANT COMMENT
-  return nil
-} 
+	do() // IMPORTANT COMMENT
+	return nil
+}
 `
 	// We need to parse with ParseComments enabled
 	file, pkg := parseAndCheck(t, src)
-	injector := NewInjector(pkg, "")
+	injector := NewInjector(pkg, "", "")
 
 	pts := []analysis.InjectionPoint{}
 	s, c := findStmt(file, pkg.Fset, "do()")
@@ -318,5 +318,67 @@ func run() error { // Renamed from main to run to allow return values during typ
 
 	if !strings.Contains(outputStr, "IMPORTANT COMMENT") {
 		t.Errorf("Comment lost during rewrite. Output:\n%s", outputStr)
+	}
+}
+
+func TestRewriteFile_GoStmt(t *testing.T) {
+	src := `package main
+func task() error { return nil }
+func multi() (int, error) { return 0, nil }
+
+func main() {
+	go task()
+	go multi()
+}
+`
+	file, pkg := parseAndCheck(t, src)
+	injector := NewInjector(pkg, "", "log-fatal")
+
+	pts := []analysis.InjectionPoint{}
+	// Find go task()
+	s1, c1 := findStmt(file, pkg.Fset, "go task()")
+	if s1 == nil {
+		t.Fatal("go task() not found")
+	}
+	pts = append(pts, analysis.InjectionPoint{Stmt: s1, Call: c1, Pos: s1.Pos()})
+
+	// Find go multi()
+	s2, c2 := findStmt(file, pkg.Fset, "go multi()")
+	if s2 == nil {
+		t.Fatal("go multi() not found")
+	}
+	pts = append(pts, analysis.InjectionPoint{Stmt: s2, Call: c2, Pos: s2.Pos()})
+
+	changed, err := injector.RewriteFile(file, pts)
+	if err != nil {
+		t.Fatalf("RewriteFile GoStmt failed: %v", err)
+	}
+	if !changed {
+		t.Fatal("Expected changes for go routines")
+	}
+
+	// Build output
+	var buf bytes.Buffer
+	printer.Fprint(&buf, pkg.Fset, file)
+	output := buf.String()
+	norm := normalizeSpace(output)
+
+	// Check wrapper for task()
+	// Should be: go func() { err := task(); if err != nil { log.Fatal(err) } }()
+	if !strings.Contains(norm, "go func() {") {
+		t.Error("Did not create anonymous func wrapper")
+	}
+	if !strings.Contains(norm, "err := task()") {
+		t.Error("Did not assign error inside wrapper (task)")
+	}
+	if !strings.Contains(norm, "log.Fatal(err)") {
+		t.Error("Did not inject log.Fatal")
+	}
+
+	// Check wrapper for multi()
+	// Should be: go func() { _, err := multi(); if err != nil ...
+	// Note: normalizeSpace might make it `_, err := multi()`
+	if !strings.Contains(norm, "_, err := multi()") && !strings.Contains(norm, "_, err := multi") {
+		t.Errorf("Did not discard value returns for multi. Got:\n%s", output)
 	}
 }
