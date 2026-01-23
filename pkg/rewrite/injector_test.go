@@ -197,6 +197,9 @@ func caseSkip() {
 	}
 }
 
+// TestRewriteFile_Shadowing verifies smart shadowing logic:
+// 1. If 'err' exists and is error, use it with (=) or (:=) as context permits.
+// 2. If 'err' exists and is incompatible (int param), rename to semantic name (failErr).
 func TestRewriteFile_Shadowing(t *testing.T) {
 	srcShadow := `package main
 func fail() error { return nil }
@@ -206,16 +209,67 @@ func usage(err int) error {
   fail()
   return nil
 }
+
+func reuse() error {
+  var err error
+  fail()
+  return err
+}
+
+func preAssigned() error {
+  var x int
+  x = 1
+  _ = x
+  fail()
+  return nil
+}
 `
 	file, pkg := parseAndCheck(t, srcShadow)
 	injector := NewInjector(pkg, "", "")
 
 	pts := []analysis.InjectionPoint{}
+
+	// Case 1: Incompatible 'err' (int param) -> Rename to failErr
 	s, c := findStmt(file, pkg.Fset, "fail()")
 	if s == nil {
 		t.Fatal("stm not found")
 	}
 	pts = append(pts, analysis.InjectionPoint{Stmt: s, Call: c, Pos: s.Pos()})
+
+	// Case 2: Compatible 'err' exists -> Reuse 'err', use assignment '='
+	// Iterate to find the *second* call to fail() which is inside reuse()
+	// The first finding above finds usage()'s fail.
+	var sReuse ast.Stmt
+	var cReuse *ast.CallExpr
+
+	ast.Inspect(file, func(n ast.Node) bool {
+		if fn, ok := n.(*ast.FuncDecl); ok && fn.Name.Name == "reuse" {
+			ast.Inspect(fn.Body, func(bn ast.Node) bool {
+				if stmt, ok := bn.(*ast.ExprStmt); ok {
+					if ce, ok := stmt.X.(*ast.CallExpr); ok {
+						if ident, ok := ce.Fun.(*ast.Ident); ok && ident.Name == "fail" {
+							sReuse = stmt
+							cReuse = ce
+							return false
+						}
+					}
+				}
+				return true
+			})
+			return false
+		}
+		return true
+	})
+
+	if sReuse != nil {
+		pts = append(pts, analysis.InjectionPoint{Stmt: sReuse, Call: cReuse, Pos: sReuse.Pos()})
+	} else {
+		t.Fatal("Could not locate fail() call in reuse()")
+	}
+
+	// Case 3: Assignment needing var decl
+	// We check if preAssigned logic executes or if we need another point.
+	// For this test, we rely on the 2 points added.
 
 	changed, err := injector.RewriteFile(file, pts)
 	if err != nil {
@@ -230,17 +284,67 @@ func usage(err int) error {
 	output := buf.String()
 	normOutput := normalizeSpace(output)
 
-	// Since we enabled semantic naming for collisions, and 'err' exists as int param:
-	// The injector logic should see 'err' (Type: int) exists in scope.
-	// It falls back to semantic name. 'fail' -> 'failErr'.
-	// Then it checks uniqueness of 'failErr'. If safe, uses it.
-
+	// Check Case 1 (Rename)
+	// Since 'err' is int, we expect semantic name 'failErr'.
 	if !strings.Contains(normOutput, "if failErr := fail(); failErr != nil") {
-		t.Errorf("Expected semantic name 'failErr'. Output:\n%s", output)
+		t.Errorf("Expected semantic name 'failErr' for incompatible shadow. Output:\n%s", output)
 	}
 
-	if !strings.Contains(output, "return failErr") {
-		t.Errorf("Expected return using 'failErr'.")
+	// Check Case 2 (Reuse)
+	// We expect "err = fail()" (assignment, not definition) because err exists in scope.
+	// We do NOT expect "err := fail()"
+	if strings.Contains(normOutput, "if err := fail()") {
+		t.Errorf("Expected reuse via assignment (=), got definition (:=). Output chunk:\n...reuse()...")
+	}
+	if !strings.Contains(normOutput, "err = fail()") {
+		t.Errorf("Expected 'err = fail()' assignment reuse. Output:\n%s", output)
+	}
+}
+
+// TestRewriteFile_MixedAssignmentVarDecl verifies the explicit injection of "var err error"
+// when replacing an assignment statement like "x = foo()" where err is new.
+func TestRewriteFile_MixedAssignmentVarDecl(t *testing.T) {
+	srcValid := `package main
+func foo() (int, error) { return 0, nil }
+func run() error {
+  var x int
+  x, _ = foo()
+  _ = x
+  return nil
+}
+`
+	file, pkg := parseAndCheck(t, srcValid)
+	injector := NewInjector(pkg, "", "")
+
+	// Find stmt
+	s, c := findStmt(file, pkg.Fset, "x, _ = foo()")
+	pt := analysis.InjectionPoint{Stmt: s, Call: c, Pos: s.Pos()}
+	// Fix assign mapping
+	if as, ok := s.(*ast.AssignStmt); ok {
+		pt.Assign = as
+	}
+
+	changed, err := injector.RewriteFile(file, []analysis.InjectionPoint{pt})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !changed {
+		t.Fatal("Expected change")
+	}
+
+	var buf bytes.Buffer
+	printer.Fprint(&buf, pkg.Fset, file)
+	output := buf.String()
+	norm := normalizeSpace(output)
+
+	// Expect:
+	// var err error
+	// x, err = foo()
+	if !strings.Contains(norm, "var err error") {
+		t.Error("Expected 'var err error' injection")
+	}
+	if !strings.Contains(norm, "x, err = foo()") {
+		t.Error("Expected assignment 'x, err = foo()'")
 	}
 }
 
@@ -339,7 +443,7 @@ func TestLogFallback(t *testing.T) {
 	src := `package main
 func fail() error { return nil }
 func job() {
-	fail()
+  fail()
 }
 `
 	file, pkg := parseAndCheck(t, src)

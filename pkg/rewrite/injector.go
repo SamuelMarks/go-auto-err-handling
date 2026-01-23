@@ -144,6 +144,9 @@ func (i *Injector) RewriteFile(file *ast.File, points []analysis.InjectionPoint)
 					oldNode, isOldNode := c.Node().(ast.Node)
 					newNode := newNodes[0]
 
+					// If the first new node is a decl (var err error), we attach comments there,
+					// or to the assignment.
+					// Simple logic: attach to first.
 					if isOldNode && newNode != nil {
 						copyComments(oldNode, newNode)
 					}
@@ -210,7 +213,7 @@ func (i *Injector) generateLogRewrite(point analysis.InjectionPoint, file *ast.F
 	scope := i.getScope(point.Pos, file)
 
 	// Use smart name/reuse resolution
-	errName, tok := i.resolveErrorVar(scope, point.Call)
+	errName, tok, declStmt := i.resolveErrorVar(point, scope)
 
 	assignStmt, err := i.generateAssignment(point, errName, tok)
 	if err != nil {
@@ -243,7 +246,9 @@ func (i *Injector) generateLogRewrite(point analysis.InjectionPoint, file *ast.F
 	}
 
 	canCollapse := true
-	if as, ok := assignStmt.(*ast.AssignStmt); ok {
+	if declStmt != nil {
+		canCollapse = false
+	} else if as, ok := assignStmt.(*ast.AssignStmt); ok {
 		for _, lhs := range as.Lhs {
 			if id, ok := lhs.(*ast.Ident); ok {
 				if id.Name != "_" && id.Name != errName {
@@ -256,12 +261,19 @@ func (i *Injector) generateLogRewrite(point analysis.InjectionPoint, file *ast.F
 		canCollapse = false
 	}
 
-	if canCollapse {
-		logStmt.Init = assignStmt
-		return []ast.Stmt{logStmt}, nil
+	result := []ast.Stmt{}
+	if declStmt != nil {
+		result = append(result, declStmt)
 	}
 
-	return []ast.Stmt{assignStmt, logStmt}, nil
+	if canCollapse {
+		logStmt.Init = assignStmt
+		result = append(result, logStmt)
+	} else {
+		result = append(result, assignStmt, logStmt)
+	}
+
+	return result, nil
 }
 
 // copyComments copies the position info from src to dst.
@@ -309,8 +321,8 @@ func (i *Injector) generateRewrite(point analysis.InjectionPoint, sig *types.Sig
 
 	scope := i.getScope(point.Pos, file)
 
-	// --- Shadow Safe Naming ---
-	errName, tok := i.resolveErrorVar(scope, point.Call)
+	// --- Smart Shadowing ---
+	errName, tok, declStmt := i.resolveErrorVar(point, scope)
 
 	funcName := i.resolveFuncName(point)
 
@@ -329,7 +341,15 @@ func (i *Injector) generateRewrite(point analysis.InjectionPoint, sig *types.Sig
 	}
 
 	canCollapse := true
-	if as, ok := assignStmt.(*ast.AssignStmt); ok {
+	if declStmt != nil {
+		// If we are injecting a declaration first, we cannot collapse into `if init;` cleanly
+		// in all style guides, but technically Go allows it.
+		// However, it's safer/cleaner to keep them separate:
+		// var err error
+		// err = f()
+		// if err != nil ...
+		canCollapse = false
+	} else if as, ok := assignStmt.(*ast.AssignStmt); ok {
 		for _, lhs := range as.Lhs {
 			if id, ok := lhs.(*ast.Ident); ok {
 				if id.Name != "_" && id.Name != errName {
@@ -356,55 +376,157 @@ func (i *Injector) generateRewrite(point analysis.InjectionPoint, sig *types.Sig
 		},
 	}
 
-	if canCollapse {
-		ifStmt.Init = assignStmt
-		return []ast.Stmt{ifStmt}, nil
+	result := []ast.Stmt{}
+	if declStmt != nil {
+		result = append(result, declStmt)
 	}
 
-	return []ast.Stmt{assignStmt, ifStmt}, nil
+	if canCollapse {
+		ifStmt.Init = assignStmt
+		result = append(result, ifStmt)
+	} else {
+		result = append(result, assignStmt, ifStmt)
+	}
+
+	return result, nil
 }
 
-// resolveErrorVar determines the best name for the error variable and whether to use := or =.
-// It checks if 'err' exists in scope and can be reused.
-// If 'err' is shadowed or unavailable, it generates a semantic name like 'setErr'.
+// resolveErrorVar determines the best variable name and assignment token for the error.
+// It performs "Smart Shadowing":
+// 1. If an 'err' variable exists in scope, is of type error, and is mutable: assume reuse.
+// 2. It determines if we can use assignment ('=') or if definition (':=') is required.
 //
-// Returns: variableName, token (DEFINE or ASSIGN).
-func (i *Injector) resolveErrorVar(scope *types.Scope, call *ast.CallExpr) (string, token.Token) {
-	// Base heuristic: prefer "err" if reusable
-	obj := scope.Lookup("err")
+// point: The injection context.
+// scope: The local scope.
+//
+// Returns:
+//
+//	name: The variable name to use (e.g. "err").
+//	tok: The token for assignment (DEFINE := or ASSIGN =).
+//	preDecl: An optional DeclStmt (e.g., `var err error`) if the target variable must be declared first.
+func (i *Injector) resolveErrorVar(point analysis.InjectionPoint, scope *types.Scope) (string, token.Token, *ast.DeclStmt) {
+	candidate := "err"
 
-	// Can we reuse `err` via `=` ?
-	if obj != nil {
-		// Valid object: Variable (not const/func), and matches error type
-		if v, ok := obj.(*types.Var); ok {
-			if i.isErrorType(v.Type()) || i.isErrorExprFromAST(v) {
-				// Reusing is preferred IF we are not blocked by mixed assignment rules from generateAssignment.
-				// For now, simplify: if we target 'err', we return 'err' and ASSIGN.
-				// generateAssignment will validate if ASSIGN matches the rest of LHS.
-				// However, Injector logic often forces := if *any* var is new.
-				// Conservative approach: If 'err' exists, return 'err' but default to DEFINE (shadow)
-				// unless strict reuse is mandated. Standard Go 'if err := ...' shadows safely.
-				// But to avoid "err1", we ignore GenerateUniqueName's collision avoidance
-				// and explicitly return "err" to force shadowing which is idiomatic.
-				return "err", token.DEFINE
+	// 1. Check for valid existing 'err'
+	var existingVar *types.Var
+	if scope != nil {
+		_, obj := scope.LookupParent(candidate, token.NoPos)
+		if obj != nil {
+			if v, ok := obj.(*types.Var); ok {
+				// Check strict error type (ignoring custom error interfaces for safety, stick to standard or built-in error)
+				if i.isErrorType(v.Type()) || i.isErrorExprFromAST(v) {
+					existingVar = v
+				}
 			}
 		}
 	}
 
-	// If 'err' is not in scope, we can use "err" and DEFINE.
-	if obj == nil {
-		return "err", token.DEFINE
+	// 2. Decide on naming collision if existing var is NOT an error (or a const)
+	useExactName := false
+	if existingVar != nil {
+		useExactName = true
+	} else {
+		// If "err" is taken by something unrelated (int, const), we must rename
+		// UNLESS "err" is free, then we use "err".
+		if scope != nil {
+			_, obj := scope.LookupParent(candidate, token.NoPos)
+			if obj == nil {
+				// Free to use "err"
+				useExactName = true
+			} else {
+				// "err" exists but is compatible?
+				// logic above set existingVar only if compatible.
+				// If existingVar is nil here, it means collision with incompatibility.
+				useExactName = false
+			}
+		} else {
+			useExactName = true
+		}
 	}
 
-	// If 'err' exists but is invalid (e.g. wrong type or const), we must avoid it.
-	// We generate a semantic name.
-	// e.g. "loopErr", "evalErr".
+	finalName := candidate
+	if !useExactName {
+		// Generate unique name (e.g. err1, err2)
+		baseName := i.generateSemanticErrName(point)
+		finalName = analysis.GenerateUniqueName(scope, baseName)
+		// Unique name implies new variable => DEFINE
+		return finalName, token.DEFINE, nil
 
-	funcName := i.resolveFuncName(analysis.InjectionPoint{Call: call})
+	}
+
+	// 3. Determine Token (:= vs =)
+
+	// Check if all LHS assignment targets are blank identifiers.
+	// If so, we are free to upgrade assignment (=) to definition (:=) because we aren't mutating any existing vars.
+	// e.g. `_ = f()` -> `err := f()`
+	isAllBlank := false
+	if point.Assign != nil {
+		isAllBlank = true
+		for _, lhs := range point.Assign.Lhs {
+			if id, ok := lhs.(*ast.Ident); !ok || id.Name != "_" {
+				isAllBlank = false
+				break
+			}
+		}
+	}
+
+	// Case A: ExprStmt (Void call originally, or `_` ignore without AssignStmt struct wrapper if simplified)
+	if point.Assign == nil {
+		if existingVar != nil {
+			return finalName, token.ASSIGN, nil // reuse via assignment
+		}
+		return finalName, token.DEFINE, nil // new definition
+	}
+
+	// Case B: AssignStmt (Existing assignment)
+	// Check if the original assignment used :=
+	if point.Assign.Tok == token.DEFINE {
+		// Source: "x := foo()"
+		// Result: "x, err := foo()"
+		// This will behave as standard Go (redeclare or shadow). We preserve `:=`.
+		return finalName, token.DEFINE, nil
+	}
+
+	// Case C: AssignStmt used = (Assignment)
+	// Source: "x = foo()"
+	// Result: "x, err = foo()"
+	if existingVar != nil {
+		// 'err' exists, 'x' exists (implied by =). We can purely assign.
+		return finalName, token.ASSIGN, nil
+	}
+
+	// Special Sub-case: Source used = but all LHS were blank (ignored).
+	// Source: "_ = foo()"
+	// Target: "err := foo()" (Upgrade to definition)
+	if isAllBlank {
+		return finalName, token.DEFINE, nil
+	}
+
+	// Case D: AssignStmt used =, but 'err' is NEW.
+	// Source: "x = foo()" (where x is pre-declared)
+	// Result Attempt: "x, err = foo()" -> ERROR: err undef.
+	// Result Attempt: "x, err := foo()" -> ERROR: x no new var (assuming x in same block).
+	//                                   OR if x in outer, shadows x (logic drift).
+	// Correct Fix: "var err error; x, err = foo()"
+	return finalName, token.ASSIGN, &ast.DeclStmt{
+		Decl: &ast.GenDecl{
+			Tok: token.VAR,
+			Specs: []ast.Spec{
+				&ast.ValueSpec{
+					Names: []*ast.Ident{{Name: finalName}},
+					Type:  &ast.Ident{Name: "error"},
+				},
+			},
+		},
+	}
+}
+
+// generateSemanticErrName generates a backup name if "err" is taken.
+func (i *Injector) generateSemanticErrName(point analysis.InjectionPoint) string {
+	funcName := i.resolveFuncName(point)
 	if idx := strings.LastIndex(funcName, "."); idx != -1 {
 		funcName = funcName[idx+1:]
 	}
-	// To lower camel
 	if len(funcName) > 0 {
 		r := []rune(funcName)
 		r[0] = unicode.ToLower(r[0])
@@ -412,12 +534,7 @@ func (i *Injector) resolveErrorVar(scope *types.Scope, call *ast.CallExpr) (stri
 	} else {
 		funcName = "call"
 	}
-
-	baseName := fmt.Sprintf("%sErr", funcName)
-
-	// Ensure this semantic name is unique
-	unique := analysis.GenerateUniqueName(scope, baseName)
-	return unique, token.DEFINE
+	return fmt.Sprintf("%sErr", funcName)
 }
 
 // isErrorExprFromAST is a backup check if Types info is missing for the var.

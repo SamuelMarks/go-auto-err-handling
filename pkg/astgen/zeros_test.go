@@ -28,6 +28,13 @@ func TestZeroExpr(t *testing.T) {
 		nil,
 	)
 
+	// Create a generic type parameter T
+	// Corresponds to: func Foo[T any]() ...
+	typeParamT := types.NewTypeParam(
+		types.NewTypeName(token.NoPos, nil, "T", nil),
+		nil, // constraint (usually interface), nil implies any/empty in simple construction
+	)
+
 	tests := []struct {
 		name      string
 		inputType types.Type
@@ -46,7 +53,9 @@ func TestZeroExpr(t *testing.T) {
 		{"NamedArray", namedArray, "MyArray{}", false},
 		{"AnonymousStruct", types.NewStruct(nil, nil), "struct{}{}", false},
 		{"ErrorInterface", types.Universe.Lookup("error").Type(), "nil", false},
+		{"GenericTypeParam", typeParamT, "*new(T)", false},
 		{"TupleError", types.NewTuple(types.NewVar(token.NoPos, nil, "a", intType)), "", true},
+		{"NilInput", nil, "", true},
 	}
 
 	for _, tt := range tests {

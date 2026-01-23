@@ -10,24 +10,21 @@ import (
 )
 
 // AddErrorToSignature modifies a function declaration signature to include an error return type.
-// It appends 'error' to the results list and updates all return statements within the function body
-// to include a 'nil' value for the new error return, unless it detects a naked return usage.
+// It performs smart anonymization of return values to prefer idiomatic Go signatures
+// (e.g., "func() (int, error)" instead of "func() (i int, err error)") when logically safe.
 //
-// It handles named return value collisions. If 'err' is already used as a parameter or return value name,
-// it generates a safe alternative (e.g., 'err1', 'err2').
+// The logic is as follows:
+// 1. Appends 'error' to the results list.
+// 2. Checks if named returns are strictly necessary (i.e., if "naked returns" are used in the body).
+// 3. If naked returns exist, it preserves all parameter names and ensures the new error is named (e.g., "err").
+// 4. If no naked returns exist, it "anonymizes" the signature:
+//   - Removes names from existing result fields.
+//   - If a removed name was referenced in the function body, it injects a "var <name> <type>"
+//     declaration at the top of the function to maintain validity.
 //
-// Examples:
+// 5. Updates all explicitly returned values to include "nil" for the error position.
 //
-//	func Foo()              -> func Foo() error
-//	func Bar() int          -> func Bar() (int, error)
-//	func Baz() (i int)      -> func Baz() (i int, err error)
-//	func Err(err int) (i int) -> func Err(err int) (i int, err1 error)
-//
-// Nested function literals and declarations are ignored.
-// If the function contained no return values (void), a 'return nil' statement is appended to the body
-// to ensure valid control flow, unless the last statement is already a return.
-//
-// fset: The FileSet (unused but provided for compatibility/future use).
+// fset: The FileSet for position handling.
 // decl: The function declaration to modify.
 //
 // Returns true if the signature was modified.
@@ -41,43 +38,90 @@ func AddErrorToSignature(fset *token.FileSet, decl *ast.FuncDecl) (bool, error) 
 		decl.Type.Results = &ast.FieldList{}
 	}
 
-	// Clear positions on Results to allow go/format to re-layout correctly
-	// ignoring potentially stale comma positions.
+	// Clear positions to allow reformatting
 	decl.Type.Results.Opening = token.NoPos
 	decl.Type.Results.Closing = token.NoPos
 
-	// 1. Analyze existing elements for naming and collisions
+	// 1. Analyze Context: Do we have named returns? Are they naked?
 	hasNamedReturns := false
-	usedNames := make(map[string]bool)
-
-	// Scan parameters for used names
-	if decl.Type.Params != nil {
-		for _, field := range decl.Type.Params.List {
-			for _, name := range field.Names {
-				usedNames[name.Name] = true
-			}
-		}
-	}
-
-	// Scan existing results for used names and check if named returns are used
-	existingResults := decl.Type.Results.List
-	wasVoid := len(existingResults) == 0
-
-	for _, field := range existingResults {
+	for _, field := range decl.Type.Results.List {
 		if len(field.Names) > 0 {
 			hasNamedReturns = true
-			for _, name := range field.Names {
-				usedNames[name.Name] = true
-			}
+			break
 		}
 	}
 
-	// 2. Modify Signature: Append 'error'
+	hasNakedReturns := false
+	if hasNamedReturns {
+		hasNakedReturns = scanForNakedReturns(decl.Body)
+	}
+
+	// 2. Strategy Decision
+	preserveNames := hasNakedReturns
+	wasVoid := len(decl.Type.Results.List) == 0
+
+	// 3. Apply Anonymization (if applicable)
+	var injectedStmts []ast.Stmt
+
+	if hasNamedReturns && !preserveNames {
+		var newResultList []*ast.Field
+
+		for _, field := range decl.Type.Results.List {
+			typeExpr := field.Type
+
+			// Handle multi-name fields like "func() (a, b int)"
+			for _, name := range field.Names {
+				// Inject var if used
+				if isNameUsed(decl.Body, name.Name) {
+					declStmt := &ast.DeclStmt{
+						Decl: &ast.GenDecl{
+							Tok: token.VAR,
+							Specs: []ast.Spec{
+								&ast.ValueSpec{
+									Names: []*ast.Ident{{Name: name.Name}},
+									Type:  typeExpr,
+								},
+							},
+						},
+					}
+					injectedStmts = append(injectedStmts, declStmt)
+				}
+				// Append anonymous field for THIS specific variable types.
+				newResultList = append(newResultList, &ast.Field{
+					Type: typeExpr, // Sharing pointer is fine for AST logic, printer handles it.
+				})
+			}
+		}
+
+		decl.Type.Results.List = newResultList
+		hasNamedReturns = false
+	}
+
+	// 4. Prepend Injected Variables (if any)
+	if len(injectedStmts) > 0 {
+		decl.Body.List = append(injectedStmts, decl.Body.List...)
+	}
+
+	// 5. Append 'error' field
 	errorType := &ast.Ident{Name: "error"}
 	var newField *ast.Field
 
 	if hasNamedReturns {
-		// Calculate safe name
+		// Calculate safe name avoiding collisions
+		usedNames := make(map[string]bool)
+		if decl.Type.Params != nil {
+			for _, f := range decl.Type.Params.List {
+				for _, n := range f.Names {
+					usedNames[n.Name] = true
+				}
+			}
+		}
+		for _, f := range decl.Type.Results.List {
+			for _, n := range f.Names {
+				usedNames[n.Name] = true
+			}
+		}
+
 		baseName := "err"
 		name := baseName
 		count := 1
@@ -98,12 +142,11 @@ func AddErrorToSignature(fset *token.FileSet, decl *ast.FuncDecl) (bool, error) 
 
 	decl.Type.Results.List = append(decl.Type.Results.List, newField)
 
-	// 3. Update Return Statements
-	// We use astutil.Apply to traverse. We must skip nested functions.
+	// 6. Update Return Statements
 	astutil.Apply(decl.Body, func(c *astutil.Cursor) bool {
 		node := c.Node()
 
-		// Skip nested function literals or declarations to avoid modifying their returns
+		// Skip nested function literals or declarations
 		if _, isFuncLit := node.(*ast.FuncLit); isFuncLit {
 			return false
 		}
@@ -113,36 +156,24 @@ func AddErrorToSignature(fset *token.FileSet, decl *ast.FuncDecl) (bool, error) 
 
 		// Handle Return Statements
 		if ret, isRet := node.(*ast.ReturnStmt); isRet {
-			// Logic for updating returns:
-			// - If named returns are used, and result list is empty (naked return),
-			//   we rely on implicit return of named vars (including our new 'err'). Do NOT append nil.
-			// - If result list is NOT empty (explicit return), we *must* append 'nil'.
-			// - If it was previously void (unnamed), result list is empty. We *must* append 'nil'.
-
 			isNaked := hasNamedReturns && len(ret.Results) == 0
 
 			if !isNaked && (len(ret.Results) > 0 || wasVoid) {
-				// Append 'nil'
 				ret.Results = append(ret.Results, &ast.Ident{Name: "nil"})
 			}
-			// Stop traversing children of the return statement
 			return false
 		}
 		return true
 	}, nil)
 
-	// 4. Handle Void Fallthrough
-	// If the function was void, it might not have an explicit return statement at the end.
-	// We append "return nil" to the body to ensure it returns the error.
+	// 7. Handle Void Fallthrough
 	if wasVoid {
-		// Check if the last statement is already a return (optional visual optimization, though explicitly appending is strictly safer against branching fallthrough)
 		needsAppend := true
 		if len(decl.Body.List) > 0 {
 			if _, ok := decl.Body.List[len(decl.Body.List)-1].(*ast.ReturnStmt); ok {
 				needsAppend = false
 			}
 		}
-
 		if needsAppend {
 			decl.Body.List = append(decl.Body.List, &ast.ReturnStmt{
 				Results: []ast.Expr{&ast.Ident{Name: "nil"}},
@@ -226,10 +257,81 @@ func EnsureNamedReturns(fset *token.FileSet, decl *ast.FuncDecl, info *types.Inf
 	return changeMade, nil
 }
 
+// scanForNakedReturns traverses the block to find any empty return statements.
+// Does not descend into nested functions.
+//
+// body: The function body to scan.
+//
+// Returns true if a naked return is found.
+func scanForNakedReturns(body *ast.BlockStmt) bool {
+	if body == nil {
+		return false
+	}
+	found := false
+	ast.Inspect(body, func(n ast.Node) bool {
+		if found {
+			return false
+		}
+		// Don't modify context of nested functions
+		if _, ok := n.(*ast.FuncLit); ok {
+			return false
+		}
+		if _, ok := n.(*ast.FuncDecl); ok {
+			return false
+		}
+
+		if ret, ok := n.(*ast.ReturnStmt); ok {
+			if len(ret.Results) == 0 {
+				found = true
+				return false
+			}
+		}
+		return true
+	})
+	return found
+}
+
+// isNameUsed checks if a specific identifier name is referenced in the block.
+// Used to determine if a stripped return parameter needs a local variable declaration.
+//
+// body: The block to scan.
+// name: The identifier name to look for.
+//
+// Returns true if the name is used.
+func isNameUsed(body *ast.BlockStmt, name string) bool {
+	if body == nil {
+		return false
+	}
+	used := false
+	ast.Inspect(body, func(n ast.Node) bool {
+		if used {
+			return false
+		}
+		// Don't confuse scope with nested functions
+		if _, ok := n.(*ast.FuncLit); ok {
+			return false
+		}
+		if _, ok := n.(*ast.FuncDecl); ok {
+			return false
+		}
+
+		if id, ok := n.(*ast.Ident); ok {
+			if id.Name == name {
+				used = true
+				return false
+			}
+		}
+		return true
+	})
+	return used
+}
+
 // isErrorType checks if the AST expression represents the "error" type.
 // It performs a simple string check on the identifier.
 //
 // expr: The AST expression to check.
+//
+// Returns true if the expression represents a standard error type.
 func isErrorType(expr ast.Expr) bool {
 	if ident, ok := expr.(*ast.Ident); ok {
 		return ident.Name == "error"

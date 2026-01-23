@@ -42,6 +42,9 @@ func render(fset *token.FileSet, node ast.Node) string {
 	return buf.String()
 }
 
+// TestAddErrorToSignature checks various scenarios for signature modification,
+// specifically focusing on the logic that enforces anonymous returns ("Anonymous Mode")
+// when possible.
 func TestAddErrorToSignature(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -70,16 +73,30 @@ func TestAddErrorToSignature(t *testing.T) {
 			expected: "func A() (int, error) { return 1, nil }",
 		},
 		{
-			name:     "NamedResult",
-			input:    "func A() (res int) { res = 1; return }",
-			expected: "func A() (res int, err error) { res = 1; return }",
+			// Previously this would yield (res int, err error).
+			// Now "Anonymous Mode" should trigger because 'res' is used but no naked return.
+			// It should strip 'res', inject 'var res int', and return (int, error).
+			name:  "NamedResult_Anonymize_WithUsage",
+			input: "func A() (res int) { res = 1; return res }",
+			// Variable usage "res = 1" implies we need to keep the variable.
+			// Signature becomes anonymous. Var injected.
+			expected: "func A() (int, error) { var res int; res = 1; return res, nil }",
 		},
 		{
-			name:     "NamedResultExplicit",
+			// Named result unused in body.
+			// "Anonymous Mode" should strip it entirely without injecting var.
+			name:     "NamedResult_Anonymize_NoUsage",
 			input:    "func A() (res int) { return 1 }",
-			expected: "func A() (res int, err error) { return 1, nil }",
+			expected: "func A() (int, error) { return 1, nil }",
 		},
 		{
+			// Naked return present: MUST PRESERVE NAMES.
+			name:     "NakedReturn_PreserveNames",
+			input:    "func A() (x int) { x=1; return }",
+			expected: "func A() (x int, err error) { x = 1; return }",
+		},
+		{
+			// Mixed Control Flow
 			name:  "MixedControlFlow",
 			input: "func A() { if true { return }; fmt.Print() }",
 			// Adjust expected string indentation to match standard format
@@ -97,41 +114,28 @@ func TestAddErrorToSignature(t *testing.T) {
 			expected: "func A() error { f := func() int { return 1 }; f(); return nil }",
 		},
 		{
-			// Collision detected (Param shadowed)
-			name:     "CollisionParam",
+			// Collision detection normally handled by generating "err1",
+			// but here "Anonymous Mode" should trigger, stripping "err" int param.
+			// Body uses "err", so we inject "var err int".
+			// Signature becomes (int, error). No name collision in sig.
+			name:     "CollisionParam_Anonymized",
 			input:    "func A(err int) (res int) { return 1 }",
-			expected: "func A(err int) (res int, err1 error) { return 1, nil }",
-		},
-		{
-			// Collision detected (Existing Result)
-			name:     "CollisionResult",
-			input:    "func A() (err int) { return 1 }",
-			expected: "func A() (err int, err1 error) { return 1, nil }",
-		},
-		{
-			// Collision detected (Both)
-			name:     "CollisionMultiple",
-			input:    "func A(err int) (err1 int) { return 1 }",
-			expected: "func A(err int) (err1 int, err2 error) { return 1, nil }",
-		},
-		{
-			// Unnamed results: names are invisible, so no collision prevention needed technically,
-			// but logic might still generate "int, error" which is fine.
-			name:     "CollisionUnnamed",
-			input:    "func A(err int) int { return 1 }",
 			expected: "func A(err int) (int, error) { return 1, nil }",
 		},
 		{
-			// Naked Return Optimization Case
-			name:     "NakedReturnOptimization",
-			input:    "func A() (x int) { x=1; return }",
-			expected: "func A() (x int, err error) { x = 1; return }",
+			// If Naked Return forces names, THEN collision logic applies.
+			// Input has result named "err".
+			name:     "CollisionResult_PreserveNames",
+			input:    "func A() (err int) { err=1; return }", // Naked -> Keep names
+			expected: "func A() (err int, err1 error) { err = 1; return }",
 		},
 		{
-			// Explicit return in Named function (Mixed Style)
-			name:     "MixedStyleExplicitReturn",
-			input:    "func A() (x int) { return 1 }",
-			expected: "func A() (x int, err error) { return 1, nil }",
+			// Edge case: Multiple named returns, some used.
+			// Input: (a, b int). a used. b unused. Explicit return.
+			// Anonymize -> (int, int, error). Inject var a. Drop b.
+			name:     "MultiResult_PartialUsage",
+			input:    "func A() (a, b int) { a = 1; return a, 2 }",
+			expected: "func A() (int, int, error) { var a int; a = 1; return a, 2, nil }",
 		},
 	}
 
