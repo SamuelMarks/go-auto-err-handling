@@ -122,6 +122,10 @@ func formatASTToBuf(fset *token.FileSet, node interface{}, filename string, buf 
 	if err != nil {
 		return err
 	}
-	buf.Write(b)
+	_, err1 := buf.Write(b)
+	if err1 != nil {
+		return err1
+	}
+
 	return nil
 }

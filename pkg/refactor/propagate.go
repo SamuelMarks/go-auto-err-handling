@@ -32,7 +32,7 @@ const (
 // 2. Checks if the enclosing function is an entry point (main/init) or a regular function.
 // 3. If entry point, injects a terminal handler (log.Fatal/panic/Exit).
 // 4. If regular function, checks if it returns error.
-//   - If yes, injects `if err != nil { return ..., err }`.
+//   - If yes, injects `if err := ...; err != nil { return ..., err }` (using collapse if possible).
 //   - If no, assigns error to `_` (or leaves for future passes if recursive propagation is intended manually, but currently silences to fix build).
 //
 // pkgs: The set of packages to search for callers.
@@ -105,6 +105,19 @@ func PropagateCallers(pkgs []*packages.Package, target *types.Func, strategy str
 	}
 
 	return updates, nil
+}
+
+// HandleEntryPoint injects terminal error handling for a call site within an entry point (main/init)
+// without creating a compilation error by forcing a signature change.
+//
+// This is used by the runner to handle unhandled errors directly inside main().
+func HandleEntryPoint(file *ast.File, call *ast.CallExpr, stmt ast.Stmt, strategy string) error {
+	var assignment *ast.AssignStmt
+	if as, ok := stmt.(*ast.AssignStmt); ok {
+		assignment = as
+	}
+	// We pass nil for enclosingSig because terminal handling (true) bypasses the return check.
+	return refactorCallSite(call, assignment, stmt, nil, file, nil, true, MainHandlerStrategy(strategy))
 }
 
 // isIdentFunctionInCall checks if the identifier acts as the function expression in the call.
@@ -204,7 +217,7 @@ func refactorCallSite(call *ast.CallExpr, assign *ast.AssignStmt, stmt ast.Stmt,
 		assign.Lhs = newLHS
 	} else {
 		// Expression statement: "foo()"
-		// Convert to "_, ..., err := foo()" via replacement block
+		// Convert to "if err := foo(); err != nil ..." via replacement block
 		return replaceStatementInBlock(file, stmt, enclosingSig, call, isTerminal, strategy)
 	}
 
@@ -233,6 +246,7 @@ func refactorCallSite(call *ast.CallExpr, assign *ast.AssignStmt, stmt ast.Stmt,
 }
 
 // replaceStatementInBlock handles the case where ExprStmt needs to become AssignStmt + IfStmt.
+// It tries to use the collapsed syntax `if err := call; err != nil { ... }`.
 //
 // file: The AST file.
 // oldStmt: The statement to replace.
@@ -248,24 +262,41 @@ func replaceStatementInBlock(file *ast.File, oldStmt ast.Stmt, sig *types.Signat
 		Rhs: []ast.Expr{call},
 	}
 
-	canReturn := canReturnError(sig)
+	// Determine if control flow allows return (non-terminal strategies do, terminal ones don't need it)
+	canReturn := false
+	if !isTerminal {
+		canReturn = canReturnError(sig)
+	}
+
+	// Determine check logic
+	var check *ast.IfStmt
+	var err error
+
+	if isTerminal {
+		check = generateTerminalCheck(strategy)
+	} else if canReturn {
+		check, err = generateErrorCheck(sig)
+		if err != nil {
+			return err
+		}
+	}
 
 	astutil.Apply(file, func(c *astutil.Cursor) bool {
 		if c.Node() == oldStmt {
-			c.Replace(as)
-			if isTerminal {
-				check := generateTerminalCheck(strategy)
-				c.InsertAfter(check)
-			} else if canReturn {
-				check, _ := generateErrorCheck(sig)
-				c.InsertAfter(check)
+			if check != nil {
+				// Use collapsed syntax: if err := call; err != nil { ... }
+				check.Init = as
+				c.Replace(check)
 			} else {
-				// Mute usage
+				// If we can't check (no return error and not terminal), we mute it.
+				// as becomes "_ = call".
 				as.Lhs[0] = &ast.Ident{Name: "_"}
-				// If we have "_ := foo()", this is invalid Go. Must be "_ = foo()".
+				// We don't have "err != nil", so strictly we just replace with the assignment.
+				// However, standard assignment _ = x might be assignment specific.
 				if len(as.Lhs) == 1 {
 					as.Tok = token.ASSIGN
 				}
+				c.Replace(as)
 			}
 			return false // stop
 		}
@@ -325,6 +356,7 @@ func generateErrorCheck(sig *types.Signature) (*ast.IfStmt, error) {
 }
 
 // generateTerminalCheck generates code to handle error at entry points.
+// Note: This returns an IfStmt *without* the Init field set. Caller must set Init if collapsing.
 func generateTerminalCheck(strategy MainHandlerStrategy) *ast.IfStmt {
 	var bodyStmts []ast.Stmt
 

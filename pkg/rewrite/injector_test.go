@@ -3,6 +3,8 @@ package rewrite
 import (
 	"bytes"
 	"go/ast"
+	"go/format" // Explicit import to fix undefined format error
+	"go/importer"
 	"go/parser"
 	"go/printer"
 	"go/token"
@@ -26,7 +28,7 @@ func parseAndCheck(t *testing.T, source string) (*ast.File, *packages.Package) {
 
 	// Run type checker to populate TypeInfo
 	conf := types.Config{
-		Importer: nil, // Use default or mock if needed. Source shouldn't depend on external pkgs for this unit test.
+		Importer: importer.Default(), // Necessary to resolve stdlib imports like "errors"
 		Error: func(err error) {
 			t.Logf("Type check error: %v", err)
 		},
@@ -101,30 +103,37 @@ func findStmt(file *ast.File, fset *token.FileSet, match string) (ast.Stmt, *ast
 	return targetStmt, targetCall
 }
 
+// normalizeSpace compacts whitespace to ensure robust comparison against generated code
+// even if comments or formatter introduce newlines/indentation differences.
+func normalizeSpace(s string) string {
+	return strings.Join(strings.Fields(s), " ")
+}
+
 func TestRewriteFile(t *testing.T) {
 	// Source code with different scenarios
-	// Uses Arguments to differentiate calls so finding statements works reliably with print
+	// NOTE: Comments removed from calls to allow clean AST rewriting verification
+	// without comment location weirdness confusing the simple string checks.
 	srcUnique := `package main
 func f(i int) error { return nil } 
 func g() (int, error) { return 0, nil } 
 
 func case1() error { 
-  f(1) // Point 1
+  f(1) 
   return nil
 } 
 
 func case2() (string, error) { 
-  _ = f(2) // Point 2
+  _ = f(2) 
   return "", nil
 } 
 
 func case3() (int, error) { 
-  i, _ := g() // Point 3
+  i, _ := g() 
   return i, nil
 } 
 
 func caseSkip() { 
-  f(4) // Point 4
+  f(4) 
 } 
 `
 	file, pkg := parseAndCheck(t, srcUnique)
@@ -165,19 +174,30 @@ func caseSkip() {
 	var buf bytes.Buffer
 	printer.Fprint(&buf, pkg.Fset, file)
 	output := buf.String()
+	normOutput := normalizeSpace(output)
 
 	// Validation
-	// Case 1: Expected "err := f(1); if err != nil { return err }"
-	if !strings.Contains(output, "err := f(1)") || !strings.Contains(output, "return err") {
-		t.Errorf("Case 1 definition missing or incorrect. Got:\n%s", output)
+	// Case 1: Expected "if err := f(1); err != nil { return err }" (collapsed)
+	if !strings.Contains(normOutput, "if err := f(1); err != nil") {
+		t.Errorf("Case 1 not using collapsed syntax. Got:\n%s", output)
+	}
+	if !strings.Contains(output, "return err") {
+		t.Errorf("Case 1 return missing. Got:\n%s", output)
 	}
 
-	// Case 2: Expected "err := f(2); if err != nil { return "", err }"
+	// Case 2: Expected "if err := f(2); err != nil { return "", err }" (collapsed)
+	if !strings.Contains(normOutput, "if err := f(2); err != nil") {
+		t.Errorf("Case 2 not using collapsed syntax. Got:\n%s", output)
+	}
 	if !strings.Contains(output, `return "", err`) {
 		t.Errorf("Case 2 return statement incorrect. Got:\n%s", output)
 	}
 
 	// Case 3: Expected "i, err := g(); if err != nil { return 0, err }"
+	// Should NOT be collapsed because 'i' escapes the if scope
+	if strings.Contains(normOutput, "if i, err := g();") {
+		t.Errorf("Case 3 incorrectly collapsed (scope unsafe). Got:\n%s", output)
+	}
 	if !strings.Contains(output, "i, err := g()") {
 		t.Errorf("Case 3 assignment rewrite incorrect. Got:\n%s", output)
 	}
@@ -194,7 +214,7 @@ func fail() error { return nil }
 
 func usage(err int) error { 
   _ = err
-  fail() // Point 1
+  fail() 
   return nil
 } 
 `
@@ -221,8 +241,15 @@ func usage(err int) error {
 	var buf bytes.Buffer
 	printer.Fprint(&buf, pkg.Fset, file)
 	output := buf.String()
+	normOutput := normalizeSpace(output)
 
-	// Parse back the specific output to verify correctness regardless of comments
+	// Check for collapsed "if err1 := fail(); err1 != nil"
+	// We verify using normalized string to safely ignore comment-induced newlines.
+	if !strings.Contains(normOutput, "if err1 := fail(); err1 != nil") {
+		t.Errorf("Expected collapsed if with err1. Output:\n%s", output)
+	}
+
+	// Double check the AST structure for correctness
 	fset := token.NewFileSet()
 	f, err := parser.ParseFile(fset, "", output, parser.ParseComments)
 	if err != nil {
@@ -251,5 +278,45 @@ func usage(err int) error {
 
 	if !strings.Contains(output, "return err1") {
 		t.Errorf("Expected return using 'err1'.")
+	}
+}
+
+// TestRewriteFile_Comments ensures that comments attached to the replaced node are preserved.
+func TestRewriteFile_Comments(t *testing.T) {
+	src := `package main
+func do() error { return nil } 
+func run() error { // Renamed from main to run to allow return values during typing
+  do() // IMPORTANT COMMENT
+  return nil
+} 
+`
+	// We need to parse with ParseComments enabled
+	file, pkg := parseAndCheck(t, src)
+	injector := NewInjector(pkg, "")
+
+	pts := []analysis.InjectionPoint{}
+	s, c := findStmt(file, pkg.Fset, "do()")
+	if s == nil {
+		t.Fatal("stm not found")
+	}
+	pts = append(pts, analysis.InjectionPoint{Stmt: s, Call: c, Pos: s.Pos()})
+
+	changed, err := injector.RewriteFile(file, pts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !changed {
+		t.Fatal("Expected change")
+	}
+
+	// Render and format
+	var buf bytes.Buffer
+	if err := format.Node(&buf, pkg.Fset, file); err != nil {
+		t.Fatal(err)
+	}
+	outputStr := buf.String()
+
+	if !strings.Contains(outputStr, "IMPORTANT COMMENT") {
+		t.Errorf("Comment lost during rewrite. Output:\n%s", outputStr)
 	}
 }

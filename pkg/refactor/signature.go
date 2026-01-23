@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"go/ast"
 	"go/token"
+	"go/types"
 
 	"golang.org/x/tools/go/ast/astutil"
 )
@@ -12,11 +13,15 @@ import (
 // It appends 'error' to the results list and updates all return statements within the function body
 // to include a 'nil' value for the new error return.
 //
+// It handles named return value collisions. If 'err' is already used as a parameter or return value name,
+// it generates a safe alternative (e.g., 'err1', 'err2').
+//
 // Examples:
 //
 //	func Foo()              -> func Foo() error
 //	func Bar() int          -> func Bar() (int, error)
 //	func Baz() (i int)      -> func Baz() (i int, err error)
+//	func Err(err int) (i int) -> func Err(err int) (i int, err1 error)
 //
 // Nested function literals and declarations are ignored.
 // If the function contained no return values (void), a 'return nil' statement is appended to the body
@@ -41,15 +46,29 @@ func AddErrorToSignature(fset *token.FileSet, decl *ast.FuncDecl) (bool, error) 
 	decl.Type.Results.Opening = token.NoPos
 	decl.Type.Results.Closing = token.NoPos
 
-	// 1. Analyze existing signature to see if we use named returns
+	// 1. Analyze existing elements for naming and collisions
 	hasNamedReturns := false
+	usedNames := make(map[string]bool)
+
+	// Scan parameters for used names
+	if decl.Type.Params != nil {
+		for _, field := range decl.Type.Params.List {
+			for _, name := range field.Names {
+				usedNames[name.Name] = true
+			}
+		}
+	}
+
+	// Scan existing results for used names and check if named returns are used
 	existingResults := decl.Type.Results.List
 	wasVoid := len(existingResults) == 0
 
 	for _, field := range existingResults {
 		if len(field.Names) > 0 {
 			hasNamedReturns = true
-			break
+			for _, name := range field.Names {
+				usedNames[name.Name] = true
+			}
 		}
 	}
 
@@ -58,9 +77,17 @@ func AddErrorToSignature(fset *token.FileSet, decl *ast.FuncDecl) (bool, error) 
 	var newField *ast.Field
 
 	if hasNamedReturns {
-		// If using named returns, the new error must also be named to avoid syntax errors
+		// Calculate safe name
+		baseName := "err"
+		name := baseName
+		count := 1
+		for usedNames[name] {
+			name = fmt.Sprintf("%s%d", baseName, count)
+			count++
+		}
+
 		newField = &ast.Field{
-			Names: []*ast.Ident{{Name: "err"}},
+			Names: []*ast.Ident{{Name: name}},
 			Type:  errorType,
 		}
 	} else {
@@ -126,15 +153,17 @@ func AddErrorToSignature(fset *token.FileSet, decl *ast.FuncDecl) (bool, error) 
 
 // EnsureNamedReturns inspects the function declaration and ensures all return values are named.
 // If the function definition already uses named returns, no changes are made.
-// If the function uses unnamed returns, it generates names for them (e.g., ret0, ret1, ..., err).
+// If the function uses unnamed returns, it generates names for them (e.g., s, i, ctx) using type heuristics.
+// It handles name collisions locally (e.g. s, s1, s2).
 //
 // This is crucial for deferred closures to capture and modify return values.
 //
-// fset: The FileSet (unused but provided for compatibility).
+// fset: The FileSet.
 // decl: The function declaration to modify.
+// info: The type info (optional, can be nil). If provided, richer type-based naming is used.
 //
 // Returns true if any changes were made.
-func EnsureNamedReturns(fset *token.FileSet, decl *ast.FuncDecl) (bool, error) {
+func EnsureNamedReturns(fset *token.FileSet, decl *ast.FuncDecl, info *types.Info) (bool, error) {
 	if decl == nil {
 		return false, fmt.Errorf("function declaration is nil")
 	}
@@ -145,34 +174,50 @@ func EnsureNamedReturns(fset *token.FileSet, decl *ast.FuncDecl) (bool, error) {
 	results := decl.Type.Results.List
 
 	// Check if already named. Go forbids mixing named and unnamed, so check the first one.
-	// However, the AST might theoretically interpret "(int, int)" as two fields with empty Names.
 	if len(results[0].Names) > 0 {
 		return false, nil
 	}
 
 	changeMade := false
-	retCount := 0
+	nameCounts := make(map[string]int)
+
 	total := len(results)
-
 	for i, field := range results {
-		// Field should not have names if we are here (assuming consistent AST from valid Go),
-		// but checking acts as a safety against malformed AST or partial states.
+		// We expect unnamed fields
 		if len(field.Names) == 0 {
-			name := fmt.Sprintf("ret%d", retCount)
+			var baseName string
 
-			// Heuristic: If it is the last return value and it is of type "error", name it "err".
+			// Heuristic Logic
+			// 1. Try TypeInfo
+			if info != nil {
+				if t, ok := info.Types[field.Type]; ok {
+					baseName = NameForType(t.Type)
+				}
+			}
+			// 2. Fallback to AST
+			if baseName == "" || baseName == "v" {
+				baseName = NameForExpr(field.Type)
+			}
+
+			// 3. Special case for trailing error
+			// If it's the very last return and it's an error type, force 'err'
+			// (NameForType usually returns 'err' for error, but AST fallback might not if type is aliased/unclear)
 			isLast := i == total-1
 			if isLast && isErrorType(field.Type) {
-				name = "err"
+				baseName = "err"
+			}
+
+			// Collision handling
+			name := baseName
+			if count, seen := nameCounts[baseName]; seen {
+				name = fmt.Sprintf("%s%d", baseName, count)
+				nameCounts[baseName] = count + 1
 			} else {
-				retCount++
+				nameCounts[baseName] = 1
 			}
 
 			field.Names = []*ast.Ident{{Name: name}}
 			changeMade = true
-		} else {
-			// Should not occur in valid Go code if first field was unnamed, but handle safely
-			retCount += len(field.Names)
 		}
 	}
 
@@ -181,9 +226,13 @@ func EnsureNamedReturns(fset *token.FileSet, decl *ast.FuncDecl) (bool, error) {
 
 // isErrorType checks if the AST expression represents the "error" type.
 // It performs a simple string check on the identifier.
+//
+// expr: The AST expression to check.
 func isErrorType(expr ast.Expr) bool {
 	if ident, ok := expr.(*ast.Ident); ok {
 		return ident.Name == "error"
 	}
+	// Also check qualified "builtin.error" or similar if ast contains it?
+	// Usually just "error" in signatures.
 	return false
 }

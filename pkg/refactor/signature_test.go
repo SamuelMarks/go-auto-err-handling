@@ -76,6 +76,7 @@ func TestAddErrorToSignature(t *testing.T) {
 		{
 			name:  "MixedControlFlow",
 			input: "func A() { if true { return }; fmt.Print() }",
+			// Adjust expected string indentation to match standard format
 			expected: `func A() error {
 	if true {
 		return nil
@@ -90,9 +91,29 @@ func TestAddErrorToSignature(t *testing.T) {
 			expected: "func A() error { f := func() int { return 1 }; f(); return nil }",
 		},
 		{
-			name:     "ExistingErrorShouldDouble", // Technical behavior check: it blindly adds error
-			input:    "func A() error { return nil }",
-			expected: "func A() (error, error) { return nil, nil }",
+			// Collision detected (Param shadowed)
+			name:     "CollisionParam",
+			input:    "func A(err int) (res int) { return 1 }",
+			expected: "func A(err int) (res int, err1 error) { return 1, nil }",
+		},
+		{
+			// Collision detected (Existing Result)
+			name:     "CollisionResult",
+			input:    "func A() (err int) { return 1 }",
+			expected: "func A() (err int, err1 error) { return 1, nil }",
+		},
+		{
+			// Collision detected (Both)
+			name:     "CollisionMultiple",
+			input:    "func A(err int) (err1 int) { return 1 }",
+			expected: "func A(err int) (err1 int, err2 error) { return 1, nil }",
+		},
+		{
+			// Unnamed results: names are invisible, so no collision prevention needed technically,
+			// but logic might still generate "int, error" which is fine.
+			name:     "CollisionUnnamed",
+			input:    "func A(err int) int { return 1 }",
+			expected: "func A(err int) (int, error) { return 1, nil }",
 		},
 	}
 
@@ -116,6 +137,8 @@ func TestAddErrorToSignature(t *testing.T) {
 }
 
 func TestEnsureNamedReturns(t *testing.T) {
+	// Note: We use AST-based fallback in these tests because setting up full TypesInfo
+	// for simple strings requires go/types.Config{}.Check(), which is tested in naming_test.go.
 	tests := []struct {
 		name        string
 		input       string
@@ -138,31 +161,37 @@ func TestEnsureNamedReturns(t *testing.T) {
 		{
 			name:        "UnnamedSingle",
 			input:       "func A() int { return 1 }",
-			expected:    "func A() (ret0 int) { return 1 }",
+			expected:    "func A() (i int) { return 1 }", // AST int -> i
 			wantChanged: true,
 		},
 		{
 			name:        "UnnamedError",
 			input:       "func A() error { return nil }",
-			expected:    "func A() (err error) { return nil }",
+			expected:    "func A() (err error) { return nil }", // AST error -> err
 			wantChanged: true,
 		},
 		{
 			name:        "UnnamedMixed",
 			input:       "func A() (int, string) { return 1, \"\" }",
-			expected:    "func A() (ret0 int, ret1 string) { return 1, \"\" }",
+			expected:    "func A() (i int, s string) { return 1, \"\" }",
 			wantChanged: true,
 		},
 		{
 			name:        "UnnamedMixedWithError",
 			input:       "func A() (int, error) { return 1, nil }",
-			expected:    "func A() (ret0 int, err error) { return 1, nil }",
+			expected:    "func A() (i int, err error) { return 1, nil }",
 			wantChanged: true,
 		},
 		{
 			name:        "UnnamedMultipleError",
 			input:       "func A() (error, error) { return nil, nil }",
-			expected:    "func A() (ret0 error, err error) { return nil, nil }",
+			expected:    "func A() (err error, err1 error) { return nil, nil }", // err, err1 collision check
+			wantChanged: true,
+		},
+		{
+			name:        "UnnamedCollisionStrings",
+			input:       "func A() (string, string) { return \"\", \"\" }",
+			expected:    "func A() (s string, s1 string) { return \"\", \"\" }",
 			wantChanged: true,
 		},
 	}
@@ -171,7 +200,7 @@ func TestEnsureNamedReturns(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			fset, decl := parseFuncDecl(t, tt.input)
 
-			changed, err := EnsureNamedReturns(fset, decl)
+			changed, err := EnsureNamedReturns(fset, decl, nil)
 			if (err != nil) != tt.wantErr {
 				t.Fatalf("EnsureNamedReturns() error = %v, wantErr %v", err, tt.wantErr)
 			}
@@ -190,7 +219,7 @@ func TestEnsureNamedReturns(t *testing.T) {
 }
 
 func TestEnsureNamedReturns_NilDecl(t *testing.T) {
-	_, err := EnsureNamedReturns(token.NewFileSet(), nil)
+	_, err := EnsureNamedReturns(token.NewFileSet(), nil, nil)
 	if err == nil {
 		t.Error("expected error for nil decl, got nil")
 	}

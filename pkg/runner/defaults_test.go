@@ -9,78 +9,90 @@ import (
 	"testing"
 )
 
-// TestRun_NoDefaultExclusion verifies that flag toggles exclusion of fmt.Println.
+// TestRun_Defaults verifies that implicit defaults enable filtering properly.
+// e.g. UseDefaultExclusions=true vs false.
 func TestRun_Defaults(t *testing.T) {
-	// 1. Setup
+	// Setup
 	tmpDir := t.TempDir()
-	goMod := []byte("module example.com/defaults\n\ngo 1.22\n")
-	_ = os.WriteFile(filepath.Join(tmpDir, "go.mod"), goMod, 0644)
+	_ = os.WriteFile(filepath.Join(tmpDir, "go.mod"), []byte("module test\ngo 1.22\n"), 0644)
 
-	// main.go has fmt.Println which returns error but is usually ignored
 	src := `package main
 import "fmt"
 func run() error {
-	fmt.Println("ignored")
-	return nil
+  fmt.Println("ignored")
+  return nil
 }
 func main() {}
 `
-	srcPath := filepath.Join(tmpDir, "main.go")
-	_ = os.WriteFile(srcPath, []byte(src), 0644)
+	_ = os.WriteFile(filepath.Join(tmpDir, "main.go"), []byte(src), 0644)
 
-	// Change CWD
 	oldWd, _ := os.Getwd()
-	if err := os.Chdir(tmpDir); err != nil {
-		t.Fatal(err)
-	}
-	defer os.Chdir(oldWd)
+	_ = os.Chdir(tmpDir)
+	defer interface{}(func() { _ = os.Chdir(oldWd) }).(func())()
 
-	// 2. Run WITH defaults (implicit exclusion) -> Should NOT apply changes
-	// We use DryRun to capture output
-	optsWithDefaults := Options{
-		LocalPreexistingErr: true,
-		Paths:               []string{"."},
-		DryRun:              true,
-		NoDefaultExclusion:  false,
-		ThirdPartyErr:       true, // fmt is third party/stdlib
+	// 1. With Defaults (UseDefaultExclusions=true) -> fmt.Println should be ignored
+	optsDefault := Options{
+		EnablePreexistingErr: true,
+		EnableThirdPartyErr:  true,
+		UseDefaultExclusions: true, // Default filters active
+		Paths:                []string{"."},
+		DryRun:               true,
 	}
-
-	outDefault := captureRun(t, optsWithDefaults)
+	outDefault, err := captureRunLocally(t, optsDefault)
+	if err != nil {
+		t.Fatalf("captureRun failed: %v", err)
+	}
 	if strings.Contains(outDefault, "err := fmt.Println") {
-		t.Error("With defaults, fmt.Println should be ignored, but found changes")
+		t.Error("fmt.Println changed despite default exclusion")
 	}
 
-	// 3. Run WITHOUT defaults -> Should apply changes
-	optsNoDefaults := Options{
-		LocalPreexistingErr: true,
-		Paths:               []string{"."},
-		DryRun:              true,
-		NoDefaultExclusion:  true,
-		ThirdPartyErr:       true,
+	// 2. Without Defaults (UseDefaultExclusions=false) -> fmt.Println should be checked
+	optsNoDefault := Options{
+		EnablePreexistingErr: true,
+		EnableThirdPartyErr:  true,
+		UseDefaultExclusions: false, // No filters
+		Paths:                []string{"."},
+		DryRun:               true,
 	}
-
-	outNoDefault := captureRun(t, optsNoDefaults)
+	outNoDefault, err := captureRunLocally(t, optsNoDefault)
+	if err != nil {
+		t.Fatalf("captureRun failed: %v", err)
+	}
 	if !strings.Contains(outNoDefault, "err := fmt.Println") {
-		t.Error("With --no-default-exclusion, fmt.Println should be detected, but found no changes")
+		t.Error("fmt.Println NOT changed despite UseDefaultExclusions=false")
 	}
 }
 
-// captureRun runs the runner and returns stdout
-func captureRun(t *testing.T, opts Options) string {
-	r, w, _ := os.Pipe()
+// Rename helper to avoid conflict with run_integration_test.go if compiled together
+func captureRunLocally(t *testing.T, opts Options) (string, error) {
+	r, w, err := os.Pipe()
+	if err != nil {
+		return "", err
+	}
+
 	oldStdout := os.Stdout
 	os.Stdout = w
 
-	err := Run(opts)
-
-	w.Close()
-	os.Stdout = oldStdout
-
+	err = Run(opts)
 	if err != nil {
-		t.Fatalf("Run failed: %v", err)
+		os.Stdout = oldStdout
+		w.Close()
+		return "", err
 	}
 
+	err = w.Close()
+	if err != nil {
+		os.Stdout = oldStdout
+		return "", err
+	}
+
+	os.Stdout = oldStdout
+
 	var buf bytes.Buffer
-	_, _ = io.Copy(&buf, r)
-	return buf.String()
+	_, err = io.Copy(&buf, r)
+	if err != nil {
+		return "", err
+	}
+
+	return buf.String(), nil
 }

@@ -78,21 +78,21 @@ func TestPropagateCallers(t *testing.T) {
 	// We expect target() call to be updated to assignments and checks added.
 	src := `package main
 
-func target() {}
+func target() {} 
 
-func enclosing() error {
-	target()      // Case 1: Bare call
-	return nil
-}
+func enclosing() error { 
+  target()      // Case 1: Bare call
+  return nil
+} 
 `
 	// To test assignment modification, we need valid Go for the parser.
 	srcAssign := `package main
-func target() int { return 0 }
-func enclosing() error {
-	x := target()
-	_ = x
-	return nil
-}
+func target() int { return 0 } 
+func enclosing() error { 
+  x := target() 
+  _ = x
+  return nil
+} 
 `
 
 	// Case 1: Void -> Error
@@ -110,11 +110,8 @@ func enclosing() error {
 
 		out := renderWithImports(t, fset, pkg.Syntax[0])
 
-		if !strings.Contains(out, "err := target()") {
-			t.Error("Did not find 'err := target()'")
-		}
-		if !strings.Contains(out, "if err != nil") {
-			t.Error("Did not find error check")
+		if !strings.Contains(out, "if err := target(); err != nil") {
+			t.Error("Did not find collapsed error check 'if err := target(); err != nil'")
 		}
 	})
 
@@ -142,17 +139,17 @@ func enclosing() error {
 func TestPropagateCallers_EntryPoint(t *testing.T) {
 	// Scenario: main calls target which now returns error.
 	srcMain := `package main
-func target() {}
-func main() {
-	target()
-}
+func target() {} 
+func main() { 
+  target() 
+} 
 `
 	// Scenario: init calls target
 	srcInit := `package main
-func target() {}
-func init() {
-	target()
-}
+func target() {} 
+func init() { 
+  target() 
+} 
 `
 	// 1. Test main with log-fatal
 	t.Run("MainLogFatal", func(t *testing.T) {
@@ -175,6 +172,10 @@ func init() {
 		}
 		if !strings.Contains(out, `"log"`) {
 			t.Error("Expected log import to be added by Process")
+		}
+		// Expect collapsed form
+		if !strings.Contains(out, "if err := target(); err != nil") {
+			t.Error("Expected collapsed form in main")
 		}
 	})
 
@@ -224,10 +225,10 @@ func init() {
 // TestPropagateCallers_NoEnclosingError verifies behavior when caller cannot return error.
 func TestPropagateCallers_NoEnclosingError(t *testing.T) {
 	src := `package main
-func target() {}
-func someFunc() {
-	target() // call
-}
+func target() {} 
+func someFunc() { 
+  target() // call
+} 
 `
 	fset, pkg, target := setupPropagateEnv(t, src)
 

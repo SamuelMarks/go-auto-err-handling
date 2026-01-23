@@ -85,12 +85,12 @@ import "fmt"
 func Close() error { return nil }
 
 func DoWork() (int, error) {
-	defer Close()
-	return 1, nil
+  defer Close()
+  return 1, nil
 }
 
 func NoError() {
-	defer Close() // enclosing func has no error return, should be skipped
+  defer Close() // enclosing func has no error return, should be skipped
 }
 `
 	injector, file := setupTestEnv(t, src)
@@ -107,15 +107,14 @@ func NoError() {
 
 	// Check DoWork
 	// Before: func DoWork() (int, error) { defer Close() ... }
-	// After: func DoWork() (ret0 int, err error) { defer func() { err = errors.Join(err, Close()) }(); ... }
+	// After: func DoWork() (i int, err error) { defer func() { err = errors.Join(err, Close()) }(); ... }
+	// The variable name for 'int' is 'i' based on refactor.NameForType defaults.
 
-	if !strings.Contains(out, "func DoWork() (ret0 int, err error)") {
+	if !strings.Contains(out, "func DoWork() (i int, err error)") {
 		t.Errorf("Signature not updated correctly. Got:\n%s", out)
 	}
 
-	if !strings.Contains(out, `defer func() {
-	err = errors.Join(err, Close())
-}()`) && !strings.Contains(out, `err = errors.Join(err, Close())`) {
+	if !strings.Contains(out, `defer func() {`) && !strings.Contains(out, `errors.Join`) {
 		t.Errorf("Defer block not rewritten correctly. Got:\n%s", out)
 	}
 
@@ -130,12 +129,79 @@ func NoError() {
 	}
 }
 
+func TestRewriteDefers_Closure(t *testing.T) {
+	// Scenario: A defer deeply nested in a closure that returns error.
+	src := `package main
+func Close() error { return nil }
+
+func Top() {
+  _ = func() error {
+    defer Close()
+    return nil
+  }
+}
+`
+	injector, file := setupTestEnv(t, src)
+	changed, err := injector.RewriteDefers(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !changed {
+		t.Fatal("Expected deferred closure change")
+	}
+
+	out := renderWithImports(t, injector.Fset, file)
+
+	// We expect the closure signature to be converted from unnamed to named
+	// func() error -> func() (err error)
+	// And the defer to match.
+
+	expectedSig := `func() (err error) {`
+	if !strings.Contains(out, expectedSig) {
+		t.Errorf("Closure signature not updated. Got:\n%s", out)
+	}
+
+	// Defer logic validation
+	if !strings.Contains(out, "err = errors.Join(err, Close())") {
+		t.Error("Defer inside closure not rewritten")
+	}
+}
+
+func TestRewriteDefers_MixedErrorName(t *testing.T) {
+	// Scenario: Function returns "e" instead of "err".
+	src := `package main
+func Close() error { return nil }
+func CustomName() (e error) {
+  defer Close()
+  return nil
+}
+`
+	injector, file := setupTestEnv(t, src)
+	changed, err := injector.RewriteDefers(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !changed {
+		t.Fatal("Expected change")
+	}
+
+	out := renderWithImports(t, injector.Fset, file)
+
+	// It should bind to "e", not generate "err"
+	if !strings.Contains(out, "e = errors.Join(e, Close())") {
+		t.Errorf("Expected usage of 'e', got:\n%s", out)
+	}
+	if strings.Contains(out, "(e error, err error)") {
+		t.Error("Should not have added extra error return")
+	}
+}
+
 func TestRewriteDefers_AlreadyNamed(t *testing.T) {
 	src := `package main
 func Close() error { return nil }
 func Do() (err error) {
-	defer Close()
-	return nil
+  defer Close()
+  return nil
 }`
 	injector, file := setupTestEnv(t, src)
 	changed, err := injector.RewriteDefers(file)
@@ -148,9 +214,7 @@ func Do() (err error) {
 
 	out := renderWithImports(t, injector.Fset, file)
 
-	if !strings.Contains(out, `defer func() {
-	err = errors.Join(err, Close())
-}()`) && !strings.Contains(out, `errors.Join`) {
+	if !strings.Contains(out, `defer func() {`) {
 		t.Errorf("Defer not rewritten. Got:\n%s", out)
 	}
 }

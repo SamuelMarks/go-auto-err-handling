@@ -13,13 +13,20 @@ import (
 )
 
 // Injector handles the rewriting of ASTs to inject error handling logic.
+// It maintains file-set context and configuration for generating code templates.
 type Injector struct {
-	Fset          *token.FileSet
-	Pkg           *packages.Package
+	// Fset is the token file set for positional information.
+	Fset *token.FileSet
+	// Pkg is the package containing the files being modified, providing type information.
+	Pkg *packages.Package
+	// ErrorTemplate is the string template used to generate return statements (e.g. "{return-zero}, err").
 	ErrorTemplate string
 }
 
 // NewInjector creates a new Injector for the given package.
+//
+// pkg: The package to operate on.
+// errorTemplate: Optional custom template string. If empty, defaults to "{return-zero}, err".
 func NewInjector(pkg *packages.Package, errorTemplate string) *Injector {
 	if errorTemplate == "" {
 		errorTemplate = "{return-zero}, err"
@@ -32,8 +39,18 @@ func NewInjector(pkg *packages.Package, errorTemplate string) *Injector {
 }
 
 // RewriteFile applies specific injection points to a single file.
+// It handles defer rewriting first, then processes the list of injection points.
+//
+// It attempts to preserve comments attached to replaced statements by copying position info
+// to the new assignment node, leveraging standard AST behavior where comments are
+// position-relative.
+//
+// file: The AST file to modify.
+// points: The list of identified injection points to process.
+//
+// Returns true if changes were applied, and an error if processing failed.
 func (i *Injector) RewriteFile(file *ast.File, points []analysis.InjectionPoint) (bool, error) {
-	// 1. Rewrite defers first
+	// 1. Rewrite defers first (catches ignored errors in defer statements)
 	defersApplied, deferErr := i.RewriteDefers(file)
 	if deferErr != nil {
 		return false, deferErr
@@ -54,7 +71,7 @@ func (i *Injector) RewriteFile(file *ast.File, points []analysis.InjectionPoint)
 	var err error
 
 	// Stack to track current enclosing function signature AND AST node
-	// (AST node needed to verify returns if TypesInfo is stale)
+	// (AST node needed to verify returns if TypesInfo is stale due to in-flight modifications)
 	type funcContext struct {
 		sig  *types.Signature
 		decl *ast.FuncDecl // Nil if FuncLit
@@ -98,9 +115,25 @@ func (i *Injector) RewriteFile(file *ast.File, points []analysis.InjectionPoint)
 					return false // Stop traversing to report error
 				}
 
-				if newNodes != nil {
+				if len(newNodes) > 0 {
+					// Preserve comments:
+					// The old statement might have specific line comments or doc comments.
+					// We copy them to the primary replacement node.
+
+					oldNode, isOldNode := c.Node().(ast.Node)
+					newNode := newNodes[0]
+
+					if isOldNode && newNode != nil {
+						copyComments(oldNode, newNode)
+					}
+
 					c.Replace(newNodes[0])
-					c.InsertAfter(newNodes[1])
+
+					// Insert any subsequent nodes (e.g. if we didn't collapse into one)
+					// iterate in reverse so they are inserted in correct order after the replacement
+					for k := len(newNodes) - 1; k > 0; k-- {
+						c.InsertAfter(newNodes[k])
+					}
 					applied = true
 				}
 			}
@@ -121,11 +154,53 @@ func (i *Injector) RewriteFile(file *ast.File, points []analysis.InjectionPoint)
 	return applied || defersApplied, err
 }
 
+// copyComments copies the position info from src to dst.
+// Since AST comments are position-based (in printer), assigning the source's Pos()
+// to the destination's primary token position is the standard workaround to
+// associate "floating" comments with the new replacement node.
+//
+// src: The original AST node.
+// dst: The new AST node.
+func copyComments(src, dst ast.Node) {
+	if !src.Pos().IsValid() {
+		return
+	}
+
+	// Depending on the statement type, the "anchoring" position field differs.
+	// We handle the most common generated nodes.
+	switch destNode := dst.(type) {
+	case *ast.AssignStmt:
+		// Assignment statements align comments to the definition/assignment token.
+		destNode.TokPos = src.Pos()
+	case *ast.ExprStmt:
+		// Expressions don't have a direct position field, they rely on the expression inside.
+		// But we rarely generate ExprStmt as a replacement (usually AssignStmt or IfStmt).
+	case *ast.DeclStmt:
+		// Ensure declaration position matches.
+		if gen, ok := destNode.Decl.(*ast.GenDecl); ok {
+			gen.TokPos = src.Pos()
+		}
+	case *ast.IfStmt:
+		// If statements align comments to the 'if' keyword.
+		destNode.If = src.Pos()
+	}
+}
+
 // generateRewrite creates the AST nodes for assignment and error checking.
 // It resolves the appropriate variable name for the error (avoiding shadowing) relative to the injection point.
+//
+// It attempts to generate the idiomatic `if err := call(); err != nil { ... }` syntax
+// if the assignment does not introduce other variables needed in the outer scope.
+//
+// point: The injection point details.
+// sig: The type signature of the enclosing function (from pre-analysis).
+// decl: The AST declaration of the enclosing function (for current state).
+// file: The file being modified.
+//
+// Returns a slice of statements to replace the original, or an error.
 func (i *Injector) generateRewrite(point analysis.InjectionPoint, sig *types.Signature, decl *ast.FuncDecl, file *ast.File) ([]ast.Stmt, error) {
 	// Check if returns error.
-	// 1. Check TypesInfo (sig)
+	// 1. Check TypesInfo (sig) - this matches state at load time.
 	useSig := false
 	if sig != nil && sig.Results().Len() > 0 {
 		last := sig.Results().At(sig.Results().Len() - 1)
@@ -134,8 +209,9 @@ func (i *Injector) generateRewrite(point analysis.InjectionPoint, sig *types.Sig
 		}
 	}
 
-	// 2. If TypesInfo didn't confirm error, check AST (decl) in case of Stale TypesInfo (DryRun)
+	// 2. If TypesInfo didn't confirm error, check AST (decl) in case of Stale TypesInfo.
 	// This happens if we appended "error" to signature in previous pass without reload.
+	// The AST will show the new 'error' return type even if TypesInfo doesn't yet.
 	if !useSig && decl != nil && decl.Type.Results != nil {
 		list := decl.Type.Results.List
 		if len(list) > 0 {
@@ -147,7 +223,7 @@ func (i *Injector) generateRewrite(point analysis.InjectionPoint, sig *types.Sig
 	}
 
 	if !useSig {
-		return nil, nil // Skip
+		return nil, nil // Skip - enclosing function does not return error
 	}
 
 	// Calculate unique variable name
@@ -157,13 +233,44 @@ func (i *Injector) generateRewrite(point analysis.InjectionPoint, sig *types.Sig
 	// Call Name Resolution
 	funcName := i.resolveFuncName(point)
 
-	// Generate
-	// Use `sig` from TypesInfo which represents the types known *before* modification (or current).
+	// Generate Return Statement using the template
 	retStmt, err := i.generateReturnStmt(sig, errName, funcName)
 	if err != nil {
 		return nil, err
 	}
 
+	// Generate Assignment: err := call()
+	assignStmt, err := i.generateAssignment(point, errName)
+	if err != nil {
+		return nil, err
+	}
+
+	// Determine if we can collapse assignment into if init.
+	// We only collapse if the assignment defines/assigns ONLY the error variable (or blanks _).
+	// If it defines other variables (e.g. val, err := ...), those variables would be
+	// scoped to the if block, breaking outer usage.
+	canCollapse := true
+	if as, ok := assignStmt.(*ast.AssignStmt); ok {
+		for _, lhs := range as.Lhs {
+			if id, ok := lhs.(*ast.Ident); ok {
+				// If we find a variable that is NOT "_" and NOT our error var,
+				// it's a value capture that must survive the if block.
+				if id.Name != "_" && id.Name != errName {
+					canCollapse = false
+					break
+				}
+			} else {
+				// Complex LHS (like *p), unlikely to be generated by generateAssignment currently,
+				// but safest to assume side-effects/scoping complexity.
+				canCollapse = false
+				break
+			}
+		}
+	} else {
+		canCollapse = false
+	}
+
+	// Generate Check Statement: if err != nil { ... }
 	ifStmt := &ast.IfStmt{
 		Cond: &ast.BinaryExpr{
 			X:  &ast.Ident{Name: errName},
@@ -175,15 +282,19 @@ func (i *Injector) generateRewrite(point analysis.InjectionPoint, sig *types.Sig
 		},
 	}
 
-	assignStmt, err := i.generateAssignment(point, errName)
-	if err != nil {
-		return nil, err
+	if canCollapse {
+		ifStmt.Init = assignStmt
+		return []ast.Stmt{ifStmt}, nil
 	}
 
 	return []ast.Stmt{assignStmt, ifStmt}, nil
 }
 
 // resolveFuncName tries to determine a readable name for the function being called.
+//
+// point: The injection point.
+//
+// Returns the function name string (e.g. "Println" or "Write").
 func (i *Injector) resolveFuncName(point analysis.InjectionPoint) string {
 	if call := point.Call; call != nil {
 		if id, ok := call.Fun.(*ast.Ident); ok {
@@ -197,7 +308,11 @@ func (i *Injector) resolveFuncName(point analysis.InjectionPoint) string {
 }
 
 // generateReturnStmt generates the return statement inside the validation block using templates.
-// It relies on post-processing for imports.
+// It relies on post-processing for adding necessary imports.
+//
+// sig: The signature of the enclosing function.
+// errName: The variable name of the error being returned.
+// funcName: The name of the function that failed (for template context).
 func (i *Injector) generateReturnStmt(sig *types.Signature, errName, funcName string) (*ast.ReturnStmt, error) {
 	var zeroExprs []ast.Expr
 
@@ -234,6 +349,11 @@ func (i *Injector) generateReturnStmt(sig *types.Signature, errName, funcName st
 }
 
 // generateAssignment creates the variable assignment statement (err := ...).
+// It constructs the LHS to match the return values of the call, typically assigning ignoring (_)
+// everything except the error.
+//
+// point: The injection point.
+// errName: The resolved name for the error variable.
 func (i *Injector) generateAssignment(point analysis.InjectionPoint, errName string) (ast.Stmt, error) {
 	call := point.Call
 	var callResultSig *types.Tuple
@@ -242,6 +362,7 @@ func (i *Injector) generateAssignment(point analysis.InjectionPoint, errName str
 		if tuple, ok := tv.Type.(*types.Tuple); ok {
 			callResultSig = tuple
 		} else {
+			// Single return value simulation
 			vars := []*types.Var{types.NewVar(token.NoPos, nil, "", tv.Type)}
 			callResultSig = types.NewTuple(vars...)
 		}
@@ -252,6 +373,7 @@ func (i *Injector) generateAssignment(point analysis.InjectionPoint, errName str
 	var lhs []ast.Expr
 
 	if point.Assign != nil {
+		// Reuse existing LHS expressions, patching the error position
 		for idx, expr := range point.Assign.Lhs {
 			isLast := idx == len(point.Assign.Lhs)-1
 			if isLast {
@@ -261,6 +383,7 @@ func (i *Injector) generateAssignment(point analysis.InjectionPoint, errName str
 			}
 		}
 	} else {
+		// Create new LHS: _, _, err :=
 		for idx := 0; idx < callResultSig.Len()-1; idx++ {
 			lhs = append(lhs, &ast.Ident{Name: "_"})
 		}
@@ -277,6 +400,8 @@ func (i *Injector) generateAssignment(point analysis.InjectionPoint, errName str
 }
 
 // isErrorReturningCall checks if the call returns exactly one value which is an error.
+//
+// call: The call expression.
 func (i *Injector) isErrorReturningCall(call *ast.CallExpr) bool {
 	if typesInfo := i.Pkg.TypesInfo; typesInfo != nil {
 		tv, ok := typesInfo.Types[call]
@@ -296,12 +421,31 @@ func (i *Injector) isErrorReturningCall(call *ast.CallExpr) bool {
 }
 
 // isErrorType checks if the type is the "error" interface.
+// It performs a robust check by comparing against the universe "error" type directly
+// to avoid issues with custom types named "error" or string matching ambiguity.
+//
+// t: The type to check.
 func (i *Injector) isErrorType(t types.Type) bool {
-	return t.String() == "error" || t.String() == "builtin.error" ||
-		types.Identical(t, types.Universe.Lookup("error").Type())
+	if t == nil {
+		return false
+	}
+	// Strict Type Check: Compare against the distinct 'error' object in the Universe scope.
+	// This handles standard 'error' correctly even if aliased.
+	if types.Identical(t, types.Universe.Lookup("error").Type()) {
+		return true
+	}
+
+	// Fallback: Check string representation for standard "error" or "builtin.error".
+	// This helps in cases where the type info might be incomplete (e.g. some test mocks)
+	// or where Universe hasn't been unified.
+	name := t.String()
+	return name == "error" || name == "builtin.error"
 }
 
 // isErrorExpr checks if the AST expression looks like "error".
+// This is an AST-level fallback when Type info is not available.
+//
+// expr: The AST expression.
 func (i *Injector) isErrorExpr(expr ast.Expr) bool {
 	if id, ok := expr.(*ast.Ident); ok {
 		return id.Name == "error"
@@ -311,7 +455,9 @@ func (i *Injector) isErrorExpr(expr ast.Expr) bool {
 
 // getScope attempts to find the innermost scope enclosing the given position.
 // It traverses the AST path upwards until a node with an associated scope is found.
-// It explicitly handles FuncDecl -> FuncConfig relationship to find function scopes (where parameters live).
+//
+// pos: The position in the file.
+// file: The start file.
 func (i *Injector) getScope(pos token.Pos, file *ast.File) *types.Scope {
 	path, _ := astutil.PathEnclosingInterval(file, pos, pos)
 	for _, node := range path {
@@ -319,16 +465,13 @@ func (i *Injector) getScope(pos token.Pos, file *ast.File) *types.Scope {
 			return scope
 		}
 		// Fallback: PathEnclosingInterval includes FuncDecl, but scopes are often keyed on FuncType.
-		// If we missed the block scope (e.g. implicit block) or for some reason it's missing,
-		// check if we are in a FuncDecl and grab the scope of its Type (which holds params).
 		if fd, ok := node.(*ast.FuncDecl); ok {
 			if fd.Type != nil {
 				if scope := i.Pkg.TypesInfo.Scopes[fd.Type]; scope != nil {
 					return scope
 				}
 			}
-			// Robustness fallback: If Scopes map is sparse (e.g. during specific manual checks),
-			// try to look up the function Object definition and get its scope.
+			// Robustness fallback: Look up function Object
 			if obj := i.Pkg.TypesInfo.ObjectOf(fd.Name); obj != nil {
 				if fn, ok := obj.(*types.Func); ok {
 					return fn.Scope()

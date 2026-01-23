@@ -5,6 +5,7 @@ import (
 	"go/printer"
 	"go/token"
 	"go/types"
+	"strings"
 	"testing"
 )
 
@@ -72,6 +73,11 @@ func TestZeroExpr(t *testing.T) {
 			expected:  "nil",
 		},
 		{
+			name:      "Chan",
+			inputType: types.NewChan(types.SendRecv, intType),
+			expected:  "nil",
+		},
+		{
 			name:      "NamedStruct",
 			inputType: namedM,
 			expected:  "MyStruct{}",
@@ -115,7 +121,9 @@ func TestZeroExpr(t *testing.T) {
 				t.Fatalf("printer.Fprint() error = %v", err)
 			}
 
-			if got := buf.String(); got != tt.expected {
+			got := buf.String()
+			// Normalize comparison to ignore whitespace differences (e.g. "struct {\n}{}" vs "struct{}{}")
+			if normalize(got) != normalize(tt.expected) {
 				t.Errorf("ZeroExpr() = %q, want %q", got, tt.expected)
 			}
 		})
@@ -123,7 +131,9 @@ func TestZeroExpr(t *testing.T) {
 }
 
 // TestZeroExpr_CompositeWithQualifier tests the qualifier logic for composite types.
+// It verifies that aliases like "aliasedpkg.Bar{}" are generated correctly.
 func TestZeroExpr_CompositeWithQualifier(t *testing.T) {
+	// Setup: package "foo", named type "Bar"
 	pkg := types.NewPackage("example.com/foo", "foo")
 	named := types.NewNamed(
 		types.NewTypeName(token.NoPos, pkg, "Bar", nil),
@@ -131,7 +141,8 @@ func TestZeroExpr_CompositeWithQualifier(t *testing.T) {
 		nil,
 	)
 
-	// Qualifier that forces package name inclusion
+	// Qualifier logic: always use package Name().
+	// This mimics scenarios where "example.com/foo" is imported as "foo" (or aliased).
 	q := func(p *types.Package) string {
 		return p.Name()
 	}
@@ -146,6 +157,37 @@ func TestZeroExpr_CompositeWithQualifier(t *testing.T) {
 
 	expected := "foo.Bar{}"
 	if buf.String() != expected {
-		t.Errorf("ZeroExpr() with qualifier = %q, want %q", buf.String(), expected)
+		t.Errorf("ZeroExpr() with standard qualifier = %q, want %q", buf.String(), expected)
 	}
+
+	// Check alias override logic
+	// Scenario: "example.com/foo" is imported as "baz".
+	// The qualifier knows this map.
+	qAlias := func(p *types.Package) string {
+		if p.Path() == "example.com/foo" {
+			return "baz"
+		}
+		return p.Name()
+	}
+
+	exprAlias, err := ZeroExpr(named, qAlias)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	buf.Reset()
+	printer.Fprint(&buf, token.NewFileSet(), exprAlias)
+
+	expectedAlias := "baz.Bar{}"
+	if buf.String() != expectedAlias {
+		t.Errorf("ZeroExpr() with alias qualifier = %q, want %q", buf.String(), expectedAlias)
+	}
+}
+
+// normalize removes all whitespace to ensure robust comparison of AST string representations.
+func normalize(s string) string {
+	s = strings.ReplaceAll(s, "\n", "")
+	s = strings.ReplaceAll(s, "\t", "")
+	s = strings.ReplaceAll(s, " ", "")
+	return s
 }

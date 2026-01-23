@@ -9,6 +9,8 @@ import (
 	"go/token"
 	"regexp"
 	"strings"
+
+	"github.com/SamuelMarks/go-auto-err-handling/pkg/astgen"
 )
 
 // RenderTemplate transforms a template string into a list of AST expressions suitable for a ReturnStmt.
@@ -93,7 +95,15 @@ func RenderTemplate(tmpl string, zeroExprs []ast.Expr, errName string, funcName 
 		return nil, nil, fmt.Errorf("no return statement found in processed template")
 	}
 
-	// 5. Scan for potential imports in the expressions
+	// 5. Clear Token Positions
+	// The parser generated tokens with positions relative to the temporary Fset.
+	// If we return these positions, the main printer will be confused and may generate bad indentation.
+	// We use the shared logic from astgen.
+	for _, expr := range returnResults {
+		astgen.ClearPositions(expr)
+	}
+
+	// 6. Scan for potential imports in the expressions
 	// We look for SelectorExpr where X is an Ident (e.g. fmt.Errorf -> X=fmt).
 	for _, expr := range returnResults {
 		ast.Inspect(expr, func(n ast.Node) bool {

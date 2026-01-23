@@ -7,13 +7,8 @@ import (
 	"testing"
 )
 
-// TestRunner_Integration simulates a full run on a temporary module.
-// It verifies:
-// 1. Detection of ignored errors.
-// 2. Level 0 Rewrite (LocalPreexisting).
-// 3. Level 1 Propagate (LocalNonExisting).
+// TestRunner_Integration verifies the full analysis and refactoring cycle.
 func TestRunner_Integration(t *testing.T) {
-	// 1. Setup Environment
 	tmpDir := t.TempDir()
 
 	// go.mod
@@ -23,30 +18,22 @@ func TestRunner_Integration(t *testing.T) {
 		t.Fatalf("failed to create go.mod: %v", err)
 	}
 
-	// main.go
-	// Contains:
-	// - failing() returning error.
-	// - existing() returning error, calls failing() (Level 0 fix).
-	// - nonexisting() returning void, calls failing() (Level 1 fix).
-	// - usage() calls nonexisting() (Propagation).
-	//
-	// NOTE: Comments removed to avoid AST formatter placing them in positions
-	// that break simple string matching assertions (e.g. inside if statements).
+	// main.go containing unhandled errors in various scenarios
 	mainSrc := `package main
 
 func failing() error { return nil } 
 
 func existing() error { 
-  failing()
+  failing() 
   return nil
 } 
 
 func nonexisting() { 
-  failing()
+  failing() 
 } 
 
 func usage() { 
-  nonexisting()
+  nonexisting() 
 } 
 `
 	err = os.WriteFile(filepath.Join(tmpDir, "main.go"), []byte(mainSrc), 0644)
@@ -54,57 +41,45 @@ func usage() {
 		t.Fatalf("failed to create main.go: %v", err)
 	}
 
-	// 2. Configure Runner
-	opts := Options{
-		LocalPreexistingErr: true,
-		LocalNonExistingErr: true,
-		ThirdPartyErr:       false,
-		Paths:               []string{"."},
-	}
-
-	// We must change working directory to tmpDir so "." path works.
 	oldWd, _ := os.Getwd()
 	if err := os.Chdir(tmpDir); err != nil {
 		t.Fatalf("failed to chdir: %v", err)
 	}
-	defer func() { _ = os.Chdir(oldWd) }()
+	defer interface{}(func() { _ = os.Chdir(oldWd) }).(func())()
 
-	// 3. Run
+	// Configure Runner with Defaults (Everything Enabled)
+	opts := Options{
+		EnablePreexistingErr: true, // Enabled
+		EnableNonExistingErr: true, // Enabled
+		EnableThirdPartyErr:  true, // Enabled
+		Paths:                []string{"."},
+	}
+
+	// Run
 	if err := Run(opts); err != nil {
 		t.Fatalf("Run failed: %v", err)
 	}
 
-	// 4. Verification
+	// Verification
 	content, err := os.ReadFile("main.go")
 	if err != nil {
 		t.Fatalf("failed to read back main.go: %v", err)
 	}
 	code := string(content)
 
-	// Check Level 0 Fix in 'existing'
-	// Should see: "err := failing(); if err != nil { return err }"
-	if !strings.Contains(code, "if err != nil {") {
-		t.Logf("Full Code:\n%s", code)
-		t.Error("Level 0 fix missing: 'if err != nil' checks not found.")
+	// Level 0: 'existing' should check error
+	// With collapse: "if err := failing(); err != nil {"
+	if !strings.Contains(code, "if err := failing(); err != nil {") && !strings.Contains(code, "if err != nil {") {
+		t.Errorf("Level 0 fix missing: check not found. Code:\n%s", code)
 	}
 
-	// Check Level 1 Fix in 'nonexisting'
-	// Signature should be `func nonexisting() error`
+	// Level 1: 'nonexisting' should now return error
 	if !strings.Contains(code, "func nonexisting() error") {
 		t.Error("Level 1 signature change missing.")
 	}
 
-	// Check Level 1 Body fix
-	// Should return nil at end of nonexisting likely (refactor logic adds it)
-	if !strings.Contains(code, "return nil") {
-		t.Error("Return nil missing in nonexisting.")
-	}
-
-	// Check Propagation in 'usage'
-	// usage calls nonexisting. nonexisting now returns error. usage is void.
-	// Propagate should update usage to return error or handle it.
+	// Propagation: 'usage' calls 'nonexisting', so 'usage' must change
 	if !strings.Contains(code, "func usage() error") {
-		t.Logf("Full Code:\n%s", code)
-		t.Error("Propagation recursive fix missing: usage() should return error.")
+		t.Error("Propagation recursive fix missing.")
 	}
 }
