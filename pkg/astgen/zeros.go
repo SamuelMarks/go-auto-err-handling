@@ -8,34 +8,54 @@ import (
 	"go/types"
 )
 
+// ZeroCtx holds configuration and context for generating zero values.
+type ZeroCtx struct {
+	// Qualifier formats package names in type strings.
+	// If nil, package names are fully qualified by default or handled via overrides.
+	Qualifier types.Qualifier
+
+	// Overrides maps a fully qualified type string (e.g., "*k8s.io/api/admission/v1.AdmissionResponse")
+	// to a Go expression string (e.g., "&k8s.io/api/admission/v1.AdmissionResponse{Allowed: false}").
+	// Using overrides allows generating "Soft Failures" where a zero-value is technically valid
+	// but logically incorrect for the application flow (e.g., returning nil pointer vs error struct).
+	Overrides map[string]string
+}
+
 // ZeroExpr generates an ast.Expr representing the zero value for the given data type.
-// It handles basic literals (0, "", false, nil) and composite types (structs, arrays)
-// by creating suitable AST nodes.
+// It handles basic literals (0, "", false, nil) and composite types (structs, arrays).
 //
-// It supports complex types involving imported packages by utilizing the provided qualifier
-// function to correctly render package aliases (e.g., "myalias.MyStruct{}").
+// It checks the provided Context for overrides first. If an override exists for the type string,
+// it parses and returns that expression. Otherwise, it generates the standard Go zero value.
 //
 // t: The type for which to generate the zero value.
-// q: An optional qualifier function to format package names in type strings.
+// ctx: Configuration context containing qualifiers and overrides.
 //
-// Returns the AST expression for the zero value, or an error if the type is unsupported
-// (like tuples).
-func ZeroExpr(t types.Type, q types.Qualifier) (ast.Expr, error) {
-	// check the underlying type to determine the category of the zero value
+// Returns the AST expression for the zero value, or an error if the type is unsupported.
+func ZeroExpr(t types.Type, ctx ZeroCtx) (ast.Expr, error) {
+	// 1. Check Overrides
+	// We need the fully qualified name to match against the configuration map.
+	// We use the default type string behavior (Package.Name) or the custom qualifier if provided.
+	typeKey := types.TypeString(t, nil) // Raw fully qualified name for robust key matching
+	if override, ok := ctx.Overrides[typeKey]; ok {
+		expr, err := parser.ParseExpr(override)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse override for %s: %w", typeKey, err)
+		}
+		ClearPositions(expr)
+		return expr, nil
+	}
+
+	// 2. Standard Generation
 	switch u := t.Underlying().(type) {
 	case *types.Basic:
 		return basicZero(u)
 	case *types.Pointer, *types.Slice, *types.Map, *types.Chan, *types.Signature, *types.Interface:
 		return &ast.Ident{Name: "nil"}, nil
 	case *types.Struct, *types.Array:
-		return compositeZero(t, q)
+		return compositeZero(t, ctx.Qualifier)
 	case *types.Tuple:
 		return nil, fmt.Errorf("tuple types are not supported for single value generation")
 	default:
-		// Named types that don't fall into the above (like named basic types w/ methods that aren't *types.Basic underlying?)
-		// Actually types.Named usually resolves to underlying for structure check, but we need to handle
-		// the value generation. If it's a named struct, it hits the Struct case above.
-		// If it's something else we missed, report error.
 		return nil, fmt.Errorf("unsupported type: %v", t)
 	}
 }
@@ -54,7 +74,7 @@ func basicZero(b *types.Basic) (ast.Expr, error) {
 		return &ast.BasicLit{Kind: token.STRING, Value: `""`}, nil
 	case b.Kind() == types.UnsafePointer:
 		return &ast.Ident{Name: "nil"}, nil
-	default: // defaults to nil for untyped nil or unknown basics
+	default:
 		return &ast.Ident{Name: "nil"}, nil
 	}
 }
@@ -62,27 +82,16 @@ func basicZero(b *types.Basic) (ast.Expr, error) {
 // compositeZero generates a composite literal (e.g., MyType{}) for structs and arrays.
 // It uses the type string representation to construct the type identifier.
 //
-// Only the outer type needs strict qualification. Go's composite literal syntax allows
-// omitting element types in array/slice/map literals usually, but for the zero value
-// of a named type `var x pkg.T`, the zero value is `pkg.T{}`.
-//
 // t: The full type (named or literal).
 // q: The qualifier for package names.
 func compositeZero(t types.Type, q types.Qualifier) (ast.Expr, error) {
-	// Generate string representation of the type, respecting imports via q
 	typeStr := types.TypeString(t, q)
 
-	// Parse the type string back into an AST expression to use as the Type of the CompositeLit.
-	// We use ParseExpr from go/parser which is robust for handling expressions like "pkg.Type"
-	// or "[]pkg.Type".
 	typeExpr, err := parser.ParseExpr(typeStr)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse type string '%s': %w", typeStr, err)
 	}
 
-	// Parser uses a throw-away FileSet, so these positions are invalid in the target file.
-	// We must clear them to allow go/printer to format correctly and avoid weird newlines
-	// in generated structs (e.g. struct{ \n }).
 	ClearPositions(typeExpr)
 
 	return &ast.CompositeLit{
@@ -92,7 +101,7 @@ func compositeZero(t types.Type, q types.Qualifier) (ast.Expr, error) {
 }
 
 // ClearPositions recursively sets position information to token.NoPos for the AST node.
-// This allows go/printer to reformat the node freely when inserted into a new file.
+// This allows go/printer to reformat the node freely.
 func ClearPositions(node ast.Node) {
 	ast.Inspect(node, func(n ast.Node) bool {
 		switch x := n.(type) {
@@ -127,7 +136,6 @@ func ClearPositions(node ast.Node) {
 			x.Lparen = token.NoPos
 			x.Rparen = token.NoPos
 		case *ast.SelectorExpr:
-			// SelectorExpr has no explicit pos for the dot
 		case *ast.SliceExpr:
 			x.Lbrack = token.NoPos
 			x.Rbrack = token.NoPos

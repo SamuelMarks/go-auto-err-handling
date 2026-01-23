@@ -15,8 +15,8 @@ func TestRenderTemplate(t *testing.T) {
 	// Setup zero exprs
 	intType := types.Typ[types.Int]
 	strType := types.Typ[types.String]
-	zeroInt, _ := astgen.ZeroExpr(intType, nil)
-	zeroStr, _ := astgen.ZeroExpr(strType, nil)
+	zeroInt, _ := astgen.ZeroExpr(intType, astgen.ZeroCtx{})
+	zeroStr, _ := astgen.ZeroExpr(strType, astgen.ZeroCtx{})
 
 	tests := []struct {
 		name         string

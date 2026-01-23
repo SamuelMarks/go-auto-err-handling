@@ -241,7 +241,7 @@ func (i *Injector) generateReturnFromPanic(fn *ast.FuncDecl, panicCall *ast.Call
 			// If we have types info for the AST expression
 			if i.Pkg != nil && i.Pkg.TypesInfo != nil {
 				if t, ok := i.Pkg.TypesInfo.Types[f.Type]; ok {
-					zero, zErr = astgen.ZeroExpr(t.Type, nil)
+					zero, zErr = astgen.ZeroExpr(t.Type, astgen.ZeroCtx{})
 				}
 			}
 

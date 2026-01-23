@@ -9,6 +9,9 @@ import (
 	"github.com/alecthomas/kong"
 )
 
+// version is set via linker flags during build (e.g., -ldflags "-X main.version=1.0.0")
+var version = "dev"
+
 // main is the CLI entry point.
 // It executes the runner and handles fatal errors (including check failures) by exiting with status 1.
 func main() {
@@ -27,7 +30,9 @@ func run(args []string, stdout io.Writer) error {
 		kong.Name("auto-err"),
 		kong.Description("Automatically inject error handling into Go code."),
 		kong.Writers(stdout, io.Discard),
-		kong.Exit(func(int) {}),
+		// We removed kong.Exit(func(int) {}) here.
+		// Use standard behavior (os.Exit) so --version and --help exit cleanly.
+		kong.Vars{"version": version}, // Bind the version variable
 	)
 	if err != nil {
 		return err

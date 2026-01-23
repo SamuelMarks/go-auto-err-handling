@@ -13,8 +13,8 @@ import (
 	"golang.org/x/tools/imports"
 )
 
-// helper to format output code
-func formatCode(fset *token.FileSet, file *ast.File) string {
+// helper to format output code in panic tests
+func formatPanicCode(fset *token.FileSet, file *ast.File) string {
 	var buf bytes.Buffer
 	if err := format.Node(&buf, fset, file); err != nil {
 		return ""
@@ -27,9 +27,9 @@ func formatCode(fset *token.FileSet, file *ast.File) string {
 	return string(out)
 }
 
-// normalize removes whitespace and comments to ensure robust comparisons
-func normalize(s string) string {
-	// Strip comments first to avoid whitespace removal merging them with code
+// normalize removed since previously it was shared but normalize can be local if needed or reused if exported.
+// Assuming we keep local copies to avoid dependency complexity or naming conflicts if parallel.
+func normalizePanic(s string) string {
 	lines := strings.Split(s, "\n")
 	var codeLines []string
 	for _, line := range lines {
@@ -89,8 +89,8 @@ func complex() int {
 		t.Error("Expected changes, got none")
 	}
 
-	out := formatCode(injector.Fset, file)
-	normOut := normalize(out)
+	out := formatPanicCode(injector.Fset, file)
+	normOut := normalizePanic(out)
 
 	// Case 1: Panic String -> fmt.Errorf
 	if !strings.Contains(normOut, `returnfmt.Errorf("%s","fail")`) {
@@ -128,14 +128,11 @@ func complex() int {
 }
 
 func TestRewritePanics_NoArgs(t *testing.T) {
-	// panic() without args is usually invalid in modern Go but technically AST parses it.
-	// Our logic throws error.
 	src := `package main
 func empty() { 
   panic() 
 } 
 `
-	// We skip strict type check for this simple parse
 	fset := token.NewFileSet()
 	file, _ := parser.ParseFile(fset, "", src, 0)
 
@@ -149,7 +146,6 @@ func empty() {
 }
 
 func TestRewritePanics_NestedFunc(t *testing.T) {
-	// Ensure we don't accidentally rewrite nested closures unless intended (logic says skip nested)
 	src := `package main
 func main() { 
   _ = func() { 
@@ -165,12 +161,11 @@ func main() {
 		t.Fatal(err)
 	}
 
-	// Expect NO change because we skip nested func lits in top-level traversal
 	if changed {
 		t.Error("Should not have modified nested closure")
 	}
 
-	out := formatCode(injector.Fset, file)
+	out := formatPanicCode(injector.Fset, file)
 	if !strings.Contains(out, `panic("nested")`) {
 		t.Error("Nested panic should remain")
 	}

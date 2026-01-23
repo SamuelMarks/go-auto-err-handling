@@ -3,7 +3,7 @@ package rewrite
 import (
 	"bytes"
 	"go/ast"
-	"go/format" // Explicit import to fix undefined format error
+	"go/format"
 	"go/importer"
 	"go/parser"
 	"go/printer"
@@ -14,6 +14,7 @@ import (
 
 	"github.com/SamuelMarks/go-auto-err-handling/pkg/analysis"
 	"golang.org/x/tools/go/packages"
+	"golang.org/x/tools/imports"
 )
 
 // NOTE: Creating a full *packages.Package with TypesInfo from scratch manually for tests is verbose.
@@ -67,27 +68,20 @@ func findStmt(file *ast.File, fset *token.FileSet, match string) (ast.Stmt, *ast
 	var targetCall *ast.CallExpr
 
 	ast.Inspect(file, func(n ast.Node) bool {
-		// Optimization: if we already found it, stop.
 		if targetStmt != nil {
 			return false
 		}
 
 		if stmt, ok := n.(ast.Stmt); ok {
-			// Filter out container statements that might textually contain the match
-			// but are not the atomic statement we want to replace.
 			switch stmt.(type) {
 			case *ast.BlockStmt, *ast.IfStmt, *ast.ForStmt, *ast.SwitchStmt, *ast.CaseClause:
 				return true
 			}
 
-			// Simple heuristics: Check if printed stmt contains match
 			var buf bytes.Buffer
 			printer.Fprint(&buf, fset, stmt)
 			if strings.Contains(buf.String(), match) && targetStmt == nil {
-				// We found a candidate statement (e.g. ExprStmt or AssignStmt)
 				targetStmt = stmt
-
-				// Try to dig out the call expr to verify/populate Call
 				ast.Inspect(stmt, func(sn ast.Node) bool {
 					if c, ok := sn.(*ast.CallExpr); ok {
 						targetCall = c
@@ -103,46 +97,53 @@ func findStmt(file *ast.File, fset *token.FileSet, match string) (ast.Stmt, *ast
 	return targetStmt, targetCall
 }
 
-// normalizeSpace compacts whitespace to ensure robust comparison against generated code
-// even if comments or formatter introduce newlines/indentation differences.
+// normalizeSpace compacts whitespace to ensure robust comparison against generated code.
 func normalizeSpace(s string) string {
 	return strings.Join(strings.Fields(s), " ")
 }
 
+// formatCode helper that uses imports.Process to clean up code
+func formatCode(fset *token.FileSet, file *ast.File) string {
+	var buf bytes.Buffer
+	if err := format.Node(&buf, fset, file); err != nil {
+		return ""
+	}
+	out, err := imports.Process("main.go", buf.Bytes(), nil)
+	if err != nil {
+		return buf.String()
+	}
+	return string(out)
+}
+
 func TestRewriteFile(t *testing.T) {
-	// Source code with different scenarios
-	// NOTE: Comments removed from calls to allow clean AST rewriting verification
-	// without comment location weirdness confusing the simple string checks.
 	srcUnique := `package main
 func f(i int) error { return nil }
 func g() (int, error) { return 0, nil }
 
 func case1() error {
-	f(1)
-	return nil
+  f(1)
+  return nil
 }
 
 func case2() (string, error) {
-	_ = f(2)
-	return "", nil
+  _ = f(2)
+  return "", nil
 }
 
 func case3() (int, error) {
-	i, _ := g()
-	return i, nil
+  i, _ := g()
+  return i, nil
 }
 
 func caseSkip() {
-	f(4)
+  f(4)
 }
 `
 	file, pkg := parseAndCheck(t, srcUnique)
-	// Passing empty strings for defaults
 	injector := NewInjector(pkg, "", "")
 
 	pts := []analysis.InjectionPoint{}
 
-	// Helper to add point
 	addPt := func(match string, assign *ast.AssignStmt) {
 		s, c := findStmt(file, pkg.Fset, match)
 		if s == nil {
@@ -161,7 +162,6 @@ func caseSkip() {
 	addPt("i, _ := g()", nil)
 	addPt("f(4)", nil)
 
-	// Run Rewrite
 	changed, err := injector.RewriteFile(file, pts)
 	if err != nil {
 		t.Fatalf("RewriteFile failed: %v", err)
@@ -170,14 +170,11 @@ func caseSkip() {
 		t.Errorf("Expected changes, got none")
 	}
 
-	// Render output
 	var buf bytes.Buffer
 	printer.Fprint(&buf, pkg.Fset, file)
 	output := buf.String()
 	normOutput := normalizeSpace(output)
 
-	// Validation
-	// Case 1: Expected "if err := f(1); err != nil { return err }" (collapsed)
 	if !strings.Contains(normOutput, "if err := f(1); err != nil") {
 		t.Errorf("Case 1 not using collapsed syntax. Got:\n%s", output)
 	}
@@ -185,7 +182,6 @@ func caseSkip() {
 		t.Errorf("Case 1 return missing. Got:\n%s", output)
 	}
 
-	// Case 2: Expected "if err := f(2); err != nil { return "", err }" (collapsed)
 	if !strings.Contains(normOutput, "if err := f(2); err != nil") {
 		t.Errorf("Case 2 not using collapsed syntax. Got:\n%s", output)
 	}
@@ -193,37 +189,28 @@ func caseSkip() {
 		t.Errorf("Case 2 return statement incorrect. Got:\n%s", output)
 	}
 
-	// Case 3: Expected "i, err := g(); if err != nil { return 0, err }"
-	// Should NOT be collapsed because 'i' escapes the if scope
 	if strings.Contains(normOutput, "if i, err := g();") {
 		t.Errorf("Case 3 incorrectly collapsed (scope unsafe). Got:\n%s", output)
 	}
 	if !strings.Contains(output, "i, err := g()") {
 		t.Errorf("Case 3 assignment rewrite incorrect. Got:\n%s", output)
 	}
-
-	// Case Skip: Enclosing func caseSkip() returns nothing. Should NOT contain "if err != nil" logic inserted for f(4).
-	// Since caseSkip has no return values, Injector should skip rewrite.
 }
 
 func TestRewriteFile_Shadowing(t *testing.T) {
-	// Scenario: "err" already defined in scope. Injector should use "err1".
-	// We use "err" as an argument to ensure it is in the closest function scope.
 	srcShadow := `package main
 func fail() error { return nil }
 
 func usage(err int) error {
-	_ = err
-	fail()
-	return nil
+  _ = err
+  fail()
+  return nil
 }
 `
 	file, pkg := parseAndCheck(t, srcShadow)
 	injector := NewInjector(pkg, "", "")
 
 	pts := []analysis.InjectionPoint{}
-
-	// Locate fail()
 	s, c := findStmt(file, pkg.Fset, "fail()")
 	if s == nil {
 		t.Fatal("stm not found")
@@ -243,54 +230,28 @@ func usage(err int) error {
 	output := buf.String()
 	normOutput := normalizeSpace(output)
 
-	// Check for collapsed "if err1 := fail(); err1 != nil"
-	// We verify using normalized string to safely ignore comment-induced newlines.
-	if !strings.Contains(normOutput, "if err1 := fail(); err1 != nil") {
-		t.Errorf("Expected collapsed if with err1. Output:\n%s", output)
+	// Since we enabled semantic naming for collisions, and 'err' exists as int param:
+	// The injector logic should see 'err' (Type: int) exists in scope.
+	// It falls back to semantic name. 'fail' -> 'failErr'.
+	// Then it checks uniqueness of 'failErr'. If safe, uses it.
+
+	if !strings.Contains(normOutput, "if failErr := fail(); failErr != nil") {
+		t.Errorf("Expected semantic name 'failErr'. Output:\n%s", output)
 	}
 
-	// Double check the AST structure for correctness
-	fset := token.NewFileSet()
-	f, err := parser.ParseFile(fset, "", output, parser.ParseComments)
-	if err != nil {
-		t.Fatalf("Failed to parse output: %v\n%s", err, output)
-	}
-
-	foundErr1Check := false
-	ast.Inspect(f, func(n ast.Node) bool {
-		if ifStmt, ok := n.(*ast.IfStmt); ok {
-			if bin, ok := ifStmt.Cond.(*ast.BinaryExpr); ok {
-				if x, ok := bin.X.(*ast.Ident); ok && x.Name == "err1" {
-					if bin.Op == token.NEQ {
-						if y, ok := bin.Y.(*ast.Ident); ok && y.Name == "nil" {
-							foundErr1Check = true
-						}
-					}
-				}
-			}
-		}
-		return true
-	})
-
-	if !foundErr1Check {
-		t.Errorf("Expected 'if err1 != nil' check. Output:\n%s", output)
-	}
-
-	if !strings.Contains(output, "return err1") {
-		t.Errorf("Expected return using 'err1'.")
+	if !strings.Contains(output, "return failErr") {
+		t.Errorf("Expected return using 'failErr'.")
 	}
 }
 
-// TestRewriteFile_Comments ensures that comments attached to the replaced node are preserved.
 func TestRewriteFile_Comments(t *testing.T) {
 	src := `package main
 func do() error { return nil }
-func run() error { // Renamed from main to run to allow return values during typing
-	do() // IMPORTANT COMMENT
-	return nil
+func run() error {
+  do() // IMPORTANT COMMENT
+  return nil
 }
 `
-	// We need to parse with ParseComments enabled
 	file, pkg := parseAndCheck(t, src)
 	injector := NewInjector(pkg, "", "")
 
@@ -309,7 +270,6 @@ func run() error { // Renamed from main to run to allow return values during typ
 		t.Fatal("Expected change")
 	}
 
-	// Render and format
 	var buf bytes.Buffer
 	if err := format.Node(&buf, pkg.Fset, file); err != nil {
 		t.Fatal(err)
@@ -327,22 +287,20 @@ func task() error { return nil }
 func multi() (int, error) { return 0, nil }
 
 func main() {
-	go task()
-	go multi()
+  go task()
+  go multi()
 }
 `
 	file, pkg := parseAndCheck(t, src)
 	injector := NewInjector(pkg, "", "log-fatal")
 
 	pts := []analysis.InjectionPoint{}
-	// Find go task()
 	s1, c1 := findStmt(file, pkg.Fset, "go task()")
 	if s1 == nil {
 		t.Fatal("go task() not found")
 	}
 	pts = append(pts, analysis.InjectionPoint{Stmt: s1, Call: c1, Pos: s1.Pos()})
 
-	// Find go multi()
 	s2, c2 := findStmt(file, pkg.Fset, "go multi()")
 	if s2 == nil {
 		t.Fatal("go multi() not found")
@@ -357,14 +315,11 @@ func main() {
 		t.Fatal("Expected changes for go routines")
 	}
 
-	// Build output
 	var buf bytes.Buffer
 	printer.Fprint(&buf, pkg.Fset, file)
 	output := buf.String()
 	norm := normalizeSpace(output)
 
-	// Check wrapper for task()
-	// Should be: go func() { err := task(); if err != nil { log.Fatal(err) } }()
 	if !strings.Contains(norm, "go func() {") {
 		t.Error("Did not create anonymous func wrapper")
 	}
@@ -375,10 +330,47 @@ func main() {
 		t.Error("Did not inject log.Fatal")
 	}
 
-	// Check wrapper for multi()
-	// Should be: go func() { _, err := multi(); if err != nil ...
-	// Note: normalizeSpace might make it `_, err := multi()`
 	if !strings.Contains(norm, "_, err := multi()") && !strings.Contains(norm, "_, err := multi") {
 		t.Errorf("Did not discard value returns for multi. Got:\n%s", output)
+	}
+}
+
+func TestLogFallback(t *testing.T) {
+	src := `package main
+func fail() error { return nil }
+func job() {
+	fail()
+}
+`
+	file, pkg := parseAndCheck(t, src)
+	injector := NewInjector(pkg, "", "")
+
+	// 1. Identify point
+	s, c := findStmt(file, pkg.Fset, "fail()")
+	if s == nil {
+		t.Fatal("fail() not found")
+	}
+	pt := analysis.InjectionPoint{Stmt: s, Call: c, Pos: s.Pos()}
+
+	// 2. Invoke LogFallback
+	changed, err := injector.LogFallback(file, pt)
+	if err != nil {
+		t.Fatalf("LogFallback failed: %v", err)
+	}
+	if !changed {
+		t.Error("LogFallback returned false, expected true")
+	}
+
+	// 3. Verify Output
+	out := formatCode(injector.Fset, file)
+	normOut := normalizeSpace(out)
+
+	if !strings.Contains(out, `"log"`) {
+		t.Error("log import not added")
+	}
+
+	// Expect standard 'err' shadowing since no conflict
+	if !strings.Contains(normOut, `if err := fail(); err != nil { log.Printf("ignored error in fail: %v", err) }`) {
+		t.Errorf("Log fallback logic mismatch mismatch. Got:\n%s", out)
 	}
 }

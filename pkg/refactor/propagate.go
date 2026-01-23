@@ -351,7 +351,7 @@ func generateErrorCheck(sig *types.Signature) (*ast.IfStmt, error) {
 	results := sig.Results()
 	var retExprs []ast.Expr
 	for i := 0; i < results.Len()-1; i++ {
-		z, err := astgen.ZeroExpr(results.At(i).Type(), nil)
+		z, err := astgen.ZeroExpr(results.At(i).Type(), astgen.ZeroCtx{})
 		if err != nil {
 			return nil, err
 		}

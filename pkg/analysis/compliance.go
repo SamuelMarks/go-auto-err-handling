@@ -37,7 +37,7 @@ type InterfaceRegistry struct {
 	// interfaces stores a list of all named interface types encountered during the scan.
 	interfaces []*types.TypeName
 	// seen avoids processing the same package identifier multiple times in the dependency graph.
-	seen map[string]bool
+	seen map[*packages.Package]bool
 }
 
 // NewInterfaceRegistry initializes a registry and populates it by scanning
@@ -49,7 +49,7 @@ type InterfaceRegistry struct {
 func NewInterfaceRegistry(pkgs []*packages.Package) *InterfaceRegistry {
 	reg := &InterfaceRegistry{
 		interfaces: []*types.TypeName{},
-		seen:       make(map[string]bool),
+		seen:       make(map[*packages.Package]bool),
 	}
 	for _, pkg := range pkgs {
 		reg.scanPackage(pkg)
@@ -63,10 +63,11 @@ func NewInterfaceRegistry(pkgs []*packages.Package) *InterfaceRegistry {
 //
 // pkg: The package to scan.
 func (r *InterfaceRegistry) scanPackage(pkg *packages.Package) {
-	if pkg == nil || pkg.Types == nil || r.seen[pkg.PkgPath] {
+	// Deduplicate by package pointer. go/packages ensures pointer identity for the same package node.
+	if pkg == nil || pkg.Types == nil || r.seen[pkg] {
 		return
 	}
-	r.seen[pkg.PkgPath] = true
+	r.seen[pkg] = true
 
 	// Iterate over package scope definitions
 	scope := pkg.Types.Scope()
@@ -112,8 +113,6 @@ func (r *InterfaceRegistry) CheckCompliance(method *types.Func) ([]InterfaceConf
 	recvType := recv.Type()
 	// types.Implements expects the exact type.
 	// If the method is on *S, we check implicit compliance of *S.
-	// Note: We do not need to check S separately because if *S satisfies it,
-	// and we break *S, we break the contract.
 
 	var conflicts []InterfaceConflict
 
@@ -124,7 +123,15 @@ func (r *InterfaceRegistry) CheckCompliance(method *types.Func) ([]InterfaceConf
 		}
 
 		// 1. Check if the type currently implements the interface
-		if types.Implements(recvType, iface) {
+		implements := types.Implements(recvType, iface)
+		if !implements {
+			// Fallback: Check for loose structural matching (name-based) to handle
+			// cases where types come from different package instances (e.g. test variants)
+			// and strict identity fails.
+			implements = verifyStructuralImplementation(recvType, iface)
+		}
+
+		if implements {
 			// 2. Check if the interface actually *uses* this method
 			// (A type might implement an interface, but the method we are changing
 			// is extraneous to that specific interface).
@@ -155,7 +162,29 @@ func interfaceHasMethod(iface *types.Interface, name string) (bool, *types.Func)
 			return true, m
 		}
 	}
-	// Embeds are flattened in .NumMethods / .Method in go/types usually,
-	// checking NumMethods should suffice for complete method set.
 	return false, nil
+}
+
+// verifyStructuralImplementation checks if the receiver type loosely implements
+// the interface by checking for method existence avoiding strict type identity.
+func verifyStructuralImplementation(recv types.Type, iface *types.Interface) bool {
+	mset := types.NewMethodSet(recv)
+	for i := 0; i < iface.NumMethods(); i++ {
+		im := iface.Method(i)
+
+		// Lookup logic:
+		// If exported, package doesn't matter for satisfaction (duck typing).
+		// Passing nil to Lookup matches only exported methods.
+		// If unexported, it must come from the same package.
+		var pkg *types.Package
+		if !im.Exported() {
+			pkg = im.Pkg()
+		}
+
+		sel := mset.Lookup(pkg, im.Name())
+		if sel == nil {
+			return false
+		}
+	}
+	return true
 }

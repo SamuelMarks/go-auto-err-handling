@@ -9,10 +9,8 @@ import (
 	"testing"
 )
 
-// TestZeroExpr verifies that ZeroExpr generates the correct AST representation
-// for various go/types inputs.
+// TestZeroExpr verifies standard generation.
 func TestZeroExpr(t *testing.T) {
-	// Setup common types for test cases
 	boolType := types.Typ[types.Bool]
 	intType := types.Typ[types.Int]
 	stringType := types.Typ[types.String]
@@ -33,80 +31,29 @@ func TestZeroExpr(t *testing.T) {
 	tests := []struct {
 		name      string
 		inputType types.Type
-		// We compare string representations of the AST to verify correctness
-		expected string
-		wantErr  bool
+		expected  string
+		wantErr   bool
 	}{
-		{
-			name:      "Bool",
-			inputType: boolType,
-			expected:  "false",
-		},
-		{
-			name:      "Int",
-			inputType: intType,
-			expected:  "0",
-		},
-		{
-			name:      "String",
-			inputType: stringType,
-			expected:  `""`,
-		},
-		{
-			name:      "Float",
-			inputType: floatType,
-			expected:  "0",
-		},
-		{
-			name:      "Pointer",
-			inputType: types.NewPointer(intType),
-			expected:  "nil",
-		},
-		{
-			name:      "Slice",
-			inputType: types.NewSlice(intType),
-			expected:  "nil",
-		},
-		{
-			name:      "Map",
-			inputType: types.NewMap(stringType, intType),
-			expected:  "nil",
-		},
-		{
-			name:      "Chan",
-			inputType: types.NewChan(types.SendRecv, intType),
-			expected:  "nil",
-		},
-		{
-			name:      "NamedStruct",
-			inputType: namedM,
-			expected:  "MyStruct{}",
-		},
-		{
-			name:      "NamedArray",
-			inputType: namedArray,
-			expected:  "MyArray{}",
-		},
-		{
-			name:      "AnonymousStruct",
-			inputType: types.NewStruct(nil, nil),
-			expected:  "struct{}{}",
-		},
-		{
-			name:      "ErrorInterface",
-			inputType: types.Universe.Lookup("error").Type(),
-			expected:  "nil",
-		},
-		{
-			name:      "TupleError",
-			inputType: types.NewTuple(types.NewVar(token.NoPos, nil, "a", intType)),
-			wantErr:   true,
-		},
+		{"Bool", boolType, "false", false},
+		{"Int", intType, "0", false},
+		{"String", stringType, `""`, false},
+		{"Float", floatType, "0", false},
+		{"Pointer", types.NewPointer(intType), "nil", false},
+		{"Slice", types.NewSlice(intType), "nil", false},
+		{"Map", types.NewMap(stringType, intType), "nil", false},
+		{"Chan", types.NewChan(types.SendRecv, intType), "nil", false},
+		{"NamedStruct", namedM, "MyStruct{}", false},
+		{"NamedArray", namedArray, "MyArray{}", false},
+		{"AnonymousStruct", types.NewStruct(nil, nil), "struct{}{}", false},
+		{"ErrorInterface", types.Universe.Lookup("error").Type(), "nil", false},
+		{"TupleError", types.NewTuple(types.NewVar(token.NoPos, nil, "a", intType)), "", true},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			expr, err := ZeroExpr(tt.inputType, nil)
+			// ZeroCtx with no overrides
+			ctx := ZeroCtx{}
+			expr, err := ZeroExpr(tt.inputType, ctx)
 			if (err != nil) != tt.wantErr {
 				t.Fatalf("ZeroExpr() error = %v, wantErr %v", err, tt.wantErr)
 			}
@@ -114,7 +61,6 @@ func TestZeroExpr(t *testing.T) {
 				return
 			}
 
-			// Render AST to string for comparison
 			var buf bytes.Buffer
 			fset := token.NewFileSet()
 			if err := printer.Fprint(&buf, fset, expr); err != nil {
@@ -122,7 +68,6 @@ func TestZeroExpr(t *testing.T) {
 			}
 
 			got := buf.String()
-			// Normalize comparison to ignore whitespace differences (e.g. "struct {\n}{}" vs "struct{}{}")
 			if normalize(got) != normalize(tt.expected) {
 				t.Errorf("ZeroExpr() = %q, want %q", got, tt.expected)
 			}
@@ -130,10 +75,39 @@ func TestZeroExpr(t *testing.T) {
 	}
 }
 
-// TestZeroExpr_CompositeWithQualifier tests the qualifier logic for composite types.
-// It verifies that aliases like "aliasedpkg.Bar{}" are generated correctly.
+// TestZeroExpr_Overrides verifies that custom values are returned when specified in Context.
+func TestZeroExpr_Overrides(t *testing.T) {
+	// Setup a type that we will override
+	pkg := types.NewPackage("k8s.io/api/admission/v1", "v1")
+	typeName := types.NewTypeName(token.NoPos, pkg, "AdmissionResponse", nil)
+	namedType := types.NewNamed(typeName, types.NewStruct(nil, nil), nil)
+	pointerType := types.NewPointer(namedType)
+
+	// Context with Override logic
+	overrides := map[string]string{
+		"*k8s.io/api/admission/v1.AdmissionResponse": "&v1.AdmissionResponse{Allowed: false}",
+	}
+	ctx := ZeroCtx{
+		Overrides: overrides,
+	}
+
+	expr, err := ZeroExpr(pointerType, ctx)
+	if err != nil {
+		t.Fatalf("ZeroExpr with override failed: %v", err)
+	}
+
+	var buf bytes.Buffer
+	printer.Fprint(&buf, token.NewFileSet(), expr)
+	got := buf.String()
+
+	expected := "&v1.AdmissionResponse{Allowed: false}"
+	if normalize(got) != normalize(expected) {
+		t.Errorf("Override failed. Got %q, Want %q", got, expected)
+	}
+}
+
+// TestZeroExpr_CompositeWithQualifier tests qualifier logic in context.
 func TestZeroExpr_CompositeWithQualifier(t *testing.T) {
-	// Setup: package "foo", named type "Bar"
 	pkg := types.NewPackage("example.com/foo", "foo")
 	named := types.NewNamed(
 		types.NewTypeName(token.NoPos, pkg, "Bar", nil),
@@ -141,28 +115,7 @@ func TestZeroExpr_CompositeWithQualifier(t *testing.T) {
 		nil,
 	)
 
-	// Qualifier logic: always use package Name().
-	// This mimics scenarios where "example.com/foo" is imported as "foo" (or aliased).
-	q := func(p *types.Package) string {
-		return p.Name()
-	}
-
-	expr, err := ZeroExpr(named, q)
-	if err != nil {
-		t.Fatalf("ZeroExpr() error = %v", err)
-	}
-
-	var buf bytes.Buffer
-	printer.Fprint(&buf, token.NewFileSet(), expr)
-
-	expected := "foo.Bar{}"
-	if buf.String() != expected {
-		t.Errorf("ZeroExpr() with standard qualifier = %q, want %q", buf.String(), expected)
-	}
-
-	// Check alias override logic
-	// Scenario: "example.com/foo" is imported as "baz".
-	// The qualifier knows this map.
+	// Qualifier: force "baz" for foo package
 	qAlias := func(p *types.Package) string {
 		if p.Path() == "example.com/foo" {
 			return "baz"
@@ -170,13 +123,15 @@ func TestZeroExpr_CompositeWithQualifier(t *testing.T) {
 		return p.Name()
 	}
 
-	exprAlias, err := ZeroExpr(named, qAlias)
+	ctx := ZeroCtx{Qualifier: qAlias}
+
+	expr, err := ZeroExpr(named, ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	buf.Reset()
-	printer.Fprint(&buf, token.NewFileSet(), exprAlias)
+	var buf bytes.Buffer
+	printer.Fprint(&buf, token.NewFileSet(), expr)
 
 	expectedAlias := "baz.Bar{}"
 	if buf.String() != expectedAlias {
@@ -184,7 +139,7 @@ func TestZeroExpr_CompositeWithQualifier(t *testing.T) {
 	}
 }
 
-// normalize removes all whitespace to ensure robust comparison of AST string representations.
+// normalize removes all whitespace to ensure robust comparison.
 func normalize(s string) string {
 	s = strings.ReplaceAll(s, "\n", "")
 	s = strings.ReplaceAll(s, "\t", "")

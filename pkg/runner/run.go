@@ -24,53 +24,23 @@ import (
 )
 
 // Options configuration for the runner.
-// Fields use positive logic ("Enable...") to explicitly state intended behavior.
 type Options struct {
-	// EnablePreexistingErr enables fixes for functions that already return an error. (Level 0)
 	EnablePreexistingErr bool
-
-	// EnableNonExistingErr enables signature refactoring for functions that do not return an error. (Level 1)
 	EnableNonExistingErr bool
-
-	// EnableThirdPartyErr enables checking errors from third-party packages. (Level 2)
-	EnableThirdPartyErr bool
-
-	// EnableTestRefactor enables refactoring within test functions.
-	EnableTestRefactor bool
-
-	// Check enables verification mode.
-	// If true, the tool will exit with an error if any unhandled errors are detected, without modifying files.
-	Check bool
-
-	// ExcludeGlob is a list of file glob patterns to ignore.
-	ExcludeGlob []string
-
-	// ExcludeSymbolGlob is a list of symbol patterns to ignore.
-	ExcludeSymbolGlob []string
-
-	// DryRun prints diffs instead of writing files.
-	// If Check is true, DryRun is implicitly true.
-	DryRun bool
-
-	// UseDefaultExclusions applies the default list of ignored symbols.
+	EnableThirdPartyErr  bool
+	EnableTestRefactor   bool
+	Check                bool
+	ExcludeGlob          []string
+	ExcludeSymbolGlob    []string
+	DryRun               bool
 	UseDefaultExclusions bool
-
-	// Paths to analyze.
-	Paths []string
-
-	// MainHandler injection strategy.
-	MainHandler string
-
-	// ErrorTemplate return statement template.
-	ErrorTemplate string
+	Paths                []string
+	MainHandler          string
+	ErrorTemplate        string
 }
 
 // Run executes the analysis and refactoring.
-//
-// opts: specific configuration options for the run.
-// Returns an error if analysis fails or if Check mode finds unhandled errors.
 func Run(opts Options) error {
-	// Enforce DryRun if Check is enabled to prevent modification
 	if opts.Check {
 		opts.DryRun = true
 	}
@@ -94,23 +64,23 @@ func Run(opts Options) error {
 
 		// Configure Filter
 		globs := opts.ExcludeSymbolGlob
-		// If "UseDefaultExclusions" is true, we APPEND the defaults to the glob list
 		if opts.UseDefaultExclusions {
 			globs = append(globs, filter.GetDefaults()...)
 		}
 		flt := filter.New(opts.ExcludeGlob, globs)
 
-		// Analyze
-		// We use opts.DryRun as a proxy for debug verbosity.
-		debugAnalyze := opts.DryRun
+		// Initialize Interface Registry
+		log.Println("Building interface compliance registry...")
+		ifaceRegistry := analysis.NewInterfaceRegistry(pkgs)
 
+		// Analyze
+		debugAnalyze := opts.DryRun
 		log.Println("Analyzing codebase for unhandled errors ...")
 		points, err := analysis.Detect(pkgs, flt, debugAnalyze)
 		if err != nil {
 			return fmt.Errorf("analysis failed: %v", err)
 		}
 
-		// Check Logic (Verification Mode)
 		if opts.Check {
 			if len(points) > 0 {
 				log.Printf("[FAIL] Found %d unhandled errors:", len(points))
@@ -121,10 +91,9 @@ func Run(opts Options) error {
 				return fmt.Errorf("check failed: %d unhandled errors found", len(points))
 			}
 			log.Println("No unhandled errors found. Codebase is stable.")
-			return nil // Success
+			return nil
 		}
 
-		// Standard Logic
 		if len(points) == 0 {
 			log.Println("No unhandled errors found. Codebase is stable.")
 			break
@@ -132,7 +101,7 @@ func Run(opts Options) error {
 		log.Printf("Found %d unhandled errors.", len(points))
 
 		// Apply Changes
-		changesCount, err := applyChanges(pkgSliceMap(pkgs), points, opts)
+		changesCount, err := applyChanges(pkgSliceMap(pkgs), points, opts, ifaceRegistry)
 		if err != nil {
 			return err
 		}
@@ -141,7 +110,6 @@ func Run(opts Options) error {
 			break
 		}
 
-		// Dry Run Output (Preview)
 		if opts.DryRun {
 			log.Printf("Dry Run: Generated %d changes. printing diffs...", changesCount)
 			if err := printDiffs(pkgs); err != nil {
@@ -158,8 +126,6 @@ func Run(opts Options) error {
 	return nil
 }
 
-// pkgSliceMap converts a slice of packages into a map keyed by ID.
-// Helper for efficient lookups during global analysis (like propagation).
 func pkgSliceMap(pkgs []*packages.Package) map[string]*packages.Package {
 	m := make(map[string]*packages.Package)
 	for _, p := range pkgs {
@@ -168,46 +134,35 @@ func pkgSliceMap(pkgs []*packages.Package) map[string]*packages.Package {
 	return m
 }
 
-// applyChanges processes injection points and applies refactorings based on options.
-// It returns the number of changes applied and any fatal error encountered.
-func applyChanges(pkgMap map[string]*packages.Package, points []analysis.InjectionPoint, opts Options) (int, error) {
+// applyChanges processes injection points.
+func applyChanges(pkgMap map[string]*packages.Package, points []analysis.InjectionPoint, opts Options, registry *analysis.InterfaceRegistry) (int, error) {
 	changes := 0
 
 	for _, p := range points {
-		// 1. Filter Third Party
 		if !opts.EnableThirdPartyErr {
 			if isThirdPartyCall(p) {
 				continue
 			}
 		}
 
-		// 2. Identify Context (Decl or Lit)
 		ctx := FindEnclosingFunc(p.Pkg, p.File, p.Pos)
 		if ctx == nil {
-			// Without context, we can't safely refactor returns.
 			continue
 		}
 
-		// Check Test Filter
 		if !opts.EnableTestRefactor {
 			if ctx.Decl != nil && filter.IsTestHandler(ctx.Decl) {
 				continue
 			}
 		}
 
-		// Determine if function already returns error using TypesInfo or AST fallback
 		returnsErr := hasErrorReturn(ctx.Sig)
 		if !returnsErr && ctx.Decl != nil {
-			// TypesInfo fallback if stale
 			returnsErr = hasErrorReturnAST(ctx.Decl)
 		}
 
-		// Special Handling: Entry Points (main/init)
-		// We cannot change signatures here, so we inject terminal handling directly.
+		// Entry Points
 		if ctx.Decl != nil && isEntryPoint(ctx.Decl) {
-			// Ensure we are allowed to refactor this level. Since main doesn't return error,
-			// this technically falls under NonExistingErr logic, but PreexistingErr user intent usually
-			// covers "fix my code". Use relaxed check for entry points.
 			if opts.EnableNonExistingErr || opts.EnablePreexistingErr {
 				if err := refactor.HandleEntryPoint(p.File, p.Call, p.Stmt, opts.MainHandler); err != nil {
 					return changes, err
@@ -217,10 +172,9 @@ func applyChanges(pkgMap map[string]*packages.Package, points []analysis.Injecti
 			continue
 		}
 
-		// Case A: Level 0 (Preexisting Error in signature)
+		// Level 0: Preexisting Error
 		if returnsErr {
 			if opts.EnablePreexistingErr {
-				// FIX: Pass MainHandler to NewInjector
 				injector := rewrite.NewInjector(p.Pkg, opts.ErrorTemplate, opts.MainHandler)
 				applied, err := injector.RewriteFile(p.File, []analysis.InjectionPoint{p})
 				if err != nil {
@@ -233,22 +187,42 @@ func applyChanges(pkgMap map[string]*packages.Package, points []analysis.Injecti
 			continue
 		}
 
-		// Case B: Level 1 (NonExisting Error - Signature change required)
+		// Level 1: NonExisting Error (Signature Change)
 		if opts.EnableNonExistingErr {
-			// Cannot change signature of Literals (Closures) easily
-			if ctx.IsLiteral() {
+			if ctx.IsLiteral() || ctx.Decl == nil {
 				continue
 			}
-			if ctx.Decl == nil {
+			if filter.IsTestHandler(ctx.Decl) {
 				continue
 			}
 
-			// Prohibit signature refactoring of Test Handlers even if enabled,
-			// as it breaks the go testing runner.
-			if filter.IsTestHandler(ctx.Decl) {
-				// We can't change `func TestX(t *T)` to `func TestX(t *T) error`.
+			// --- Interface Compliance Check ---
+			isBlockedByInterface := false
+
+			// We use ObjectOf to look up the function definition.
+			funcObj := p.Pkg.TypesInfo.ObjectOf(ctx.Decl.Name)
+
+			if funcObj != nil {
+				if method, ok := funcObj.(*types.Func); ok {
+					conflicts, err := registry.CheckCompliance(method)
+					if err != nil && opts.DryRun {
+						log.Printf("[WARN] Compliance check error for %s: %v", method.Name(), err)
+					}
+					if len(conflicts) > 0 {
+						if opts.DryRun {
+							log.Printf("[SKIP] Cannot refactor %s.%s because it implements interface %s.%s",
+								p.Pkg.Name, ctx.Decl.Name.Name, conflicts[0].Interface.Pkg().Name(), conflicts[0].Interface.Name())
+						}
+						isBlockedByInterface = true
+					}
+				}
+			}
+
+			if isBlockedByInterface {
+				// Skip this injection point entirely - don't modify the signature or inject any handling
 				continue
 			}
+			// ----------------------------------
 
 			// 1. Mutate Signature
 			changed, err := refactor.AddErrorToSignature(p.Pkg.Fset, ctx.Decl)
@@ -256,8 +230,6 @@ func applyChanges(pkgMap map[string]*packages.Package, points []analysis.Injecti
 				return changes, err
 			}
 			if changed {
-				// SYNC: Manually patch types info so subsequent steps see the new signature
-				// Fix: Ensure we don't panic on empty params
 				var pkg *types.Package
 				if ctx.Sig.Params().Len() > 0 && ctx.Sig.Params().At(0).Pkg() != nil {
 					pkg = ctx.Sig.Params().At(0).Pkg()
@@ -266,7 +238,6 @@ func applyChanges(pkgMap map[string]*packages.Package, points []analysis.Injecti
 				}
 
 				if err := PatchSignature(p.Pkg.TypesInfo, ctx.Decl, pkg); err != nil {
-					// Fallback attempt with package types if first failed, though above check handles most cases
 					if err1 := PatchSignature(p.Pkg.TypesInfo, ctx.Decl, p.Pkg.Types); err1 != nil {
 						return changes, err1
 					}
@@ -275,7 +246,6 @@ func applyChanges(pkgMap map[string]*packages.Package, points []analysis.Injecti
 				changes++
 
 				// 2. Mutate Body
-				// FIX: Pass MainHandler to NewInjector
 				injector := rewrite.NewInjector(p.Pkg, opts.ErrorTemplate, opts.MainHandler)
 				appliedBody, err := injector.RewriteFile(p.File, []analysis.InjectionPoint{p})
 				if err != nil {
@@ -286,9 +256,9 @@ func applyChanges(pkgMap map[string]*packages.Package, points []analysis.Injecti
 				}
 
 				// 3. Propagation
-				funcObj := p.Pkg.TypesInfo.ObjectOf(ctx.Decl.Name)
-				if funcObj != nil {
-					if targetFunc, ok := funcObj.(*types.Func); ok {
+				newObj := p.Pkg.TypesInfo.ObjectOf(ctx.Decl.Name)
+				if newObj != nil {
+					if targetFunc, ok := newObj.(*types.Func); ok {
 						var allPkgs []*packages.Package
 						for _, pkg := range pkgMap {
 							allPkgs = append(allPkgs, pkg)
@@ -306,7 +276,6 @@ func applyChanges(pkgMap map[string]*packages.Package, points []analysis.Injecti
 	return changes, nil
 }
 
-// isEntryPoint checks if the declaration is a main or init function.
 func isEntryPoint(decl *ast.FuncDecl) bool {
 	if decl.Name.Name == "init" {
 		return true
@@ -317,7 +286,6 @@ func isEntryPoint(decl *ast.FuncDecl) bool {
 	return false
 }
 
-// hasErrorReturn checks if the function signature includes an error return value.
 func hasErrorReturn(sig *types.Signature) bool {
 	if sig.Results().Len() == 0 {
 		return false
@@ -326,7 +294,6 @@ func hasErrorReturn(sig *types.Signature) bool {
 	return isErrorType(last.Type())
 }
 
-// hasErrorReturnAST checks if the function declaration AST includes an error return value.
 func hasErrorReturnAST(decl *ast.FuncDecl) bool {
 	if decl.Type.Results == nil || len(decl.Type.Results.List) == 0 {
 		return false
@@ -338,7 +305,6 @@ func hasErrorReturnAST(decl *ast.FuncDecl) bool {
 	return false
 }
 
-// isThirdPartyCall determines if the injection point originates from a third-party package.
 func isThirdPartyCall(p analysis.InjectionPoint) bool {
 	callObj := resolveCallObject(p.Pkg.TypesInfo, p.Call)
 	if callObj == nil {
@@ -364,7 +330,6 @@ func isThirdPartyCall(p analysis.InjectionPoint) bool {
 	return true
 }
 
-// resolveCallObject attempts to find the definition object of the called function.
 func resolveCallObject(info *types.Info, call *ast.CallExpr) types.Object {
 	switch fun := call.Fun.(type) {
 	case *ast.Ident:
@@ -375,13 +340,11 @@ func resolveCallObject(info *types.Info, call *ast.CallExpr) types.Object {
 	return nil
 }
 
-// isErrorType checks if the type matches the error interface.
 func isErrorType(t types.Type) bool {
 	return t.String() == "error" || t.String() == "builtin.error" ||
 		types.Identical(t, types.Universe.Lookup("error").Type())
 }
 
-// printDiffs generates and prints a unified diff of changes made to the files.
 func printDiffs(pkgs []*packages.Package) error {
 	for _, pkg := range pkgs {
 		for i, astFile := range pkg.Syntax {
@@ -408,7 +371,6 @@ func printDiffs(pkgs []*packages.Package) error {
 	return nil
 }
 
-// savePackages writes modified files back to disk.
 func savePackages(pkgs []*packages.Package) error {
 	written := make(map[string]bool)
 	for _, pkg := range pkgs {
@@ -429,7 +391,6 @@ func savePackages(pkgs []*packages.Package) error {
 	return nil
 }
 
-// savePackageFiles writes individual files of a package.
 func savePackageFiles(pkg *packages.Package, written map[string]bool) error {
 	for i, astFile := range pkg.Syntax {
 		if i >= len(pkg.GoFiles) {
@@ -451,7 +412,6 @@ func savePackageFiles(pkg *packages.Package, written map[string]bool) error {
 	return nil
 }
 
-// formatAST formats the AST node using go/format and goimports.
 func formatAST(fset *token.FileSet, node interface{}, filename string) ([]byte, error) {
 	var buf bytes.Buffer
 	if err := format.Node(&buf, fset, node); err != nil {

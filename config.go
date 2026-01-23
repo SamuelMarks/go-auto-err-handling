@@ -1,5 +1,7 @@
 package main
 
+import "github.com/alecthomas/kong"
+
 // Config holds the complete configuration mapping to CLI flags.
 // Fields use positive logic ("Enable...") defaulting to true to ensure
 // the tool performs analysis by default unless explicitly disabled.
@@ -52,4 +54,7 @@ type Config struct {
 
 	// ErrorTemplate template for return statements.
 	ErrorTemplate string `name:"error-template" help:"Template for return (e.g. '{return-zero}, err')." default:"{return-zero}, err"`
+
+	// Get the version of the package, defaults to `dev`
+	Version kong.VersionFlag `name:"version" help:"Print version information and exit."`
 }

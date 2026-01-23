@@ -272,12 +272,23 @@ func isGlobalErrorIgnored(info *types.Info, vSpec *ast.ValueSpec, rhsIndex int, 
 func shouldInclude(pkg *packages.Package, file *ast.File, call *ast.CallExpr, stmt ast.Stmt, cmap ast.CommentMap, flt *filter.Filter, debug bool) bool {
 	// 1. Check Filters
 	if flt != nil {
-		if flt.MatchesFile(pkg.Fset, call.Pos()) {
+		// Update: Handle error-returning MatchesFile
+		matchedFile, err := flt.MatchesFile(pkg.Fset, call.Pos())
+		if err != nil {
+			if debug {
+				logDebug(pkg, call, fmt.Sprintf("Error checking file filter: %v", err))
+			}
+			// If we can't check file (permission?), skipping usually safer or better to fail?
+			// We skip to be safe.
+			return false
+		}
+		if matchedFile {
 			if debug {
 				logDebug(pkg, call, fmt.Sprintf("Filtered by file glob: %s", pkg.Fset.Position(call.Pos()).Filename))
 			}
 			return false
 		}
+
 		if fn := getCalledFunction(pkg.TypesInfo, call); fn != nil {
 			if flt.MatchesSymbol(fn) {
 				if debug {

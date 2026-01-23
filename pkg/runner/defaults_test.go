@@ -3,6 +3,7 @@ package runner
 import (
 	"bytes"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -17,12 +18,12 @@ func TestRun_Defaults(t *testing.T) {
 	_ = os.WriteFile(filepath.Join(tmpDir, "go.mod"), []byte("module test\ngo 1.22\n"), 0644)
 
 	src := `package main
-import "fmt"
-func run() error {
-  fmt.Println("ignored")
+import "fmt" 
+func run() error { 
+  fmt.Println("ignored") 
   return nil
-}
-func main() {}
+} 
+func main() {} 
 `
 	_ = os.WriteFile(filepath.Join(tmpDir, "main.go"), []byte(src), 0644)
 
@@ -63,30 +64,40 @@ func main() {}
 	}
 }
 
-// Rename helper to avoid conflict with run_integration_test.go if compiled together
+// captureRunLocally helper to capture stdout and log output
 func captureRunLocally(t *testing.T, opts Options) (string, error) {
 	r, w, err := os.Pipe()
 	if err != nil {
 		return "", err
 	}
 
+	// Capture Standard Output
 	oldStdout := os.Stdout
 	os.Stdout = w
 
+	// Capture Log Output
+	// The runner uses the global log package (log.Printf), which writes to standard logger output.
+	// We redirect standard log output to our pipe.
+	// Note: We don't restore old flags/prefix, assuming tests don't depend on them critically or run in isolation.
+	log.SetOutput(w)
+
 	err = Run(opts)
-	if err != nil {
-		os.Stdout = oldStdout
-		w.Close()
-		return "", err
-	}
 
-	err = w.Close()
-	if err != nil {
-		os.Stdout = oldStdout
-		return "", err
-	}
-
+	// Restore
 	os.Stdout = oldStdout
+	// Restore log to stderr (standard default)
+	log.SetOutput(os.Stderr)
+
+	if err != nil {
+		if err := w.Close(); err != nil {
+			return "", err
+		}
+		return "", err
+	}
+
+	if err := w.Close(); err != nil {
+		return "", err
+	}
 
 	var buf bytes.Buffer
 	_, err = io.Copy(&buf, r)

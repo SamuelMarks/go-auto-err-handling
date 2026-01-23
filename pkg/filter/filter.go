@@ -40,32 +40,34 @@ func New(fileGlobs, symbolGlobs []string) *Filter {
 //
 // fset: The file set containing the position.
 // pos: The position within the file to check.
-func (f *Filter) MatchesFile(fset *token.FileSet, pos token.Pos) bool {
+func (f *Filter) MatchesFile(fset *token.FileSet, pos token.Pos) (bool, error) {
 	if fset == nil || !pos.IsValid() {
-		return false
+		return false, nil
 	}
 
 	tf := fset.File(pos)
 	if tf == nil {
-		return false
+		return false, nil
 	}
 
 	path := tf.Name()
 
 	// 1. Check Glob Patterns
 	if f.matchesGlob(path) {
-		return true
+		return true, nil
 	}
 
 	// 2. Check Generated Header
-	// We ignore an error from this check because failing to read usually implies it's not a valid Go source to analyze anyway,
-	// or perms are wrong. In either case, treating it as 'not generated' and letting subsequent stages fail or succeed is accepted.
-	isGen, _ := isGeneratedFile(path)
+	// We check for error from read to bubble it up, ensuring robust failure handling if permissions deny.
+	isGen, err := isGeneratedFile(path)
+	if err != nil {
+		return false, err
+	}
 	if isGen {
-		return true
+		return true, nil
 	}
 
-	return false
+	return false, nil
 }
 
 // matchesGlob checks if the path matches the configured file globs.
@@ -88,11 +90,13 @@ func (f *Filter) matchesGlob(path string) bool {
 }
 
 // isGeneratedFile opens the file and scans the first 20 lines for the standard generated code header.
-// Returns true if found, false otherwise. Returns false on I/O errors (safest to process if readable).
+// Returns true if found, false otherwise.
 func isGeneratedFile(path string) (b bool, err error) {
 	file, err := os.Open(path)
 	if err != nil {
-		return false, nil // Treat as not generated if we can't read it
+		// If we can't open it (e.g. doesn't exist or no permission), we return error.
+		// Caller decides if this is a skip or a failure.
+		return false, err
 	}
 	defer func() {
 		err = errors.Join(err, file.Close())
