@@ -16,7 +16,7 @@ import (
 // 2. Constructs a new types.Signature with the appended 'error' return value.
 // 3. Creates a new types.Func object pointing to this signature.
 // 4. Updates info.Defs to point to the new object.
-// 5. Updates info.Scopes (if necessary) to ensure lookups succeed [Optional consistency].
+// 5. Updates info.Uses to point all existing references to the new object.
 //
 // info: The package type info.
 // decl: The modified AST declaration (should already have the 'error' field in AST).
@@ -57,8 +57,10 @@ func PatchSignature(info *types.Info, decl *ast.FuncDecl, pkg *types.Package) er
 	var newVars []*types.Var
 
 	// Copy existing results
-	for i := 0; i < oldResults.Len(); i++ {
-		newVars = append(newVars, oldResults.At(i))
+	if oldResults != nil {
+		for i := 0; i < oldResults.Len(); i++ {
+			newVars = append(newVars, oldResults.At(i))
+		}
 	}
 
 	// Create Error Var
@@ -88,6 +90,15 @@ func PatchSignature(info *types.Info, decl *ast.FuncDecl, pkg *types.Package) er
 		info.Types[decl.Type] = types.TypeAndValue{
 			Type:  newSig,
 			Value: nil,
+		}
+	}
+
+	// 5. Update Uses
+	// Iterate over all uses in the package. If any use pointed to the old 'fnObj',
+	// point it to 'newFnObj'. This ensures call sites are updated.
+	for id, usedObj := range info.Uses {
+		if usedObj == fnObj {
+			info.Uses[id] = newFnObj
 		}
 	}
 

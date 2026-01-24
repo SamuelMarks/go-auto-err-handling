@@ -31,6 +31,10 @@ func canFail() error {
 	return nil
 }
 
+func multi() (int, string, error) {
+	return 0, "", nil
+}
+
 // Check Global Var Detection
 var _ = canFail() // Should be detected (GenDecl/ValueSpec)
 
@@ -46,6 +50,16 @@ func main() {
 	if err != nil {
 		fmt.Println(err)
 	}
+
+	// Partially Ignored Multi-Return (Tuple)
+	// (int, string, error)
+	// Case A: Assignment
+	i, _, _ := multi() // Error is ignored (3rd arg)
+
+	// Case B: Definition
+	var x int
+	var s string
+	x, s, _ = multi() // Error is ignored
 
 	// Ignored error from stdlib (filtered later)
 	fmt.Println("hello")
@@ -103,12 +117,14 @@ func testIgnored() {
 	// 1. var _ = canFail() (Global Init)
 	// 2. canFail() in main.go (ExprStmt)
 	// 3. _ = canFail() in main.go (AssignStmt)
-	// 4. defer canFail() in main.go (DeferStmt)
-	// 5. go canFail() in main.go (GoStmt)
+	// 4. i, _, _ := multi() in main.go (Tuple Assign 1)
+	// 5. x, s, _ = multi() in main.go (Tuple Assign 2)
+	// 6. defer canFail() in main.go (DeferStmt)
+	// 7. go canFail() in main.go (GoStmt)
 	// ignoredFunc() should be filtered out.
 	// fmt.Println should be filtered out.
 
-	expectedCount := 5
+	expectedCount := 7
 	if len(points) != expectedCount {
 		t.Errorf("expected %d injection points, got %d", expectedCount, len(points))
 		for i, p := range points {
@@ -119,6 +135,7 @@ func testIgnored() {
 	// Verify specific types
 	hasExprStmt := false
 	hasAssignStmt := false
+	hasTupleAssign := 0
 	hasDeferStmt := false
 	hasGoStmt := false
 	hasGlobal := false
@@ -137,9 +154,16 @@ func testIgnored() {
 				hasGoStmt = true
 			case *ast.AssignStmt:
 				// Verify it's blank assignment inside
-				if p.Assign != nil && len(p.Assign.Lhs) == 1 {
-					if id, ok := p.Assign.Lhs[0].(*ast.Ident); ok && id.Name == "_" {
-						hasAssignStmt = true
+				if p.Assign != nil {
+					// Check simple case
+					if len(p.Assign.Lhs) == 1 {
+						if id, ok := p.Assign.Lhs[0].(*ast.Ident); ok && id.Name == "_" {
+							hasAssignStmt = true
+						}
+					}
+					// Check tuple case
+					if len(p.Assign.Lhs) > 1 {
+						hasTupleAssign++
 					}
 				}
 			}
@@ -154,6 +178,9 @@ func testIgnored() {
 	}
 	if !hasAssignStmt {
 		t.Error("Did not detect blank assignment '_ = canFail()'")
+	}
+	if hasTupleAssign != 2 {
+		t.Errorf("Did not detect tuple assignments correctly. Expected 2, got %d", hasTupleAssign)
 	}
 	if !hasDeferStmt {
 		t.Error("Did not detect defer statement 'defer canFail()'")

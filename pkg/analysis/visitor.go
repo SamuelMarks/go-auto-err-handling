@@ -86,19 +86,31 @@ func Detect(pkgs []*packages.Package, flt *filter.Filter, debug bool) ([]Injecti
 
 				// Case 2: Assignment Statement (Assigned to _)
 				if assignStmt, ok := node.(*ast.AssignStmt); ok {
+					// Handle Tuple Assignment (1 Call -> N Vars)
+					// Handle N:N Assignment (N Calls -> N Vars)
+
+					// Iterate over RHS to handle N:N or 1:N cases
 					for i, rhs := range assignStmt.Rhs {
-						// Check root call
 						if call, ok := rhs.(*ast.CallExpr); ok {
 							if checksOut, errorIndex := isErrorReturningCall(pkg.TypesInfo, call); checksOut {
+
+								// Determine which LHS corresponds to the error
 								var lhsExpr ast.Expr
+
 								if len(assignStmt.Lhs) == len(assignStmt.Rhs) {
+									// N:N Case. e.g. x, y = a(), b()
+									// Here, each RHS returns exactly 1 value (one of them is error)
 									lhsExpr = assignStmt.Lhs[i]
 								} else {
+									// 1:N Case (Tuple). e.g. x, y = f()
+									// RHS has 1, LHS has N.
+									// errorIndex indicates position in the tuple (0-indexed)
 									if errorIndex < len(assignStmt.Lhs) {
 										lhsExpr = assignStmt.Lhs[errorIndex]
 									}
 								}
 
+								// If the matching LHS is a blank identifier, it's a hole.
 								if isBlankIdentifier(lhsExpr) {
 									addPoint(call, assignStmt, assignStmt)
 								} else if debug {
@@ -108,6 +120,7 @@ func Detect(pkgs []*packages.Package, flt *filter.Filter, debug bool) ([]Injecti
 								logDebug(pkg, call, "AssignStmt RHS does not return error")
 							}
 						}
+
 						// Check chains in RHS
 						checkForChains(pkg.TypesInfo, rhs, func(c *ast.CallExpr) {
 							addPoint(c, assignStmt, assignStmt)
@@ -386,9 +399,14 @@ func isErrorReturningCall(info *types.Info, call *ast.CallExpr) (bool, int) {
 	// Tuple Return
 	if tuple, ok := tv.Type.(*types.Tuple); ok {
 		if tuple.Len() > 0 {
-			last := tuple.At(tuple.Len() - 1)
+			// Iterate efficiently to find the error-typed return value.
+			// Conventionally it is the last one, but we search from end to start to be robust.
+			// Actually, typical convention is it's the LAST one.
+			// But for "partial ignore", we need to know exactly which index.
+			lastIndex := tuple.Len() - 1
+			last := tuple.At(lastIndex)
 			if isErrorType(last.Type()) {
-				return true, tuple.Len() - 1
+				return true, lastIndex
 			}
 		}
 	}

@@ -19,6 +19,11 @@ type ZeroCtx struct {
 	// Using overrides allows generating "Soft Failures" where a zero-value is technically valid
 	// but logically incorrect for the application flow (e.g., returning nil pointer vs error struct).
 	Overrides map[string]string
+
+	// MakeMapsAndChans, if true, causes maps and channels to be initialized via 'make(...)'
+	// instead of returning 'nil'. This "Soft Initialization" is useful to prevent panics in
+	// callers that expect to implicitly write to the returned container.
+	MakeMapsAndChans bool
 }
 
 // ZeroExpr generates an ast.Expr representing the zero value for the given data type.
@@ -27,6 +32,7 @@ type ZeroCtx struct {
 //
 // It checks the provided Context for overrides first. If an override exists for the type string,
 // it parses and returns that expression. Otherwise, it generates the standard Go zero value.
+// If MakeMapsAndChans is set in the context, maps and channels will be initialized via `make()`.
 //
 // t: The type for which to generate the zero value.
 // ctx: Configuration context containing qualifiers and overrides.
@@ -60,7 +66,12 @@ func ZeroExpr(t types.Type, ctx ZeroCtx) (ast.Expr, error) {
 	switch u := t.Underlying().(type) {
 	case *types.Basic:
 		return basicZero(u)
-	case *types.Pointer, *types.Slice, *types.Map, *types.Chan, *types.Signature, *types.Interface:
+	case *types.Pointer, *types.Slice, *types.Signature, *types.Interface:
+		return &ast.Ident{Name: "nil"}, nil
+	case *types.Map, *types.Chan:
+		if ctx.MakeMapsAndChans {
+			return makeInitialized(t, ctx.Qualifier)
+		}
 		return &ast.Ident{Name: "nil"}, nil
 	case *types.Struct, *types.Array:
 		return compositeZero(t, ctx.Qualifier)
@@ -139,6 +150,25 @@ func genericZero(t *types.TypeParam, q types.Qualifier) (ast.Expr, error) {
 			Fun:  &ast.Ident{Name: "new"},
 			Args: []ast.Expr{typeExpr},
 		},
+	}, nil
+}
+
+// makeInitialized generates a 'make(T)' expression for correctly initializing maps and channels.
+//
+// t: The type (Map or Chan).
+// q: The qualifier for package names.
+func makeInitialized(t types.Type, q types.Qualifier) (ast.Expr, error) {
+	typeStr := types.TypeString(t, q)
+
+	typeExpr, err := parser.ParseExpr(typeStr)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse type string '%s': %w", typeStr, err)
+	}
+	ClearPositions(typeExpr)
+
+	return &ast.CallExpr{
+		Fun:  &ast.Ident{Name: "make"},
+		Args: []ast.Expr{typeExpr},
 	}, nil
 }
 

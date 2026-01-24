@@ -84,6 +84,57 @@ func TestZeroExpr(t *testing.T) {
 	}
 }
 
+// TestZeroExpr_SoftInit verifies that maps and channels are initialized with make()
+// when the MakeMapsAndChans flag is used.
+func TestZeroExpr_SoftInit(t *testing.T) {
+	boolType := types.Typ[types.Bool]
+	intType := types.Typ[types.Int]
+	stringType := types.Typ[types.String]
+
+	// map[string]int
+	mapType := types.NewMap(stringType, intType)
+	// chan bool
+	chanType := types.NewChan(types.SendRecv, boolType)
+	// Named map type: type MyStartMap map[string]bool
+	namedMapParams := types.NewNamed(
+		types.NewTypeName(token.NoPos, nil, "MyStartMap", nil),
+		types.NewMap(stringType, boolType),
+		nil,
+	)
+
+	ctx := ZeroCtx{MakeMapsAndChans: true}
+
+	tests := []struct {
+		name      string
+		inputType types.Type
+		expected  string
+	}{
+		{"Map", mapType, "make(map[string]int)"},
+		{"Chan", chanType, "make(chan bool)"},
+		{"NamedMap", namedMapParams, "make(MyStartMap)"},
+		// Slice should still be nil even with SoftInit
+		{"SliceIgnored", types.NewSlice(intType), "nil"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			expr, err := ZeroExpr(tt.inputType, ctx)
+			if err != nil {
+				t.Fatalf("ZeroExpr() error = %v", err)
+			}
+
+			var buf bytes.Buffer
+			if err := printer.Fprint(&buf, token.NewFileSet(), expr); err != nil {
+				t.Fatalf("printer error: %v", err)
+			}
+
+			if normalize(buf.String()) != normalize(tt.expected) {
+				t.Errorf("SoftInit result mismatch. Got %q, Want %q", buf.String(), tt.expected)
+			}
+		})
+	}
+}
+
 // TestZeroExpr_Overrides verifies that custom values are returned when specified in Context.
 func TestZeroExpr_Overrides(t *testing.T) {
 	// Setup a type that we will override
