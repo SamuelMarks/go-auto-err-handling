@@ -219,7 +219,17 @@ func applyChanges(pkgMap map[string]*packages.Package, points []analysis.Injecti
 			}
 
 			if isBlockedByInterface {
-				// Skip this injection point entirely - don't modify the signature or inject any handling
+				// FIX: Fallback to logging if interface prevents refactoring.
+				// This restores 'ignored error' logging for methods like handlers where changing
+				// the signature would break the interface contract.
+				injector := rewrite.NewInjector(p.Pkg, opts.ErrorTemplate, opts.MainHandler)
+				applied, err := injector.LogFallback(p.File, p)
+				if err != nil {
+					return changes, err
+				}
+				if applied {
+					changes++
+				}
 				continue
 			}
 			// ----------------------------------
@@ -256,6 +266,7 @@ func applyChanges(pkgMap map[string]*packages.Package, points []analysis.Injecti
 				}
 
 				// 3. Propagation
+				// Resolve the *new* function object from TypesInfo after patching to ensure PropagateCallers sees the updated signature.
 				newObj := p.Pkg.TypesInfo.ObjectOf(ctx.Decl.Name)
 				if newObj != nil {
 					if targetFunc, ok := newObj.(*types.Func); ok {
@@ -270,6 +281,17 @@ func applyChanges(pkgMap map[string]*packages.Package, points []analysis.Injecti
 						changes += propagated
 					}
 				}
+			}
+		} else if !returnsErr {
+			// If we're not in Level 1 mode but the function doesn't return error,
+			// we should still apply the log fallback to handle the unhandled error
+			injector := rewrite.NewInjector(p.Pkg, opts.ErrorTemplate, opts.MainHandler)
+			applied, err := injector.LogFallback(p.File, p)
+			if err != nil {
+				return changes, err
+			}
+			if applied {
+				changes++
 			}
 		}
 	}

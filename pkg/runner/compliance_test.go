@@ -13,7 +13,8 @@ import (
 // It simulates a scenario where a struct 'Job' implements an interface 'Runner'.
 // The 'Job.Run' method (which initially returns void) contains an unhandled error inside.
 // Standard analysis would try to change 'Job.Run() error' to handle the inner error.
-// Compliance logic should detect that changing the signature breaks 'Runner', and thus SKIP it.
+// Compliance logic should detect that changing the signature breaks 'Runner', and thus
+// fall back to logging the error instead.
 func TestRun_InterfaceCompliance(t *testing.T) {
 	// 1. Setup Environment
 	tmpDir := t.TempDir()
@@ -21,28 +22,25 @@ func TestRun_InterfaceCompliance(t *testing.T) {
 
 	src := `package main
 
-type Runner interface {
-  Run()
-}
+type Runner interface { 
+  Run() 
+} 
 
-type Job struct{}
+type Job struct{} 
 
 // Run implements Runner. 
-// A naive tool would change this to func (j *Job) Run() error.
-// But this would break compile because Job would no longer satisfy Runner.
-func (j *Job) Run() {
-  fail()
-}
+func (j *Job) Run() { 
+  fail() 
+} 
 
-// fail is a helper that returns error, triggering detection.
-func fail() error { return nil }
+// fail is a helper that returns error, triggering detection. 
+func fail() error { return nil } 
 
-func main() {
-  var r Runner = &Job{}
-  r.Run()
-}
+func main() { 
+  var r Runner = &Job{} 
+  r.Run() 
+} 
 `
-	// Removed double quotes in comment above to prevent textual match in diff
 
 	srcPath := filepath.Join(tmpDir, "main.go")
 	if err := os.WriteFile(srcPath, []byte(src), 0644); err != nil {
@@ -69,10 +67,20 @@ func main() {
 		t.Fatalf("Run failed: %v", err)
 	}
 
-	// 4. Verification (Skipping log check as capture might be flaky, relying on functional result)
-	// We expect the function signature NOT to change in the dry run diff.
-	// If it contains "func (j *Job) Run() error", the guard failed.
+	// 4. Verification
+	// The output should show a diff that adds logging but does NOT change the signature
+
+	// Should NOT contain a signature change
 	if strings.Contains(out, "func (j *Job) Run() error") {
 		t.Error("Compliance failed: Job.Run signature was modified despite interface constraint")
+	}
+
+	// Should contain the logging injection
+	if !strings.Contains(out, "if err := fail(); err != nil") {
+		t.Error("Expected error handling injection for the fail() call")
+	}
+
+	if !strings.Contains(out, "log.Printf") && !strings.Contains(out, "ignored error") {
+		t.Error("Expected log.Printf call for ignored error")
 	}
 }
