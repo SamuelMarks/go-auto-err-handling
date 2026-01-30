@@ -6,194 +6,169 @@ import (
 	"go/token"
 
 	"github.com/SamuelMarks/go-auto-err-handling/pkg/refactor"
+	"github.com/dave/dst"
 	"golang.org/x/tools/go/ast/astutil"
 )
 
 // RewriteDefers scans the file for defer statements (including inside closures).
 // It converts defers that ignore errors into a pattern using errors.Join.
-//
-// Pattern:
-//
-//	defer f()
-//
-// Rewrites to:
-//
-//	defer func() { err = errors.Join(err, f()) }()
-//
-// The rewriting logic respects scope: defers inside a closure target the return variable of
-// that specific closure, not the outer function.
-//
-// file: The AST file to modify.
-//
-// Returns true if changes were applied.
-func (i *Injector) RewriteDefers(file *ast.File) (bool, error) {
-	applied := false
-	var err error
+func (i *Injector) RewriteDefers(dstFile *dst.File, astFile *ast.File) (bool, error) {
+	if dstFile == nil || astFile == nil {
+		return false, fmt.Errorf("files cannot be nil")
+	}
 
-	// Traverse the entire file. We handle each function boundary (Decl or Lit) individually.
-	astutil.Apply(file, func(c *astutil.Cursor) bool {
-		if err != nil {
-			return false
-		}
+	targets := make(map[*ast.FuncDecl][]*ast.DeferStmt)
+	litTargets := make(map[*ast.FuncLit][]*ast.DeferStmt)
 
+	type scopeCtx struct {
+		decl *ast.FuncDecl
+		lit  *ast.FuncLit
+	}
+	var stack []scopeCtx
+
+	astutil.Apply(astFile, func(c *astutil.Cursor) bool {
 		node := c.Node()
-
-		// Identify if we are entering a function scope
-		var body *ast.BlockStmt
-		var typeField *ast.FuncType
-
-		switch fn := node.(type) {
-		case *ast.FuncDecl:
-			body = fn.Body
-			typeField = fn.Type
-		case *ast.FuncLit:
-			body = fn.Body
-			typeField = fn.Type
+		if decl, ok := node.(*ast.FuncDecl); ok {
+			stack = append(stack, scopeCtx{decl: decl})
 		}
-
-		// If not a function or empty body, keep traversing
-		if body == nil || typeField == nil {
-			return true
+		if lit, ok := node.(*ast.FuncLit); ok {
+			stack = append(stack, scopeCtx{lit: lit})
 		}
-
-		// 1. Check if this function *immediately* contains relevant defers.
-		// We use a shallow inspection that does NOT enter nested functions.
-		hasTargetDefer := false
-		hasDeferCheckErr := false
-
-		// We must inspect the entire body block recursively (e.g. inside if/for),
-		// but stop at nested FuncLit/FuncDecl.
-		ast.Inspect(body, func(n ast.Node) bool {
-			// Stop if we hit a nested function boundary
-			if _, isFunc := n.(*ast.FuncLit); isFunc && n != node { // n != node check for safety if inspecting root
-				return false
-			}
-			if _, isDecl := n.(*ast.FuncDecl); isDecl && n != node {
-				return false
-			}
-
-			if deferStmt, isDefer := n.(*ast.DeferStmt); isDefer {
-				if i.isErrorReturningCall(deferStmt.Call) {
-					hasTargetDefer = true
-					return false // Found one, no need to keep looking in this branch
+		if deferStmt, ok := node.(*ast.DeferStmt); ok {
+			if i.isErrorReturningCall(deferStmt.Call) {
+				if len(stack) > 0 {
+					current := stack[len(stack)-1]
+					if current.decl != nil {
+						targets[current.decl] = append(targets[current.decl], deferStmt)
+					} else if current.lit != nil {
+						litTargets[current.lit] = append(litTargets[current.lit], deferStmt)
+					}
 				}
 			}
-			return true
-		})
+		}
+		return true
+	}, func(c *astutil.Cursor) bool {
+		node := c.Node()
+		if _, ok := node.(*ast.FuncDecl); ok {
+			stack = stack[:len(stack)-1]
+		}
+		if _, ok := node.(*ast.FuncLit); ok {
+			stack = stack[:len(stack)-1]
+		}
+		return true
+	})
 
-		if hasDeferCheckErr {
-			// Should ideally handle error from inspect if we generated one,
-			// but inspect doesn't support error return.
-			// We effectively just skip if we failed to detect properly.
+	applied := false
+
+	// Process FuncDecls
+	for astDecl, defers := range targets {
+		res, err := FindDstNode(i.Fset, dstFile, astFile, astDecl)
+		if err != nil {
+			return applied, err
+		}
+		dstDecl, ok := res.Node.(*dst.FuncDecl)
+		if !ok {
+			continue
 		}
 
-		if !hasTargetDefer {
-			return true // Continue traversal to find nested functions
+		if hasAnonymousReturnsDST(dstDecl.Type) {
+			continue
 		}
 
-		// 2. Ensure Named Returns for THIS function context
-		changedSig, ensureErr := i.ensureNamedReturnsForType(typeField)
-		if ensureErr != nil {
-			err = ensureErr
-			return false
+		changed, err := refactor.EnsureNamedReturnsDST(dstDecl)
+		if err != nil {
+			return applied, err
 		}
-		if changedSig {
+		if changed {
 			applied = true
 		}
 
-		// Verify "err" exists now
-		targetErrName := i.getErrorReturnName(typeField)
-		if targetErrName == "" {
-			return true
+		errName := i.getErrorReturnNameDST(dstDecl.Type)
+		if errName == "" {
+			continue
 		}
 
-		// 3. Rewrite the defers in this function's scope
-		// We use a localized Apply that stops at nested functions.
-		astutil.Apply(body, func(cSub *astutil.Cursor) bool {
-			nSub := cSub.Node()
+		if i.rewriteDefersInDST(dstDecl.Body, defers, astFile, dstFile, errName) {
+			applied = true
+		}
+	}
 
-			// Block nested functions from this pass (they will be visited by the outer Apply)
-			if _, isFunc := nSub.(*ast.FuncLit); isFunc {
-				return false
-			}
-			if _, isDecl := nSub.(*ast.FuncDecl); isDecl {
-				return false
-			}
+	// Process FuncLits
+	for astLit, defers := range litTargets {
+		res, err := FindDstNode(i.Fset, dstFile, astFile, astLit)
+		if err != nil {
+			return applied, err
+		}
+		dstLit, ok := res.Node.(*dst.FuncLit)
+		if !ok {
+			continue
+		}
 
-			if deferStmt, isDefer := nSub.(*ast.DeferStmt); isDefer {
-				if i.isErrorReturningCall(deferStmt.Call) {
-					newDefer := i.generateDeferRewrite(deferStmt.Call, targetErrName)
-					cSub.Replace(newDefer)
-					applied = true
-				}
-			}
-			return true
-		}, nil)
+		if hasAnonymousReturnsDST(dstLit.Type) {
+			continue
+		}
 
-		return true
-	}, nil)
+		changed, err := refactor.EnsureNamedReturnsDST(&dst.FuncDecl{Type: dstLit.Type})
+		if err != nil {
+			return applied, err
+		}
+		if changed {
+			applied = true
+		}
 
-	return applied, err
+		errName := i.getErrorReturnNameDST(dstLit.Type)
+		if errName == "" {
+			continue
+		}
+
+		if i.rewriteDefersInDST(dstLit.Body, defers, astFile, dstFile, errName) {
+			applied = true
+		}
+	}
+
+	return applied, nil
 }
 
-// ensureNamedReturnsForType is a wrapper around refactor logic adjusted for FuncType.
-// It names unnamed return values to allow defer capture.
-//
-// ft: The function type to modify.
-func (i *Injector) ensureNamedReturnsForType(ft *ast.FuncType) (bool, error) {
-	if ft.Results == nil || len(ft.Results.List) == 0 {
-		return false, nil
+func (i *Injector) rewriteDefersInDST(body *dst.BlockStmt, astDefers []*ast.DeferStmt, astFile *ast.File, dstFile *dst.File, errName string) bool {
+	changed := false
+	for _, astDefer := range astDefers {
+		res, err := FindDstNode(i.Fset, dstFile, astFile, astDefer)
+		if err != nil {
+			continue
+		}
+		dstDefer, ok := res.Node.(*dst.DeferStmt)
+		if !ok {
+			continue
+		}
+
+		newDefer := i.generateDeferRewriteDST(dstDefer.Call, errName)
+
+		if replaceDstStmt(body, dstDefer, newDefer) {
+			changed = true
+		}
 	}
+	return changed
+}
 
-	// Go requires all returns to be named or all unnamed.
-	results := ft.Results.List
-	if len(results[0].Names) > 0 {
-		return false, nil
+func hasAnonymousReturnsDST(ft *dst.FuncType) bool {
+	if ft.Results == nil {
+		return false
 	}
-
-	changeMade := false
-	nameCounts := make(map[string]int)
-	total := len(results)
-
-	for idx, field := range results {
+	for _, field := range ft.Results.List {
 		if len(field.Names) == 0 {
-			// Determine name
-			baseName := refactor.NameForExpr(field.Type) // default "v", "i", "s"
-
-			// If it is the last return and looks like an error, name it "err" explicitely
-			if idx == total-1 && i.isErrorExpr(field.Type) {
-				baseName = "err"
-			}
-
-			// Collision handling
-			name := baseName
-			if count, seen := nameCounts[baseName]; seen {
-				name = fmt.Sprintf("%s%d", baseName, count)
-				nameCounts[baseName] = count + 1
-			} else {
-				nameCounts[baseName] = 1
-			}
-
-			field.Names = []*ast.Ident{{Name: name}}
-			changeMade = true
+			return true
 		}
 	}
-	return changeMade, nil
+	return false
 }
 
-// getErrorReturnName finds the name of the return variable that matches the error type.
-// If multiple errors exist, it prioritizes "err".
-//
-// ft: The function type.
-func (i *Injector) getErrorReturnName(ft *ast.FuncType) string {
+func (i *Injector) getErrorReturnNameDST(ft *dst.FuncType) string {
 	if ft.Results == nil {
 		return ""
 	}
-
 	var lastErrName string
-
 	for _, field := range ft.Results.List {
-		if i.isErrorExpr(field.Type) {
+		if isErrorDstExpr(field.Type) {
 			for _, name := range field.Names {
 				if name.Name == "err" {
 					return "err"
@@ -205,41 +180,61 @@ func (i *Injector) getErrorReturnName(ft *ast.FuncType) string {
 	return lastErrName
 }
 
-// generateDeferRewrite creates: defer func() { err = errors.Join(err, f()) }()
-//
-// originalCall: The call expression being deferred.
-// errName: The name of the return variable to join.
-func (i *Injector) generateDeferRewrite(originalCall *ast.CallExpr, errName string) *ast.DeferStmt {
-	assign := &ast.AssignStmt{
-		Lhs: []ast.Expr{&ast.Ident{Name: errName}},
+func isErrorDstExpr(expr dst.Expr) bool {
+	if id, ok := expr.(*dst.Ident); ok {
+		return id.Name == "error"
+	}
+	return false
+}
+
+func (i *Injector) generateDeferRewriteDST(originalCall *dst.CallExpr, errName string) *dst.DeferStmt {
+	callClone := dst.Clone(originalCall).(*dst.CallExpr)
+
+	assign := &dst.AssignStmt{
+		Lhs: []dst.Expr{dst.NewIdent(errName)},
 		Tok: token.ASSIGN,
-		Rhs: []ast.Expr{
-			&ast.CallExpr{
-				Fun: &ast.SelectorExpr{
-					X:   &ast.Ident{Name: "errors"},
-					Sel: &ast.Ident{Name: "Join"},
+		Rhs: []dst.Expr{
+			&dst.CallExpr{
+				Fun: &dst.SelectorExpr{
+					X:   dst.NewIdent("errors"),
+					Sel: dst.NewIdent("Join"),
 				},
-				Args: []ast.Expr{
-					&ast.Ident{Name: errName},
-					originalCall,
+				Args: []dst.Expr{
+					dst.NewIdent(errName),
+					callClone,
 				},
 			},
 		},
 	}
 
-	funcLit := &ast.FuncLit{
-		Type: &ast.FuncType{
-			Params:  &ast.FieldList{},
+	funcLit := &dst.FuncLit{
+		Type: &dst.FuncType{
+			Params:  &dst.FieldList{},
 			Results: nil,
 		},
-		Body: &ast.BlockStmt{
-			List: []ast.Stmt{assign},
+		Body: &dst.BlockStmt{
+			List: []dst.Stmt{assign},
 		},
 	}
 
-	return &ast.DeferStmt{
-		Call: &ast.CallExpr{
+	return &dst.DeferStmt{
+		Call: &dst.CallExpr{
 			Fun: funcLit,
 		},
 	}
+}
+
+// Reuse helper check
+func (i *Injector) isErrorReturningCall(call *ast.CallExpr) bool {
+	if i.Pkg.TypesInfo == nil {
+		return false
+	}
+	tv, ok := i.Pkg.TypesInfo.Types[call]
+	if !ok {
+		return false
+	}
+	if i.isErrorType(tv.Type) {
+		return true
+	}
+	return false
 }

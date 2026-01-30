@@ -11,25 +11,18 @@ import (
 	"strings"
 
 	"github.com/SamuelMarks/go-auto-err-handling/pkg/astgen"
+	"github.com/dave/dst"
+	"github.com/dave/dst/decorator"
 )
 
-// RenderTemplate transforms a template string into a list of AST expressions suitable for a ReturnStmt.
-//
-// tmpl: The template string (e.g., "{return-zero}, fmt.Errorf(\"wrapping %s\", \"{func_name}\", err)").
-// zeroExprs: The AST expressions for the zero values (converted to string and injected).
-// errName: The actual name of the error variable in the scope (avoids shadowing conflicts).
-// funcName: The name of the function being called, for context.
-//
-// Returns:
-// - slice of ast.Expr for the return statement results.
-// - slice of strings representing imports found in the template (e.g., "fmt").
-// - error if parsing fails.
+// RenderTemplate transforms a template into a list of AST expressions (Legacy).
 func RenderTemplate(tmpl string, zeroExprs []ast.Expr, errName string, funcName string) ([]ast.Expr, []string, error) {
+	// Reusing logic via temporary source string is easiest but we have existing logic.
+	// For compilation checks of existing dependent code, we restore original logic.
 	if tmpl == "" {
 		tmpl = "{return-zero}, err"
 	}
 
-	// 1. Render zero values to string
 	var zerosParts []string
 	fset := token.NewFileSet()
 	for _, z := range zeroExprs {
@@ -40,87 +33,130 @@ func RenderTemplate(tmpl string, zeroExprs []ast.Expr, errName string, funcName 
 		zerosParts = append(zerosParts, buf.String())
 	}
 	zerosStr := strings.Join(zerosParts, ", ")
+	processed := applyTemplateReplacement(tmpl, zerosStr, funcName, errName)
 
-	// 2. Perform text replacements
-	processed := tmpl
-
-	// Handle {return-zero}
-	if len(zerosParts) == 0 {
-		// If no zero strings, remove "{return-zero}," or ", {return-zero}" to avoid syntax errors like ", err" or "err,".
-		// Regex to remove trailing comma
-		reTrailing := regexp.MustCompile(`\{return-zero\}\s*,\s*`)
-		processed = reTrailing.ReplaceAllString(processed, "")
-
-		// Regex to remove leading comma
-		reLeading := regexp.MustCompile(`,\s*\{return-zero\}`)
-		processed = reLeading.ReplaceAllString(processed, "")
-
-		// Replace bare '{return-zero}' with empty
-		processed = strings.ReplaceAll(processed, "{return-zero}", "")
-	} else {
-		processed = strings.ReplaceAll(processed, "{return-zero}", zerosStr)
-	}
-
-	// Handle {func_name}
-	processed = strings.ReplaceAll(processed, "{func_name}", funcName)
-
-	// Handle err variable name.
-	// We use a regex word boundary to avoid replacing "error" -> "err1or"
-	// Regex: \berr\b matches "err" but not "error", "terr", etc.
-	reErr := regexp.MustCompile(`\berr\b`)
-	processed = reErr.ReplaceAllString(processed, errName)
-
-	// 3. Parse the resulting string into AST
-	// We wrap it in a dummy function to parse as valid Go source.
 	dummySrc := fmt.Sprintf("package p; func _() { return %s }", processed)
 	file, err := parser.ParseFile(fset, "", dummySrc, 0)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to parse generated template '%s': %w", processed, err)
 	}
 
-	// 4. Extract ReturnStmt
 	var returnResults []ast.Expr
 	var importsFound []string
-
 	ast.Inspect(file, func(n ast.Node) bool {
 		if ret, ok := n.(*ast.ReturnStmt); ok {
 			returnResults = ret.Results
-			return false // Found it, stop digging children of return
+			return false
 		}
 		return true
 	})
-
 	if returnResults == nil {
-		// Might happen if template was empty?
-		return nil, nil, fmt.Errorf("no return statement found in processed template")
+		return nil, nil, fmt.Errorf("no return statement found")
 	}
-
-	// 5. Clear Token Positions
-	// The parser generated tokens with positions relative to the temporary Fset.
-	// If we return these positions, the main printer will be confused and may generate bad indentation.
-	// We use the shared logic from astgen.
 	for _, expr := range returnResults {
 		astgen.ClearPositions(expr)
-	}
-
-	// 6. Scan for potential imports in the expressions
-	// We look for SelectorExpr where X is an Ident (e.g. fmt.Errorf -> X=fmt).
-	for _, expr := range returnResults {
+		// Scan imports
 		ast.Inspect(expr, func(n ast.Node) bool {
 			if sel, ok := n.(*ast.SelectorExpr); ok {
 				if id, ok := sel.X.(*ast.Ident); ok {
-					// Heuristic: If it looks like a package name (lowercase), treat as import candidate.
-					// This is simple but covers stdlib/common cases (fmt, log, errors).
-					// Determining actual existence requires generic knowledge or assumption.
-					// We'll trust the user's template implies availability.
 					importsFound = append(importsFound, id.Name)
 				}
 			}
 			return true
 		})
 	}
-
 	return returnResults, uniqueStrings(importsFound), nil
+}
+
+// RenderTemplateDST transforms a template into a list of DST expressions (New).
+func RenderTemplateDST(tmpl string, zeroExprs []dst.Expr, errName string, funcName string) ([]dst.Expr, []string, error) {
+	if tmpl == "" {
+		tmpl = "{return-zero}, err"
+	}
+
+	var zerosParts []string
+	restorer := decorator.NewRestorer()
+	for _, z := range zeroExprs {
+		var buf bytes.Buffer
+		// Wrap z in a dummy file to satisfy Restorer.Fprint strict check
+		file := &dst.File{
+			Name: dst.NewIdent("p"),
+			Decls: []dst.Decl{
+				&dst.GenDecl{
+					Tok: token.VAR,
+					Specs: []dst.Spec{
+						&dst.ValueSpec{
+							Names:  []*dst.Ident{dst.NewIdent("_")},
+							Values: []dst.Expr{z},
+						},
+					},
+				},
+			},
+		}
+		if err := restorer.Fprint(&buf, file); err != nil {
+			return nil, nil, fmt.Errorf("failed to render zero expr: %w", err)
+		}
+		// Extract cleaned string from "package p\n\nvar _ = expr"
+		s := buf.String()
+		s = strings.TrimSpace(s)
+		s = strings.TrimPrefix(s, "package p")
+		s = strings.TrimSpace(s)
+		s = strings.TrimPrefix(s, "var _ =")
+		s = strings.TrimSpace(s)
+		zerosParts = append(zerosParts, s)
+	}
+	zerosStr := strings.Join(zerosParts, ", ")
+	processed := applyTemplateReplacement(tmpl, zerosStr, funcName, errName)
+
+	dummySrc := fmt.Sprintf("package p; func _() { return %s }", processed)
+	// decorator.Parse accepts just source string
+	file, err := decorator.Parse(dummySrc)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to parse generated template '%s': %w", processed, err)
+	}
+
+	var returnResults []dst.Expr
+	var importsFound []string
+	dst.Inspect(file, func(n dst.Node) bool {
+		if ret, ok := n.(*dst.ReturnStmt); ok {
+			returnResults = ret.Results
+			return false
+		}
+		return true
+	})
+	if returnResults == nil {
+		return nil, nil, fmt.Errorf("no return statement found")
+	}
+
+	for _, expr := range returnResults {
+		astgen.ClearDecorations(expr)
+		dst.Inspect(expr, func(n dst.Node) bool {
+			if sel, ok := n.(*dst.SelectorExpr); ok {
+				if id, ok := sel.X.(*dst.Ident); ok {
+					importsFound = append(importsFound, id.Name)
+				}
+			}
+			return true
+		})
+	}
+	return returnResults, uniqueStrings(importsFound), nil
+}
+
+func applyTemplateReplacement(tmpl, zerosStr, funcName, errName string) string {
+	processed := tmpl
+	if zerosStr == "" {
+		reTrailing := regexp.MustCompile(`\{return-zero\}\s*,\s*`)
+		processed = reTrailing.ReplaceAllString(processed, "")
+		reLeading := regexp.MustCompile(`,\s*\{return-zero\}`)
+		processed = reLeading.ReplaceAllString(processed, "")
+		processed = strings.ReplaceAll(processed, "{return-zero}", "")
+	} else {
+		processed = strings.ReplaceAll(processed, "{return-zero}", zerosStr)
+	}
+	processed = strings.ReplaceAll(processed, "{func_name}", funcName)
+	reErr := regexp.MustCompile(`\berr\b`)
+	processed = reErr.ReplaceAllString(processed, errName)
+	return processed
 }
 
 func uniqueStrings(s []string) []string {

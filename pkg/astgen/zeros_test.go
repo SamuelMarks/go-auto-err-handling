@@ -7,10 +7,115 @@ import (
 	"go/types"
 	"strings"
 	"testing"
+
+	"github.com/dave/dst"
+	"github.com/dave/dst/decorator"
 )
 
-// TestZeroExpr verifies standard generation.
+// TestZeroExpr verifies standard generation (AST).
 func TestZeroExpr(t *testing.T) {
+	cases := getTestCases(t)
+
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := ZeroCtx{}
+			expr, err := ZeroExpr(tt.inputType, ctx)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("ZeroExpr() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if tt.wantErr {
+				return
+			}
+
+			// Use AST printer
+			var buf bytes.Buffer
+			fset := token.NewFileSet()
+			if err := printer.Fprint(&buf, fset, expr); err != nil {
+				t.Fatalf("printer.Fprint() error = %v", err)
+			}
+
+			got := buf.String()
+			if normalize(got) != normalize(tt.expected) {
+				t.Errorf("ZeroExpr() = %q, want %q", got, tt.expected)
+			}
+		})
+	}
+}
+
+// TestZeroExprDST verifies DST generation.
+func TestZeroExprDST(t *testing.T) {
+	cases := getTestCases(t)
+
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := ZeroCtx{}
+			expr, err := ZeroExprDST(tt.inputType, ctx)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("ZeroExprDST() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if tt.wantErr {
+				return
+			}
+
+			// Wrap expr in a file node to print it safely using dst Restorer
+			got := renderDstNode(t, expr)
+
+			if normalize(got) != normalize(tt.expected) {
+				t.Errorf("ZeroExprDST() = %q, want %q", got, tt.expected)
+			}
+		})
+	}
+}
+
+// renderDstNode wraps a node in a dummy File to use Restorer.Fprint securely.
+func renderDstNode(t *testing.T, node dst.Node) string {
+	var buf bytes.Buffer
+	res := decorator.NewRestorer()
+
+	var expr dst.Expr
+	if e, ok := node.(dst.Expr); ok {
+		expr = e
+	} else {
+		t.Fatalf("Unsupported node type for rendering: %T", node)
+	}
+
+	// Create a dummy file structure: package p; var _ = <expr>
+	file := &dst.File{
+		Name: dst.NewIdent("p"),
+		Decls: []dst.Decl{
+			&dst.GenDecl{
+				Tok: token.VAR,
+				Specs: []dst.Spec{
+					&dst.ValueSpec{
+						Names:  []*dst.Ident{dst.NewIdent("_")},
+						Values: []dst.Expr{expr},
+					},
+				},
+			},
+		},
+	}
+
+	if err := res.Fprint(&buf, file); err != nil {
+		t.Fatalf("Fprint failed: %v", err)
+	}
+
+	// Output will be "package p\n\nvar _ = <expected>"
+	// We normalize it anyway, so we just strip the known prefix
+	s := buf.String()
+	// Hacky cleanup for checking
+	s = strings.ReplaceAll(s, "package p", "")
+	s = strings.ReplaceAll(s, "var _ =", "")
+	return s
+}
+
+type testCase struct {
+	name      string
+	inputType types.Type
+	expected  string
+	wantErr   bool
+}
+
+func getTestCases(t *testing.T) []testCase {
 	boolType := types.Typ[types.Bool]
 	intType := types.Typ[types.Int]
 	stringType := types.Typ[types.String]
@@ -28,19 +133,12 @@ func TestZeroExpr(t *testing.T) {
 		nil,
 	)
 
-	// Create a generic type parameter T
-	// Corresponds to: func Foo[T any]() ...
 	typeParamT := types.NewTypeParam(
 		types.NewTypeName(token.NoPos, nil, "T", nil),
-		nil, // constraint (usually interface), nil implies any/empty in simple construction
+		nil,
 	)
 
-	tests := []struct {
-		name      string
-		inputType types.Type
-		expected  string
-		wantErr   bool
-	}{
+	return []testCase{
 		{"Bool", boolType, "false", false},
 		{"Int", intType, "0", false},
 		{"String", stringType, `""`, false},
@@ -57,45 +155,55 @@ func TestZeroExpr(t *testing.T) {
 		{"TupleError", types.NewTuple(types.NewVar(token.NoPos, nil, "a", intType)), "", true},
 		{"NilInput", nil, "", true},
 	}
+}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			// ZeroCtx with no overrides
-			ctx := ZeroCtx{}
-			expr, err := ZeroExpr(tt.inputType, ctx)
-			if (err != nil) != tt.wantErr {
-				t.Fatalf("ZeroExpr() error = %v, wantErr %v", err, tt.wantErr)
-			}
-			if tt.wantErr {
-				return
-			}
+// TestASTOverrides & TestDSTOverrides shared logic handled by separate runners below
 
-			var buf bytes.Buffer
-			fset := token.NewFileSet()
-			if err := printer.Fprint(&buf, fset, expr); err != nil {
-				t.Fatalf("printer.Fprint() error = %v", err)
-			}
+func TestZeroExpr_Overrides(t *testing.T) {
+	ctx, ptr := setupOverrideCtx()
+	expr, err := ZeroExpr(ptr, ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	printer.Fprint(&buf, token.NewFileSet(), expr)
+	checkOverride(t, buf.String())
+}
 
-			got := buf.String()
-			if normalize(got) != normalize(tt.expected) {
-				t.Errorf("ZeroExpr() = %q, want %q", got, tt.expected)
-			}
-		})
+func TestZeroExprDST_Overrides(t *testing.T) {
+	ctx, ptr := setupOverrideCtx()
+	expr, err := ZeroExprDST(ptr, ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkOverride(t, renderDstNode(t, expr))
+}
+
+func setupOverrideCtx() (ZeroCtx, types.Type) {
+	pkg := types.NewPackage("k8s.io/api/admission/v1", "v1")
+	typeName := types.NewTypeName(token.NoPos, pkg, "AdmissionResponse", nil)
+	namedType := types.NewNamed(typeName, types.NewStruct(nil, nil), nil)
+	pointerType := types.NewPointer(namedType)
+	overrides := map[string]string{
+		"*k8s.io/api/admission/v1.AdmissionResponse": "&v1.AdmissionResponse{Allowed: false}",
+	}
+	return ZeroCtx{Overrides: overrides}, pointerType
+}
+
+func checkOverride(t *testing.T, got string) {
+	expected := "&v1.AdmissionResponse{Allowed: false}"
+	if normalize(got) != normalize(expected) {
+		t.Errorf("Override mismatch. Got %q, Want %q", got, expected)
 	}
 }
 
 // TestZeroExpr_SoftInit verifies that maps and channels are initialized with make()
-// when the MakeMapsAndChans flag is used.
 func TestZeroExpr_SoftInit(t *testing.T) {
 	boolType := types.Typ[types.Bool]
 	intType := types.Typ[types.Int]
 	stringType := types.Typ[types.String]
-
-	// map[string]int
 	mapType := types.NewMap(stringType, intType)
-	// chan bool
 	chanType := types.NewChan(types.SendRecv, boolType)
-	// Named map type: type MyStartMap map[string]bool
 	namedMapParams := types.NewNamed(
 		types.NewTypeName(token.NoPos, nil, "MyStartMap", nil),
 		types.NewMap(stringType, boolType),
@@ -103,7 +211,6 @@ func TestZeroExpr_SoftInit(t *testing.T) {
 	)
 
 	ctx := ZeroCtx{MakeMapsAndChans: true}
-
 	tests := []struct {
 		name      string
 		inputType types.Type
@@ -112,57 +219,25 @@ func TestZeroExpr_SoftInit(t *testing.T) {
 		{"Map", mapType, "make(map[string]int)"},
 		{"Chan", chanType, "make(chan bool)"},
 		{"NamedMap", namedMapParams, "make(MyStartMap)"},
-		// Slice should still be nil even with SoftInit
 		{"SliceIgnored", types.NewSlice(intType), "nil"},
 	}
 
 	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			expr, err := ZeroExpr(tt.inputType, ctx)
-			if err != nil {
-				t.Fatalf("ZeroExpr() error = %v", err)
-			}
-
+		t.Run("AST_"+tt.name, func(t *testing.T) {
+			expr, _ := ZeroExpr(tt.inputType, ctx)
 			var buf bytes.Buffer
-			if err := printer.Fprint(&buf, token.NewFileSet(), expr); err != nil {
-				t.Fatalf("printer error: %v", err)
-			}
-
+			printer.Fprint(&buf, token.NewFileSet(), expr)
 			if normalize(buf.String()) != normalize(tt.expected) {
-				t.Errorf("SoftInit result mismatch. Got %q, Want %q", buf.String(), tt.expected)
+				t.Errorf("AST SoftInit mismatch. Got %q", buf.String())
 			}
 		})
-	}
-}
-
-// TestZeroExpr_Overrides verifies that custom values are returned when specified in Context.
-func TestZeroExpr_Overrides(t *testing.T) {
-	// Setup a type that we will override
-	pkg := types.NewPackage("k8s.io/api/admission/v1", "v1")
-	typeName := types.NewTypeName(token.NoPos, pkg, "AdmissionResponse", nil)
-	namedType := types.NewNamed(typeName, types.NewStruct(nil, nil), nil)
-	pointerType := types.NewPointer(namedType)
-
-	// Context with Override logic
-	overrides := map[string]string{
-		"*k8s.io/api/admission/v1.AdmissionResponse": "&v1.AdmissionResponse{Allowed: false}",
-	}
-	ctx := ZeroCtx{
-		Overrides: overrides,
-	}
-
-	expr, err := ZeroExpr(pointerType, ctx)
-	if err != nil {
-		t.Fatalf("ZeroExpr with override failed: %v", err)
-	}
-
-	var buf bytes.Buffer
-	printer.Fprint(&buf, token.NewFileSet(), expr)
-	got := buf.String()
-
-	expected := "&v1.AdmissionResponse{Allowed: false}"
-	if normalize(got) != normalize(expected) {
-		t.Errorf("Override failed. Got %q, Want %q", got, expected)
+		t.Run("DST_"+tt.name, func(t *testing.T) {
+			expr, _ := ZeroExprDST(tt.inputType, ctx)
+			got := renderDstNode(t, expr)
+			if normalize(got) != normalize(tt.expected) {
+				t.Errorf("DST SoftInit mismatch. Got %q", got)
+			}
+		})
 	}
 }
 
@@ -174,32 +249,31 @@ func TestZeroExpr_CompositeWithQualifier(t *testing.T) {
 		types.NewStruct(nil, nil),
 		nil,
 	)
-
-	// Qualifier: force "baz" for foo package
 	qAlias := func(p *types.Package) string {
 		if p.Path() == "example.com/foo" {
 			return "baz"
 		}
 		return p.Name()
 	}
-
 	ctx := ZeroCtx{Qualifier: qAlias}
+	expected := "baz.Bar{}"
 
-	expr, err := ZeroExpr(named, ctx)
-	if err != nil {
-		t.Fatal(err)
+	// AST
+	exprAST, _ := ZeroExpr(named, ctx)
+	var buf bytes.Buffer
+	printer.Fprint(&buf, token.NewFileSet(), exprAST)
+	if buf.String() != expected {
+		t.Errorf("AST Qualifier failed. Got %s", buf.String())
 	}
 
-	var buf bytes.Buffer
-	printer.Fprint(&buf, token.NewFileSet(), expr)
-
-	expectedAlias := "baz.Bar{}"
-	if buf.String() != expectedAlias {
-		t.Errorf("ZeroExpr() with alias qualifier = %q, want %q", buf.String(), expectedAlias)
+	// DST
+	exprDST, _ := ZeroExprDST(named, ctx)
+	gotDST := renderDstNode(t, exprDST)
+	if normalize(gotDST) != normalize(expected) {
+		t.Errorf("DST Qualifier failed. Got %s", gotDST)
 	}
 }
 
-// normalize removes all whitespace to ensure robust comparison.
 func normalize(s string) string {
 	s = strings.ReplaceAll(s, "\n", "")
 	s = strings.ReplaceAll(s, "\t", "")

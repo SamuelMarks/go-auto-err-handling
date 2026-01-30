@@ -7,7 +7,7 @@ import (
 	"testing"
 )
 
-// TestRunner_Integration verifies the full analysis and refactoring cycle.
+// TestRunner_Integration verifies the full analysis and refactoring cycle using DST.
 func TestRunner_Integration(t *testing.T) {
 	tmpDir := t.TempDir()
 
@@ -21,20 +21,28 @@ func TestRunner_Integration(t *testing.T) {
 	// main.go containing unhandled errors in various scenarios
 	mainSrc := `package main
 
-func failing() error { return nil } 
+import "fmt"
 
-func existing() error { 
-  failing() 
-  return nil
-} 
+func failing() error { return nil }
 
-func nonexisting() { 
-  failing() 
-} 
+// comment attached to existing
+func existing() error {
+	failing()
+	return nil
+}
 
-func usage() { 
-  nonexisting() 
-} 
+func nonexisting() {
+	failing() // inline comment
+}
+
+func usage() {
+	nonexisting()
+}
+
+func main() {
+	// Should log fatal
+	usage()
+}
 `
 	err = os.WriteFile(filepath.Join(tmpDir, "main.go"), []byte(mainSrc), 0644)
 	if err != nil {
@@ -45,14 +53,15 @@ func usage() {
 	if err := os.Chdir(tmpDir); err != nil {
 		t.Fatalf("failed to chdir: %v", err)
 	}
-	defer interface{}(func() { _ = os.Chdir(oldWd) }).(func())()
+	defer func() { _ = os.Chdir(oldWd) }()
 
 	// Configure Runner with Defaults (Everything Enabled)
 	opts := Options{
-		EnablePreexistingErr: true, // Enabled
-		EnableNonExistingErr: true, // Enabled
-		EnableThirdPartyErr:  true, // Enabled
+		EnablePreexistingErr: true,
+		EnableNonExistingErr: true,
+		EnableThirdPartyErr:  true,
 		Paths:                []string{"."},
+		DryRun:               false,
 	}
 
 	// Run
@@ -67,19 +76,68 @@ func usage() {
 	}
 	code := string(content)
 
-	// Level 0: 'existing' should check error
-	// With collapse: "if err := failing(); err != nil {"
-	if !strings.Contains(code, "if err := failing(); err != nil {") && !strings.Contains(code, "if err != nil {") {
-		t.Errorf("Level 0 fix missing: check not found. Code:\n%s", code)
+	// Check 1: 'existing' should check error using 'err' variable
+	if !strings.Contains(code, "if err := failing(); err != nil") {
+		t.Errorf("Level 0 fix missing. Code dump:\n%s", code)
+	}
+	// Check comment preservation
+	if !strings.Contains(code, "// comment attached to existing") {
+		t.Error("Top level comment lost")
 	}
 
-	// Level 1: 'nonexisting' should now return error
+	// Check 2: 'nonexisting' signature upgrade
 	if !strings.Contains(code, "func nonexisting() error") {
 		t.Error("Level 1 signature change missing.")
 	}
+	if !strings.Contains(code, "// inline comment") {
+		t.Error("Inline comment lost.")
+	}
 
-	// Propagation: 'usage' calls 'nonexisting', so 'usage' must change
+	// Check 3: 'usage' signature upgrade (Propagation)
 	if !strings.Contains(code, "func usage() error") {
 		t.Error("Propagation recursive fix missing.")
+	} else if !strings.Contains(code, "if err := nonexisting(); err != nil") {
+		t.Error("Usage body not updated.")
+	}
+
+	// Check 4: 'main' terminal handling
+	if !strings.Contains(code, "log.Fatal(err)") {
+		t.Error("Main terminal handling missing.")
+	}
+}
+
+func TestRunner_PanicRewrite(t *testing.T) {
+	tmpDir := t.TempDir()
+	_ = os.WriteFile(filepath.Join(tmpDir, "go.mod"), []byte("module panic\ngo 1.22\n"), 0644)
+
+	src := `package main
+import "errors"
+func do() {
+	panic(errors.New("fail"))
+}
+`
+	_ = os.WriteFile(filepath.Join(tmpDir, "main.go"), []byte(src), 0644)
+
+	oldWd, _ := os.Getwd()
+	_ = os.Chdir(tmpDir)
+	defer func() { _ = os.Chdir(oldWd) }()
+
+	opts := Options{
+		PanicToReturn: true,
+		Paths:         []string{"."},
+	}
+
+	if err := Run(opts); err != nil {
+		t.Fatalf("Run failed: %v", err)
+	}
+
+	content, _ := os.ReadFile("main.go")
+	code := string(content)
+
+	if !strings.Contains(code, "func do() error") {
+		t.Error("Signature not upgraded for panic")
+	}
+	if !strings.Contains(code, `return errors.New("fail")`) {
+		t.Error("Panic not rewritten to return")
 	}
 }

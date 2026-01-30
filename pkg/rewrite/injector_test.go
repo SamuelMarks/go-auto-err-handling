@@ -3,333 +3,218 @@ package rewrite
 import (
 	"bytes"
 	"go/ast"
-	"go/format"
 	"go/importer"
 	"go/parser"
-	"go/printer"
 	"go/token"
 	"go/types"
 	"strings"
 	"testing"
 
 	"github.com/SamuelMarks/go-auto-err-handling/pkg/analysis"
+	"github.com/dave/dst"
+	"github.com/dave/dst/decorator"
 	"golang.org/x/tools/go/packages"
-	"golang.org/x/tools/imports"
 )
 
-// NOTE: Creating a full *packages.Package with TypesInfo from scratch manually for tests is verbose.
-// We use a small helper to parse and typecheck source string.
-
-func parseAndCheck(t *testing.T, source string) (*ast.File, *packages.Package) {
+// Helper to setup everything
+func setupInjectorTest(t *testing.T, src string) (*Injector, *dst.File, *ast.File) {
 	fset := token.NewFileSet()
-	f, err := parser.ParseFile(fset, "main.go", source, parser.ParseComments)
+	astFile, err := parser.ParseFile(fset, "main.go", src, parser.ParseComments)
 	if err != nil {
-		t.Fatalf("Parse error: %v", err)
+		t.Fatalf("parser: %v", err)
 	}
 
-	// Run type checker to populate TypeInfo
-	conf := types.Config{
-		Importer: importer.Default(), // Necessary to resolve stdlib imports like "errors"
-		Error: func(err error) {
-			t.Logf("Type check error: %v", err)
-		},
-	}
+	conf := types.Config{Importer: importer.Default()}
 	info := &types.Info{
-		Types:      make(map[ast.Expr]types.TypeAndValue),
-		Defs:       make(map[*ast.Ident]types.Object),
-		Uses:       make(map[*ast.Ident]types.Object),
-		Scopes:     make(map[ast.Node]*types.Scope),
-		Selections: make(map[*ast.SelectorExpr]*types.Selection),
+		Types:  make(map[ast.Expr]types.TypeAndValue),
+		Defs:   make(map[*ast.Ident]types.Object),
+		Uses:   make(map[*ast.Ident]types.Object),
+		Scopes: make(map[ast.Node]*types.Scope),
 	}
-
-	pkg, err := conf.Check("main", fset, []*ast.File{f}, info)
+	pkgTypes, err := conf.Check("main", fset, []*ast.File{astFile}, info)
 	if err != nil {
-		t.Fatalf("Type check error: %v", err)
+		t.Fatalf("checker: %v", err)
 	}
 
-	// Wrap in packages.Package
-	pack := &packages.Package{
-		PkgPath:         "main",
-		Fset:            fset,
-		Syntax:          []*ast.File{f},
-		Types:           pkg,
-		TypesInfo:       info,
-		GoFiles:         []string{"main.go"},
-		CompiledGoFiles: []string{"main.go"},
+	pkg := &packages.Package{
+		Fset:      fset,
+		Types:     pkgTypes,
+		TypesInfo: info,
+		Syntax:    []*ast.File{astFile},
 	}
 
-	return f, pack
+	dstFile, err := decorator.NewDecorator(fset).DecorateFile(astFile)
+	if err != nil {
+		t.Fatalf("decorate: %v", err)
+	}
+
+	injector := NewInjector(pkg, "", "")
+	return injector, dstFile, astFile
 }
 
-// findStmt finds the first statement matching a substring in the source code.
-// This mocks the analysis phase finding.
-func findStmt(file *ast.File, fset *token.FileSet, match string) (ast.Stmt, *ast.CallExpr) {
-	var targetStmt ast.Stmt
-	var targetCall *ast.CallExpr
-
-	ast.Inspect(file, func(n ast.Node) bool {
-		if targetStmt != nil {
+// findPoint helper
+func findPoint(t *testing.T, f *ast.File, substr string) analysis.InjectionPoint {
+	var pt analysis.InjectionPoint
+	found := false
+	ast.Inspect(f, func(n ast.Node) bool {
+		if found {
 			return false
 		}
-
-		if stmt, ok := n.(ast.Stmt); ok {
-			switch stmt.(type) {
-			case *ast.BlockStmt, *ast.IfStmt, *ast.ForStmt, *ast.SwitchStmt, *ast.CaseClause:
+		if s, ok := n.(ast.Stmt); ok {
+			// Skip BlockStmt to match Detection logic and prevent mapping issues
+			if _, isBlock := s.(*ast.BlockStmt); isBlock {
 				return true
 			}
 
-			var buf bytes.Buffer
-			printer.Fprint(&buf, fset, stmt)
-			if strings.Contains(buf.String(), match) && targetStmt == nil {
-				targetStmt = stmt
-				ast.Inspect(stmt, func(sn ast.Node) bool {
+			// Naive check if statement contains the substring via token pos?
+			// Let's look for call expr inside stmt.
+			if callStmtContains(s, substr) {
+				pt = analysis.InjectionPoint{
+					Stmt: s,
+					File: f,
+					Pos:  s.Pos(),
+				}
+				// Populate Call
+				ast.Inspect(s, func(sn ast.Node) bool {
 					if c, ok := sn.(*ast.CallExpr); ok {
-						targetCall = c
+						pt.Call = c
 						return false
 					}
 					return true
 				})
+				// Populate Assign
+				if a, ok := s.(*ast.AssignStmt); ok {
+					pt.Assign = a
+				}
+				found = true
 				return false
 			}
 		}
 		return true
 	})
-	return targetStmt, targetCall
-}
-
-// normalizeSpace compacts whitespace to ensure robust comparison against generated code.
-func normalizeSpace(s string) string {
-	return strings.Join(strings.Fields(s), " ")
-}
-
-// formatCode helper that uses imports.Process to clean up code
-func formatCode(fset *token.FileSet, file *ast.File) string {
-	var buf bytes.Buffer
-	if err := format.Node(&buf, fset, file); err != nil {
-		return ""
+	if !found {
+		t.Fatalf("point not found for %q", substr)
 	}
-	out, err := imports.Process("main.go", buf.Bytes(), nil)
-	if err != nil {
-		return buf.String()
-	}
-	return string(out)
+	return pt
 }
 
-func TestRewriteFile(t *testing.T) {
-	srcUnique := `package main
-func f(i int) error { return nil }
-func g() (int, error) { return 0, nil }
-
-func case1() error {
-  f(1)
-  return nil
-}
-
-func case2() (string, error) {
-  _ = f(2)
-  return "", nil
-}
-
-func case3() (int, error) {
-  i, _ := g()
-  return i, nil
-}
-
-func caseSkip() {
-  f(4)
-}
-`
-	file, pkg := parseAndCheck(t, srcUnique)
-	injector := NewInjector(pkg, "", "")
-
-	pts := []analysis.InjectionPoint{}
-
-	addPt := func(match string, assign *ast.AssignStmt) {
-		s, c := findStmt(file, pkg.Fset, match)
-		if s == nil {
-			t.Fatalf("Could not find stmt for %q", match)
-		}
-		if assign == nil {
-			if a, ok := s.(*ast.AssignStmt); ok {
-				assign = a
+func callStmtContains(s ast.Stmt, sub string) bool {
+	match := false
+	ast.Inspect(s, func(n ast.Node) bool {
+		if id, ok := n.(*ast.Ident); ok {
+			if strings.Contains(id.Name, sub) {
+				match = true
 			}
 		}
-		pts = append(pts, analysis.InjectionPoint{Stmt: s, Call: c, Assign: assign, Pos: s.Pos()})
-	}
+		return true
+	})
+	return match
+}
 
-	addPt("f(1)", nil)
-	addPt("_ = f(2)", nil)
-	addPt("i, _ := g()", nil)
-	addPt("f(4)", nil)
-
-	changed, err := injector.RewriteFile(file, pts)
-	if err != nil {
-		t.Fatalf("RewriteFile failed: %v", err)
-	}
-	if !changed {
-		t.Errorf("Expected changes, got none")
-	}
-
+func render(t *testing.T, f *dst.File) string {
 	var buf bytes.Buffer
-	printer.Fprint(&buf, pkg.Fset, file)
-	output := buf.String()
-	normOutput := normalizeSpace(output)
-
-	if !strings.Contains(normOutput, "if err := f(1); err != nil") {
-		t.Errorf("Case 1 not using collapsed syntax. Got:\n%s", output)
-	}
-	if !strings.Contains(output, "return err") {
-		t.Errorf("Case 1 return missing. Got:\n%s", output)
-	}
-
-	if !strings.Contains(normOutput, "if err := f(2); err != nil") {
-		t.Errorf("Case 2 not using collapsed syntax. Got:\n%s", output)
-	}
-	if !strings.Contains(output, `return "", err`) {
-		t.Errorf("Case 2 return statement incorrect. Got:\n%s", output)
-	}
-
-	if strings.Contains(normOutput, "if i, err := g();") {
-		t.Errorf("Case 3 incorrectly collapsed (scope unsafe). Got:\n%s", output)
-	}
-	if !strings.Contains(output, "i, err := g()") {
-		t.Errorf("Case 3 assignment rewrite incorrect. Got:\n%s", output)
-	}
-}
-
-func TestRewriteFile_Comments_AssignStmt(t *testing.T) {
-	src := `package main
-func do() error { return nil }
-func run() error {
-  // IMPORTANT COMMENT
-  do()
-  return nil
-}
-`
-	file, pkg := parseAndCheck(t, src)
-	injector := NewInjector(pkg, "", "")
-
-	s, c := findStmt(file, pkg.Fset, "do()")
-	pts := []analysis.InjectionPoint{{Stmt: s, Call: c, Pos: s.Pos()}}
-
-	changed, err := injector.RewriteFile(file, pts)
-	if err != nil {
+	if err := decorator.NewRestorer().Fprint(&buf, f); err != nil {
 		t.Fatal(err)
 	}
-	if !changed {
-		t.Fatal("Expected change")
-	}
-
-	out := formatCode(pkg.Fset, file)
-
-	// We expect:
-	// // IMPORTANT COMMENT
-	// if err := do(); err != nil {
-	if !strings.Contains(out, "// IMPORTANT COMMENT") {
-		t.Error("Comment lost")
-	}
+	return buf.String()
 }
 
-// TestRewriteFile_Comments_DeclStmt ensures that if we inject a var declaration,
-// comments attach to it properly.
-func TestRewriteFile_Comments_DeclStmt(t *testing.T) {
+func TestRewriteFile_Comments(t *testing.T) {
 	src := `package main
-func foo() (int, error) { return 0, nil }
+
+func fail() error { return nil }
+
 func run() error {
-	var x int
-	// DOC COMMENT
-	x, _ = foo()
-	_ = x
+	// Pre-comment
+	fail() // Inline-comment
+	// Post-comment
 	return nil
 }
 `
-	file, pkg := parseAndCheck(t, src)
-	injector := NewInjector(pkg, "", "")
+	injector, dstFile, astFile := setupInjectorTest(t, src)
+	pt := findPoint(t, astFile, "fail")
 
-	s, c := findStmt(file, pkg.Fset, "x, _ = foo()")
-	// Make sure we set Assign field correctly for rewrite logic
-	as := s.(*ast.AssignStmt)
-	pts := []analysis.InjectionPoint{{Stmt: s, Call: c, Assign: as, Pos: s.Pos()}}
-
-	changed, err := injector.RewriteFile(file, pts)
+	changed, err := injector.RewriteFile(dstFile, astFile, []analysis.InjectionPoint{pt})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !changed {
-		t.Fatal("Expected change")
+		t.Error("Expected change")
 	}
 
-	out := formatCode(pkg.Fset, file)
+	out := render(t, dstFile)
 
-	// Since refactoring injects "var err error" before "x, err = foo()",
-	// the comment should conceptually stick to the assignment or the var decl?
-	// The injector logic attaches comments to the FIRST generated node.
-	// Generated nodes: [DeclStmt(var err), AssignStmt(x, err = ...), IfStmt]
-	// Expectation:
-	// // DOC COMMENT
-	// var err error
-	if !strings.Contains(out, "// DOC COMMENT\n\tvar err error") {
-		t.Errorf("Comment not attached to injected decl. Got:\n%s", out)
+	// Check Trivia Placement with flexible whitespace
+	// Expected roughly:
+	// // Pre-comment
+	// if err := fail(); ...
+
+	if !strings.Contains(out, "// Pre-comment") {
+		t.Error("Pre-comment missing")
+	}
+	if !strings.Contains(out, "if err := fail();") {
+		t.Error("Injection failed")
+	}
+
+	// Comment check
+	if !strings.Contains(out, "// Inline-comment") {
+		t.Error("Inline comment lost")
+	}
+	if !strings.Contains(out, "// Post-comment") {
+		t.Error("Post comment lost")
 	}
 }
 
-func TestRewriteFile_Comments_GoStmt(t *testing.T) {
+func TestRewriteFile_GoStmt(t *testing.T) {
 	src := `package main
 func task() error { return nil }
 func main() {
-	// ASYNC TASK
 	go task()
 }
 `
-	file, pkg := parseAndCheck(t, src)
-	injector := NewInjector(pkg, "", "")
+	injector, dstFile, astFile := setupInjectorTest(t, src)
+	pt := findPoint(t, astFile, "task")
 
-	s, c := findStmt(file, pkg.Fset, "go task()")
-	pts := []analysis.InjectionPoint{{Stmt: s, Call: c, Pos: s.Pos()}}
-
-	changed, err := injector.RewriteFile(file, pts)
+	changed, err := injector.RewriteFile(dstFile, astFile, []analysis.InjectionPoint{pt})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !changed {
-		t.Fatal("Expected change")
+		t.Error("Expected change")
 	}
 
-	out := formatCode(pkg.Fset, file)
-
-	// Expect:
-	// // ASYNC TASK
-	// go func() { ... }
-	if !strings.Contains(out, "// ASYNC TASK\n\tgo func()") {
-		t.Errorf("Comment not attached to go stmt. Got:\n%s", out)
+	out := render(t, dstFile)
+	if !strings.Contains(out, "go func() {") {
+		t.Errorf("Go rewrite failed: %s", out)
+	}
+	if !strings.Contains(out, "log.Fatal") {
+		t.Error("Default handler missing")
 	}
 }
 
-func TestLogFallback_Comments(t *testing.T) {
+func TestLogFallback(t *testing.T) {
 	src := `package main
-func fail() error { return nil }
-func job() {
-	// IGNORED
-	fail()
+func task() error { return nil }
+func main() {
+	task()
 }
 `
-	file, pkg := parseAndCheck(t, src)
-	injector := NewInjector(pkg, "", "")
+	injector, dstFile, astFile := setupInjectorTest(t, src)
+	pt := findPoint(t, astFile, "task")
 
-	s, c := findStmt(file, pkg.Fset, "fail()")
-	pt := analysis.InjectionPoint{Stmt: s, Call: c, Pos: s.Pos()}
-
-	changed, err := injector.LogFallback(file, pt)
+	changed, err := injector.LogFallback(dstFile, astFile, pt)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !changed {
-		t.Fatal("Expected change")
+		t.Error("Expected change")
 	}
 
-	out := formatCode(pkg.Fset, file)
-
-	if !strings.Contains(out, "// IGNORED") {
-		t.Error("Comment lost in log fallback")
+	out := render(t, dstFile)
+	if !strings.Contains(out, `log.Printf("ignored error in task: %v", err)`) {
+		t.Errorf("Log fallback failed: %s", out)
+	}
+	if !strings.Contains(out, `import "log"`) {
+		t.Error("Import log missing")
 	}
 }

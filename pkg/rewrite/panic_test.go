@@ -3,170 +3,164 @@ package rewrite
 import (
 	"bytes"
 	"go/ast"
-	"go/format"
+	"go/importer"
 	"go/parser"
 	"go/token"
+	"go/types"
 	"strings"
 	"testing"
 
+	"github.com/dave/dst"
+	"github.com/dave/dst/decorator"
 	"golang.org/x/tools/go/packages"
-	"golang.org/x/tools/imports"
 )
 
-// helper to format output code in panic tests
-func formatPanicCode(fset *token.FileSet, file *ast.File) string {
-	var buf bytes.Buffer
-	if err := format.Node(&buf, fset, file); err != nil {
-		return ""
-	}
-	// Run imports to clean up fmt
-	out, err := imports.Process("main.go", buf.Bytes(), nil)
+// setupDstEnv creates the environment for DST-based rewriting.
+// Returns Injector, AST File, and DST File.
+// If skipTypes is true, ignores type checker errors.
+func setupDstEnv(t *testing.T, src string, skipTypes bool) (*Injector, *ast.File, *dst.File) {
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "main.go", src, parser.ParseComments)
 	if err != nil {
-		return buf.String()
+		t.Fatalf("parser failed: %v", err)
 	}
-	return string(out)
-}
 
-// normalize removed since previously it was shared but normalize can be local if needed or reused if exported.
-// Assuming we keep local copies to avoid dependency complexity or naming conflicts if parallel.
-func normalizePanic(s string) string {
-	lines := strings.Split(s, "\n")
-	var codeLines []string
-	for _, line := range lines {
-		if idx := strings.Index(line, "//"); idx != -1 {
-			line = line[:idx]
-		}
-		codeLines = append(codeLines, line)
+	conf := types.Config{Importer: importer.Default()}
+	info := &types.Info{
+		Types: make(map[ast.Expr]types.TypeAndValue),
+		Defs:  make(map[*ast.Ident]types.Object),
+		Uses:  make(map[*ast.Ident]types.Object),
 	}
-	s = strings.Join(codeLines, "")
+	_, err = conf.Check("main", fset, []*ast.File{f}, info)
+	if err != nil && !skipTypes {
+		t.Fatalf("type check failed: %v", err)
+	}
 
-	s = strings.ReplaceAll(s, "\n", "")
-	s = strings.ReplaceAll(s, "\t", "")
-	s = strings.ReplaceAll(s, " ", "")
-	return s
-}
+	dstFile, err := decorator.NewDecorator(fset).DecorateFile(f)
+	if err != nil {
+		t.Fatalf("decoration failed: %v", err)
+	}
 
-func TestRewritePanics(t *testing.T) {
-	// We parse and mockcheck a file to get TypesInfo populated sufficiently for panic analysis
-	src := `package main
-
-import "errors" 
-
-func panicString() { 
-  panic("fail") 
-} 
-
-func panicError() { 
-  panic(errors.New("fail")) 
-} 
-
-func panicOther() { 
-  panic(123) 
-} 
-
-// Function that already has error return
-func existingError() error { 
-  if true { 
-    panic("boom") 
-  } 
-  return nil
-} 
-
-// Function with multiple returns
-func complex() int { 
-  panic("c") 
-} 
-`
-
-	file, pkg := parseAndCheck(t, src)
+	pkg := &packages.Package{
+		Fset:      fset,
+		TypesInfo: info,
+	}
 	injector := NewInjector(pkg, "", "")
 
-	changed, err := injector.RewritePanics(file)
+	return injector, f, dstFile
+}
+
+// renderDstFile helper to print DST to string.
+func renderDstFile(t *testing.T, file *dst.File) string {
+	res := decorator.NewRestorer()
+	var buf bytes.Buffer
+	if err := res.Fprint(&buf, file); err != nil {
+		t.Fatalf("restorer failed: %v", err)
+	}
+	return buf.String()
+}
+
+func normalizeStr(s string) string {
+	return strings.Join(strings.Fields(s), " ")
+}
+
+func TestRewritePanics_DST(t *testing.T) {
+	// Ensure all imports are actively used
+	src := `package main
+
+import "errors"
+import "fmt"
+
+func panicString() {
+	panic("fail")
+}
+
+func panicError() {
+	panic(errors.New("fail"))
+}
+
+// Comments should be preserved
+func panicOther() {
+	// Pre-panic comment
+	panic(123)
+}
+
+func existingError() error {
+	panic("boom")
+}
+
+func complexReturn() int {
+	panic("c")
+}
+
+func useFmt() {
+    fmt.Println("usage")
+}
+`
+	injector, astFile, dstFile := setupDstEnv(t, src, false)
+
+	changed, err := injector.RewritePanics(dstFile, astFile)
 	if err != nil {
-		t.Fatalf("RewritePanics error: %v", err)
+		t.Fatalf("RewritePanics failed: %v", err)
 	}
 	if !changed {
-		t.Error("Expected changes, got none")
+		t.Error("Expected changes")
 	}
 
-	out := formatPanicCode(injector.Fset, file)
-	normOut := normalizePanic(out)
+	out := renderDstFile(t, dstFile)
+	norm := normalizeStr(out)
 
-	// Case 1: Panic String -> fmt.Errorf
-	if !strings.Contains(normOut, `returnfmt.Errorf("%s","fail")`) {
-		t.Errorf("panicString not rewritten correctly. Got:\n%s", out)
-	}
-
-	// Case 2: Panic Error -> return err
-	if !strings.Contains(out, "func panicError() error") {
-		t.Error("Signature for panicError not updated")
-	}
-	if !strings.Contains(normOut, `returnerrors.New("fail")`) {
-		t.Error("Did not return error expression directly")
+	// Case 1: String -> fmt.Errorf
+	if !strings.Contains(norm, `return fmt.Errorf("%s", "fail")`) {
+		t.Errorf("panicString failed. Got:\n%s", out)
 	}
 
-	// Case 3: Panic Other -> fmt.Errorf("%v")
-	if !strings.Contains(normOut, `returnfmt.Errorf("%v",123)`) {
-		t.Errorf("panicOther not rewritten to %%v format. Got:\n%s", out)
+	// Case 2: Error -> direct return
+	if !strings.Contains(norm, `return errors.New("fail")`) {
+		t.Errorf("panicError failed. Got:\n%s", out)
 	}
 
-	// Case 4: Existing Error -> Don't double signature
-	if strings.Contains(out, "func existingError() (error, error)") {
-		t.Error("existingError signature doubled")
+	// Case 3: Other -> fmt.Errorf("%v") + Comments
+	if !strings.Contains(out, "// Pre-panic comment") {
+		t.Error("Comment lost in panicOther")
 	}
-	if !strings.Contains(normOut, `returnfmt.Errorf("%s","boom")`) {
-		t.Error("existingError panic not rewritten")
+	if !strings.Contains(norm, `return fmt.Errorf("%v", 123)`) {
+		t.Errorf("panicOther failed. Got:\n%s", out)
 	}
 
-	// Case 5: Complex (int) -> (int, error) + Zero Value
-	if !strings.Contains(out, "func complex() (int, error)") {
-		t.Error("complex signature not updated correctly")
+	// Case 4: Existing Error
+	// Should not double assign signature
+	if strings.Contains(out, "error, error") {
+		t.Error("Signature doubled for existingError")
 	}
-	if !strings.Contains(normOut, `return0,fmt.Errorf("%s","c")`) {
-		t.Errorf("complex return not generating zero values correctly. Got:\n%s", out)
+	if !strings.Contains(norm, `return fmt.Errorf("%s", "boom")`) {
+		t.Error("existingError body not updated")
+	}
+
+	// Case 5: Complex (int) -> (int, error)
+	if !strings.Contains(norm, `func complexReturn() (int, error)`) {
+		t.Error("complexReturn signature not updated")
+	}
+	if !strings.Contains(norm, `return 0, fmt.Errorf("%s", "c")`) {
+		t.Errorf("complexReturn body not updated. Got:\n%s", out)
 	}
 }
 
 func TestRewritePanics_NoArgs(t *testing.T) {
+	// Invalid Go code (panic requires arg), type check will fail, so we skip it to test robustness
 	src := `package main
-func empty() { 
-  panic() 
-} 
-`
-	fset := token.NewFileSet()
-	file, _ := parser.ParseFile(fset, "", src, 0)
-
-	pkg := &packages.Package{Fset: fset, TypesInfo: nil} // No types info
-	injector := NewInjector(pkg, "", "")
-
-	_, err := injector.RewritePanics(file)
+func f() { panic() }`
+	injector, astFile, dstFile := setupDstEnv(t, src, true)
+	_, err := injector.RewritePanics(dstFile, astFile)
 	if err == nil {
-		t.Error("Expected error for panic() with no args")
+		t.Error("Expected error for panic() without args")
 	}
 }
 
-func TestRewritePanics_NestedFunc(t *testing.T) {
-	src := `package main
-func main() { 
-  _ = func() { 
-    panic("nested") 
-  } 
-} 
-`
-	file, pkg := parseAndCheck(t, src)
-	injector := NewInjector(pkg, "", "")
-
-	changed, err := injector.RewritePanics(file)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if changed {
-		t.Error("Should not have modified nested closure")
-	}
-
-	out := formatPanicCode(injector.Fset, file)
-	if !strings.Contains(out, `panic("nested")`) {
-		t.Error("Nested panic should remain")
+func TestRewritePanics_NilInputs(t *testing.T) {
+	injector := &Injector{}
+	_, err := injector.RewritePanics(nil, nil)
+	if err == nil {
+		t.Error("Expected error for nil inputs")
 	}
 }

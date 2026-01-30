@@ -8,98 +8,131 @@ import (
 
 	"github.com/SamuelMarks/go-auto-err-handling/pkg/astgen"
 	"github.com/SamuelMarks/go-auto-err-handling/pkg/refactor"
+	"github.com/dave/dst"
 	"golang.org/x/tools/go/ast/astutil"
 )
 
-// RewritePanics scans the provided file for explicit panic calls (e.g., panic(err)) and converts them
-// into return statements with an error.
+// RewritePanics scans the provided DST file for explicit explicit panic calls (e.g., panic(err))
+// and converts them into return statements with an error.
 //
-// This transformation involves:
-// 1. Identifying panic calls with arguments.
-// 2. Modifying the enclosing function signature to return an error (if it doesn't already).
-// 3. Replacing the panic statement with a return statement:
-//   - If the argument is an error: return zero_vals..., arg
-//   - If the argument is a string: return zero_vals..., fmt.Errorf(arg)
-//   - Otherwise: return zero_vals..., fmt.Errorf("%v", arg)
+// Analysis is performed on the AST (for type safety), and transformations are applied
+// to the DST (for comment preservation).
 //
-// This is triggered via a specific CLI flag configuration passed to the runner.
-//
-// file: The AST file to modify.
+// dstFile: The DST file to modify.
+// astFile: The AST file corresponding to the DST file (used for type analysis).
 //
 // Returns true if any changes were applied.
-func (i *Injector) RewritePanics(file *ast.File) (bool, error) {
-	applied := false
-	var firstErr error
+func (i *Injector) RewritePanics(dstFile *dst.File, astFile *ast.File) (bool, error) {
+	if dstFile == nil || astFile == nil {
+		return false, fmt.Errorf("files cannot be nil")
+	}
 
-	// We use astutil.Apply to traverse and modify declarations and statements
-	astutil.Apply(file, func(c *astutil.Cursor) bool {
-		if firstErr != nil {
-			return false
-		}
+	// 1. Identify Candidates via AST Analysis
+	candidates := make(map[*ast.FuncDecl][]*ast.CallExpr)
 
+	astutil.Apply(astFile, func(c *astutil.Cursor) bool {
 		node := c.Node()
-
-		// We focus on Function Declarations
 		fnDecl, ok := node.(*ast.FuncDecl)
 		if !ok {
 			return true
 		}
 
-		// Check if this function contains valid panic calls to rewrite
-		if !i.containsRewriteablePanic(fnDecl) {
-			return false // Skip descent if no panics
+		var panicCalls []*ast.CallExpr
+		ast.Inspect(fnDecl.Body, func(n ast.Node) bool {
+			if _, isClosure := n.(*ast.FuncLit); isClosure {
+				return false
+			}
+			if call, ok := n.(*ast.CallExpr); ok {
+				if i.isPanicCall(call) {
+					panicCalls = append(panicCalls, call)
+				}
+			}
+			return true
+		})
+
+		if len(panicCalls) > 0 {
+			candidates[fnDecl] = panicCalls
+		}
+		return false
+	}, nil)
+
+	if len(candidates) == 0 {
+		return false, nil
+	}
+
+	applied := false
+
+	// 2. Apply Transformations to DST
+	for astFn, panics := range candidates {
+		mapRes, err := FindDstNode(i.Fset, dstFile, astFile, astFn)
+		if err != nil {
+			return applied, fmt.Errorf("failed to map function %s to DST: %w", astFn.Name.Name, err)
+		}
+		dstFn, ok := mapRes.Node.(*dst.FuncDecl)
+		if !ok {
+			continue
 		}
 
-		// 1. Signature Adjustment
-		// Determine if we need to add 'error' to the return signature
-		needsSigUpdate := !i.hasTrailingErrorReturn(fnDecl)
-
+		needsSigUpdate := !i.hasTrailingErrorReturnDST(dstFn)
 		if needsSigUpdate {
-			changed, err := refactor.AddErrorToSignature(i.Fset, fnDecl)
+			changed, err := refactor.AddErrorToSignatureDST(dstFn)
 			if err != nil {
-				firstErr = err
-				return false
+				return applied, err
 			}
 			if changed {
 				applied = true
 			}
 		}
 
-		// 2. Body Rewrite
-		// We now replace panic() statements with return statements.
-		// We must recalculate the expected return types (zero values) based on the current signature.
-		// Note: TypesInfo might be slightly stale if signature just changed,
-		// but the *original* return types (pre-error) are still valid in TypesInfo.
+		for _, astPanic := range panics {
+			panicMapRes, err := FindDstNode(i.Fset, dstFile, astFile, astPanic)
+			if err != nil {
+				return applied, fmt.Errorf("failed to map panic call to DST: %w", err)
+			}
+			dstPanicCall, ok := panicMapRes.Node.(*dst.CallExpr)
+			if !ok {
+				continue
+			}
 
-		rewriteErr := i.replacePanicsInBody(fnDecl)
-		if rewriteErr != nil {
-			firstErr = rewriteErr
-			return false
+			stmt, ok := panicMapRes.Parent.(*dst.ExprStmt)
+			if !ok {
+				continue
+			}
+
+			retStmt, err := i.generateReturnFromPanicDST(dstFn, dstPanicCall, astPanic)
+			if err != nil {
+				return applied, err
+			}
+
+			// Capture Trivia from original statement
+			retStmt.Decorations().Before = stmt.Decorations().Before
+			retStmt.Decorations().Start = stmt.Decorations().Start
+			retStmt.Decorations().End = stmt.Decorations().End
+			retStmt.Decorations().After = stmt.Decorations().After
+
+			if replaceDstStmt(dstFn.Body, stmt, retStmt) {
+				applied = true
+			}
 		}
+	}
 
-		// If we modified body or signature, we mark applied true.
-		// replacePanicsInBody returns error, but we can assume if it returns nil,
-		// and we knew containsRewriteablePanic was true, we likely made changes.
-		// To be precise, we trust the combination.
-		applied = true
-
-		return false // Stop traversing children of this func (processed internally)
-	}, nil)
-
-	return applied, firstErr
+	return applied, nil
 }
 
-// containsRewriteablePanic checks if a function body has panic calls with arguments.
-func (i *Injector) containsRewriteablePanic(fn *ast.FuncDecl) bool {
+// replaceDstStmt matches a statement by pointer identity and replaces it in a BlockStmt.
+func replaceDstStmt(block *dst.BlockStmt, target, replacement dst.Stmt) bool {
 	found := false
-	ast.Inspect(fn.Body, func(n ast.Node) bool {
-		if _, isFunc := n.(*ast.FuncLit); isFunc {
-			return false // Don't descend into closures for this check
+	dst.Inspect(block, func(n dst.Node) bool {
+		if found {
+			return false
 		}
-		if call, ok := n.(*ast.CallExpr); ok {
-			if i.isPanicCall(call) {
-				found = true
-				return false
+		if blk, ok := n.(*dst.BlockStmt); ok {
+			for idx, s := range blk.List {
+				if s == target {
+					blk.List[idx] = replacement
+					found = true
+					return false
+				}
 			}
 		}
 		return true
@@ -107,107 +140,42 @@ func (i *Injector) containsRewriteablePanic(fn *ast.FuncDecl) bool {
 	return found
 }
 
-// isPanicCall checks if the call expression is the built-in panic function.
 func (i *Injector) isPanicCall(call *ast.CallExpr) bool {
 	if ident, ok := call.Fun.(*ast.Ident); ok {
-		// Verify it's the builtin panic, not a shadowed variable.
-		// In strictly typed checking:
 		if i.Pkg.TypesInfo != nil {
 			if obj := i.Pkg.TypesInfo.ObjectOf(ident); obj != nil {
-				// Builtins usually have no pkg in Object (pkg=nil) and parent is Universe
 				if obj.Pkg() == nil && obj.Name() == "panic" {
 					return true
 				}
-				// If TypesInfo is partial/missing (e.g. tests), check Name
 				return obj.Name() == "panic"
 			}
 		}
-		// Fallback purely syntactic check (if TypesInfo not populated or incomplete)
 		return ident.Name == "panic"
 	}
 	return false
 }
 
-// hasTrailingErrorReturn checks if the function already returns an error as the last value.
-func (i *Injector) hasTrailingErrorReturn(fn *ast.FuncDecl) bool {
+func (i *Injector) hasTrailingErrorReturnDST(fn *dst.FuncDecl) bool {
 	if fn.Type.Results == nil || len(fn.Type.Results.List) == 0 {
 		return false
 	}
 	lastField := fn.Type.Results.List[len(fn.Type.Results.List)-1]
-
-	// Check AST type expression
-	if i.isErrorExpr(lastField.Type) {
-		return true
-	}
-
-	// Check TypesInfo if available
-	if i.Pkg.TypesInfo != nil {
-		if t, ok := i.Pkg.TypesInfo.Types[lastField.Type]; ok {
-			return i.isErrorType(t.Type)
-		}
+	if id, ok := lastField.Type.(*dst.Ident); ok {
+		return id.Name == "error"
 	}
 	return false
 }
 
-// replacePanicsInBody iterates the function body statements and replaces panic calls.
-func (i *Injector) replacePanicsInBody(fn *ast.FuncDecl) error {
-	var err error
-
-	astutil.Apply(fn.Body, func(c *astutil.Cursor) bool {
-		if err != nil {
-			return false
-		}
-
-		n := c.Node()
-
-		// Skip nested functions
-		if _, ok := n.(*ast.FuncLit); ok {
-			return false
-		}
-
-		// Look for ExprStmt containing CallExpr (panic)
-		// e.g. "panic(err)"
-		if exprStmt, ok := n.(*ast.ExprStmt); ok {
-			if call, ok := exprStmt.X.(*ast.CallExpr); ok {
-				if i.isPanicCall(call) {
-					// Found panic to replace
-					retStmt, genErr := i.generateReturnFromPanic(fn, call)
-					if genErr != nil {
-						err = genErr
-						return false
-					}
-					c.Replace(retStmt)
-				}
-			}
-		}
-		return true
-	}, nil)
-
-	return err
-}
-
-// generateReturnFromPanic constructs the ReturnStmt to replace the panic.
-// It generates zero values for non-error returns and processes the panic argument into an error.
-func (i *Injector) generateReturnFromPanic(fn *ast.FuncDecl, panicCall *ast.CallExpr) (*ast.ReturnStmt, error) {
+func (i *Injector) generateReturnFromPanicDST(fn *dst.FuncDecl, panicCall *dst.CallExpr, astPanicCall *ast.CallExpr) (*dst.ReturnStmt, error) {
 	if len(panicCall.Args) == 0 {
-		return nil, fmt.Errorf("panic with no arguments logic not supported")
+		return nil, fmt.Errorf("panic with no arguments not supported")
 	}
-	arg := panicCall.Args[0]
+	dstArg := panicCall.Args[0]
+	astgen.ClearDecorations(dstArg)
+	astArg := astPanicCall.Args[0]
 
-	// 1. Generate Zero Values for preceding returns
-	var results []ast.Expr
-
-	// The function signature MUST have 'error' at the end now (we ensured signature update).
-	// We iterate all but the last result field.
-	// Note: fn.Type.Results.List fields might contain multiple names "a, b int".
-	// We must count the actual return values needed.
-
+	var results []dst.Expr
 	resFields := fn.Type.Results.List
-	// If the last field is the error we added/verified, we exclude it from zero-gen loop.
-	// However, AST fields group names. We iterate fields, and for each name in field, adds a zero.
-	// If field has no names, it counts as 1.
-
-	// We need to count total returns to identify the last one (error).
 	totalReturns := 0
 	for _, f := range resFields {
 		if len(f.Names) > 0 {
@@ -218,72 +186,54 @@ func (i *Injector) generateReturnFromPanic(fn *ast.FuncDecl, panicCall *ast.Call
 	}
 
 	processedCount := 0
-	targetCount := totalReturns - 1 // All except the newly added error
+	targetCount := totalReturns - 1
 
 	for _, f := range resFields {
 		count := len(f.Names)
 		if count == 0 {
 			count = 1
 		}
-
-		// For each return variable defined by this field
 		for k := 0; k < count; k++ {
 			if processedCount >= targetCount {
-				// This is the last one (error), stop
 				break
 			}
-
-			// Generate zero for this field type
-			// We try to get type from TypesInfo.
-			var zero ast.Expr
-			var zErr error
-
-			// If we have types info for the AST expression
-			if i.Pkg != nil && i.Pkg.TypesInfo != nil {
-				if t, ok := i.Pkg.TypesInfo.Types[f.Type]; ok {
-					zero, zErr = astgen.ZeroExpr(t.Type, astgen.ZeroCtx{})
-				}
-			}
-
-			// If TypeInfo failed (or stale), fallback to basic AST analysis (optional but robust)
-			// For this implementation, we assume TypesInfo works for original types.
-			// If nil, astgen might error or we might need fallback.
-			if zero == nil {
-				// Fallback to "nil" is risky for int, but safe for pointers.
-				// Let's produce a safe fallback if TypesInfo is missing?
-				// astgen.ZeroExpr requires types.Type.
-				if zErr != nil {
-					return nil, zErr
-				}
-				// If we couldn't resolve type, we error out as we can't safely refactor
-				return nil, fmt.Errorf("unable to resolve zero value for return position %d", processedCount)
-			}
-
-			results = append(results, zero)
+			z := guessZeroDST(f.Type)
+			results = append(results, z)
 			processedCount++
 		}
 	}
 
-	// 2. Generate Error Expression from Panic Arg
-	errExpr := i.convertPanicArgToError(arg)
+	errExpr := i.convertPanicArgToErrorDST(dstArg, astArg)
 	results = append(results, errExpr)
 
-	return &ast.ReturnStmt{Results: results}, nil
+	return &dst.ReturnStmt{Results: results}, nil
 }
 
-// convertPanicArgToError creates an expression that fits an 'error' return type.
-// If arg is already error type -> arg.
-// If arg is string -> fmt.Errorf(arg).
-// Else -> fmt.Errorf("%v", arg).
-//
-// This function assumes 'fmt' might need importing.
-func (i *Injector) convertPanicArgToError(arg ast.Expr) ast.Expr {
-	// Determine type of arg
+func guessZeroDST(t dst.Expr) dst.Expr {
+	switch x := t.(type) {
+	case *dst.Ident:
+		switch x.Name {
+		case "int", "int8", "int16", "int32", "int64",
+			"uint", "uint8", "uint16", "uint32", "uint64", "uintptr",
+			"byte", "rune", "float32", "float64", "complex64", "complex128":
+			return &dst.BasicLit{Kind: token.INT, Value: "0"}
+		case "bool":
+			return dst.NewIdent("false")
+		case "string":
+			return &dst.BasicLit{Kind: token.STRING, Value: `""`}
+		}
+	case *dst.StarExpr, *dst.MapType, *dst.ArrayType, *dst.ChanType, *dst.FuncType, *dst.InterfaceType:
+		return dst.NewIdent("nil")
+	}
+	return dst.NewIdent("nil")
+}
+
+func (i *Injector) convertPanicArgToErrorDST(dstArg dst.Expr, astArg ast.Expr) dst.Expr {
 	isError := false
 	isString := false
 
 	if i.Pkg != nil && i.Pkg.TypesInfo != nil {
-		if tv, ok := i.Pkg.TypesInfo.Types[arg]; ok {
+		if tv, ok := i.Pkg.TypesInfo.Types[astArg]; ok {
 			if i.isErrorType(tv.Type) {
 				isError = true
 			} else if basic, ok := tv.Type.(*types.Basic); ok && basic.Info()&types.IsString != 0 {
@@ -292,39 +242,35 @@ func (i *Injector) convertPanicArgToError(arg ast.Expr) ast.Expr {
 		}
 	}
 
-	// Fallback AST checks if TypesInfo missing (e.g. literals)
 	if !isError && !isString {
-		if lit, ok := arg.(*ast.BasicLit); ok && lit.Kind == token.STRING {
+		if lit, ok := astArg.(*ast.BasicLit); ok && lit.Kind == token.STRING {
 			isString = true
 		}
 	}
 
 	if isError {
-		return arg
+		return dst.Clone(dstArg).(dst.Expr)
 	}
 
-	// Construct fmt.Errorf call
-	// If string: fmt.Errorf(arg)
-	// If other: fmt.Errorf("%v", arg)
-
-	sel := &ast.SelectorExpr{
-		X:   &ast.Ident{Name: "fmt"},
-		Sel: &ast.Ident{Name: "Errorf"},
+	sel := &dst.SelectorExpr{
+		X:   dst.NewIdent("fmt"),
+		Sel: dst.NewIdent("Errorf"),
 	}
 
-	var args []ast.Expr
+	var args []dst.Expr
 	if isString {
-		// fmt.Errorf(originalString)
-		// NOTE: if originalString contains %, strict vetting might complain,
-		// but typically panic messages are static.
-		// Safe way: fmt.Errorf("%s", str)
-		args = []ast.Expr{&ast.BasicLit{Kind: token.STRING, Value: "\"%s\""}, arg}
+		args = []dst.Expr{
+			&dst.BasicLit{Kind: token.STRING, Value: `"%s"`},
+			dst.Clone(dstArg).(dst.Expr),
+		}
 	} else {
-		// fmt.Errorf("%v", obj)
-		args = []ast.Expr{&ast.BasicLit{Kind: token.STRING, Value: "\"%v\""}, arg}
+		args = []dst.Expr{
+			&dst.BasicLit{Kind: token.STRING, Value: `"%v"`},
+			dst.Clone(dstArg).(dst.Expr),
+		}
 	}
 
-	return &ast.CallExpr{
+	return &dst.CallExpr{
 		Fun:  sel,
 		Args: args,
 	}
