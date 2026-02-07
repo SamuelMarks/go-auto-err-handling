@@ -141,3 +141,46 @@ func do() {
 		t.Error("Panic not rewritten to return")
 	}
 }
+
+func TestRunner_SubtestTableDriven(t *testing.T) {
+	tmpDir := t.TempDir()
+	_ = os.WriteFile(filepath.Join(tmpDir, "go.mod"), []byte("module subtest\ngo 1.22\n"), 0644)
+
+	// Combine into one test file to avoid package loading issues in temp env
+	srcTest := `package main
+import "testing"
+func canFailed() error { return nil }
+func TestSomething(t *testing.T) {
+	t.Run("sub", func(t *testing.T) {
+		canFailed()
+	})
+}
+`
+	_ = os.WriteFile(filepath.Join(tmpDir, "main_test.go"), []byte(srcTest), 0644)
+
+	oldWd, _ := os.Getwd()
+	_ = os.Chdir(tmpDir)
+	defer func() { _ = os.Chdir(oldWd) }()
+
+	opts := Options{
+		EnablePreexistingErr: true, // Required for canFailed() which returns error
+		EnableNonExistingErr: true,
+		EnableTestRefactor:   true,
+		Paths:                []string{"."},
+	}
+
+	if err := Run(opts); err != nil {
+		t.Fatalf("Run failed: %v", err)
+	}
+
+	content, _ := os.ReadFile("main_test.go")
+	code := string(content)
+
+	if !strings.Contains(code, "t.Fatal(err)") {
+		t.Errorf("Subtest failure not captured with t.Fatal. Got:\n%s", code)
+	}
+	// Ensure signature NOT changed
+	if strings.Contains(code, "func(t *testing.T) error") {
+		t.Error("Subtest signature incorrectly modified")
+	}
+}

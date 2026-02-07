@@ -7,11 +7,16 @@ import (
 
 	"github.com/SamuelMarks/go-auto-err-handling/pkg/refactor"
 	"github.com/dave/dst"
+	"github.com/dave/dst/dstutil"
 	"golang.org/x/tools/go/ast/astutil"
 )
 
 // RewriteDefers scans the file for defer statements (including inside closures).
 // It converts defers that ignore errors into a pattern using errors.Join.
+//
+// If rewrite forces named returns in the function signature, it also performs normalization
+// of return statements to "naked" returns (assignment + return) to ensure consistency and correctness
+// with the deferred error masking.
 func (i *Injector) RewriteDefers(dstFile *dst.File, astFile *ast.File) (bool, error) {
 	if dstFile == nil || astFile == nil {
 		return false, fmt.Errorf("files cannot be nil")
@@ -71,16 +76,16 @@ func (i *Injector) RewriteDefers(dstFile *dst.File, astFile *ast.File) (bool, er
 			continue
 		}
 
-		if hasAnonymousReturnsDST(dstDecl.Type) {
-			continue
-		}
-
+		// Ensure named returns allows capturing the error in defer
 		changed, err := refactor.EnsureNamedReturnsDST(dstDecl)
 		if err != nil {
 			return applied, err
 		}
 		if changed {
 			applied = true
+			// Normalize return statements to ensure the new named return variables are used correctly.
+			// Explicit returns (return 1, nil) are converted to (ret1 = 1; ret2 = nil; return).
+			i.normalizeToNakedReturns(dstDecl.Body, dstDecl.Type.Results)
 		}
 
 		errName := i.getErrorReturnNameDST(dstDecl.Type)
@@ -104,16 +109,16 @@ func (i *Injector) RewriteDefers(dstFile *dst.File, astFile *ast.File) (bool, er
 			continue
 		}
 
-		if hasAnonymousReturnsDST(dstLit.Type) {
-			continue
-		}
-
-		changed, err := refactor.EnsureNamedReturnsDST(&dst.FuncDecl{Type: dstLit.Type})
+		// FuncLit doesn't have a Decl wrapper for EnsureNamedReturnsDST which takes *FuncDecl
+		// We wrap it temporarily as EnsureNamedReturnsDST only inspects Type field.
+		wrapperDecl := &dst.FuncDecl{Type: dstLit.Type}
+		changed, err := refactor.EnsureNamedReturnsDST(wrapperDecl)
 		if err != nil {
 			return applied, err
 		}
 		if changed {
 			applied = true
+			i.normalizeToNakedReturns(dstLit.Body, dstLit.Type.Results)
 		}
 
 		errName := i.getErrorReturnNameDST(dstLit.Type)
@@ -148,6 +153,76 @@ func (i *Injector) rewriteDefersInDST(body *dst.BlockStmt, astDefers []*ast.Defe
 		}
 	}
 	return changed
+}
+
+// normalizeToNakedReturns converts explicit return statements into assignments to named result variables
+// followed by a naked return. This ensures style consistency and that deferred modifiers act on the
+// intended variables.
+func (i *Injector) normalizeToNakedReturns(body *dst.BlockStmt, results *dst.FieldList) {
+	if body == nil || results == nil {
+		return
+	}
+
+	// 1. Collect declared return names
+	var names []string
+	for _, field := range results.List {
+		for _, name := range field.Names {
+			names = append(names, name.Name)
+		}
+	}
+
+	if len(names) == 0 {
+		return
+	}
+
+	// 2. Scan and rewrite ReturnStmts
+	dstutil.Apply(body, func(c *dstutil.Cursor) bool {
+		stmt := c.Node()
+
+		// Don't recurse into nested functions
+		if _, ok := stmt.(*dst.FuncLit); ok {
+			return false
+		}
+
+		ret, ok := stmt.(*dst.ReturnStmt)
+		if !ok {
+			return true
+		}
+
+		// Try to normalize explicit returns.
+		// If return is already naked (Results == 0), skip.
+		if len(ret.Results) == 0 {
+			return false
+		}
+
+		// Create LHS identifiers for assignment
+		var lhs []dst.Expr
+		for _, name := range names {
+			lhs = append(lhs, dst.NewIdent(name))
+		}
+
+		// Create Assignment
+		// Note: Supports tuple returns implicitly (e.g. return call()) since AssignStmt does too.
+		assign := &dst.AssignStmt{
+			Lhs: lhs,
+			Tok: token.ASSIGN,
+			Rhs: ret.Results,
+		}
+
+		// Preserve Comments/Spacing
+		assign.Decorations().Before = ret.Decorations().Before
+		assign.Decorations().Start = ret.Decorations().Start
+
+		// Create Naked Return
+		nakedRet := &dst.ReturnStmt{}
+		// If there were extensive comments on the original return logic, they now belong to assign usually.
+		nakedRet.Decorations().After = ret.Decorations().After
+
+		c.InsertBefore(assign)
+		c.Replace(nakedRet)
+
+		return false
+	}, nil)
 }
 
 func hasAnonymousReturnsDST(ft *dst.FuncType) bool {

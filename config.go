@@ -27,6 +27,13 @@ type Config struct {
 	// but this flag allows body refactoring within tests.
 	EnableTestRefactor bool `name:"test-func-changes" help:"Enable refactoring within test functions (Test*, Example*, Benchmark*)." default:"true"`
 
+	// PanicToReturn enables rewriting of explicit panic() calls into return error statements.
+	PanicToReturn bool `name:"panic-to-return" help:"Enable rewriting explicit panic() calls to return errors." default:"false"`
+
+	// RetainPanics, if true, restricts panic replacement to only those wrapping errors.
+	// String panics (often used for assertions/unreachable code) are preserved.
+	RetainPanics bool `name:"retain-panics" help:"If enabled, only rewrites panics that wrap errors. String panics are preserved." default:"false"`
+
 	// Check enables CI/Linter mode.
 	// If true, the tool performs analysis and reports unhandled errors with a non-zero exit code,
 	// without modifying files. Implies --dry-run.

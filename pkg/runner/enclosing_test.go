@@ -216,3 +216,35 @@ func TestFindEnclosingFunc_MissingTypes(t *testing.T) {
 		t.Error("Expected nil context when TypesInfo is missing")
 	}
 }
+
+func TestFindEnclosingFunc_Subtest(t *testing.T) {
+	src := `package main
+import "testing"
+
+func TestFoo(t *testing.T) {
+	t.Run("sub", func(subT *testing.T) {
+		x := 1 // Point Sub
+		_ = x
+	})
+}
+`
+	_, file, pkg := setupEnclosingEnv(t, src)
+
+	posSub := findNodePos(file, func(n ast.Node) bool {
+		if id, ok := n.(*ast.Ident); ok && id.Name == "x" {
+			return true
+		}
+		return false
+	})
+
+	ctx := FindEnclosingFunc(pkg, file, posSub)
+	if ctx == nil {
+		t.Fatal("Expected context for subtest")
+	}
+	if ctx.TestParam != "subT" {
+		t.Errorf("Expected TestParam 'subT', got '%s'", ctx.TestParam)
+	}
+	if !ctx.IsLiteral() {
+		t.Error("Expected IsLiteral true for subtest closure")
+	}
+}

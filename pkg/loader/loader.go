@@ -67,10 +67,6 @@ func LoadPackages(patterns []string, dir string) ([]*packages.Package, error) {
 			}
 		}
 
-		// If patterns didn't contain ".", but we triggered retry (e.g. implicitly),
-		// force "./..." if list was empty? (Though Callers usually provide "." default).
-		// We assume the caller (runner) provides "." as default.
-
 		pkgs, err = packages.Load(cfg, recursivePatterns...)
 		if err != nil {
 			return nil, fmt.Errorf("failed to retry packages.Load: %w", err)
@@ -98,6 +94,9 @@ func LoadPackages(patterns []string, dir string) ([]*packages.Package, error) {
 // 2. The patterns include ".".
 // 3. A "go.mod" file exists in the target directory.
 //
+// It avoids recursion if any valid package (with Go files) was successfully loaded,
+// to support test-only directories where the primary package is empty but the test variant is valid.
+//
 // pkgs: The packages returned from the initial load.
 // patterns: The patterns used for the initial load.
 // dir: The directory context.
@@ -113,22 +112,31 @@ func shouldRetryRecursive(pkgs []*packages.Package, patterns []string, dir strin
 		return false
 	}
 
-	// Check for the specific failure mode "no Go files in <path>"
+	// Check if we successfully loaded ANY package with files.
+	// If we did (e.g. the test variant of ".", or another package in the list),
+	// then strict recursion might not be needed or might be redundant.
+	hasValidPackage := false
 	hasNoFilesError := false
+
 	for _, pkg := range pkgs {
-		// If a package has no files, it might be the root wrapper for specific directory queries
+		if len(pkg.GoFiles) > 0 {
+			hasValidPackage = true
+		}
+
+		// Check for the specific failure mode "no Go files in <path>"
 		if len(pkg.GoFiles) == 0 {
-			// Check errors
 			for _, e := range pkg.Errors {
 				if strings.Contains(e.Msg, "no Go files") {
 					hasNoFilesError = true
-					break
 				}
 			}
 		}
-		if hasNoFilesError {
-			break
-		}
+	}
+
+	// If we found at least one valid package, we assume looking at "." gave us what we wanted
+	// (e.g. the test package in a test-only directory).
+	if hasValidPackage {
+		return false
 	}
 
 	if !hasNoFilesError {

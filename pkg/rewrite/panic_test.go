@@ -45,7 +45,7 @@ func setupDstEnv(t *testing.T, src string, skipTypes bool) (*Injector, *ast.File
 		Fset:      fset,
 		TypesInfo: info,
 	}
-	injector := NewInjector(pkg, "", "")
+	injector := NewInjector(pkg, "", "", false)
 
 	return injector, f, dstFile
 }
@@ -72,25 +72,25 @@ import "errors"
 import "fmt"
 
 func panicString() {
-	panic("fail")
+  panic("fail")
 }
 
 func panicError() {
-	panic(errors.New("fail"))
+  panic(errors.New("fail"))
 }
 
 // Comments should be preserved
 func panicOther() {
-	// Pre-panic comment
-	panic(123)
+  // Pre-panic comment
+  panic(123)
 }
 
 func existingError() error {
-	panic("boom")
+  panic("boom")
 }
 
 func complexReturn() int {
-	panic("c")
+  panic("c")
 }
 
 func useFmt() {
@@ -143,6 +143,73 @@ func useFmt() {
 	}
 	if !strings.Contains(norm, `return 0, fmt.Errorf("%s", "c")`) {
 		t.Errorf("complexReturn body not updated. Got:\n%s", out)
+	}
+}
+
+func TestRewritePanics_ControlFlow(t *testing.T) {
+	src := `package main
+func check(b bool) {
+  if b {
+    panic("stop")
+  }
+}
+`
+	injector, astFile, dstFile := setupDstEnv(t, src, false)
+	// Function is void. Rewrite will signature to error.
+	// panic will be return error.
+	// End of function will implicitly fall through.
+	// ensureTerminalReturn should add 'return nil'
+
+	changed, err := injector.RewritePanics(dstFile, astFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !changed {
+		t.Fatal("Expected change")
+	}
+
+	out := renderDstFile(t, dstFile)
+	norm := normalizeStr(out)
+
+	if !strings.Contains(norm, `return fmt.Errorf("%s", "stop")`) {
+		t.Error("Panic not rewritten")
+	}
+	if !strings.Contains(norm, `return nil }`) {
+		t.Errorf("Terminal return nil missing. Got:\n%s", out)
+	}
+}
+
+func TestRewritePanics_RetainPanics(t *testing.T) {
+	src := `package main
+import "errors"
+func check() {
+  panic("assertion")
+}
+func checkErr() {
+  panic(errors.New("fatal"))
+}
+`
+	injector, astFile, dstFile := setupDstEnv(t, src, false)
+	injector.RetainPanics = true
+
+	changed, err := injector.RewritePanics(dstFile, astFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !changed {
+		t.Fatal("Expected change")
+	}
+
+	out := renderDstFile(t, dstFile)
+	norm := normalizeStr(out)
+
+	// String assertion should remain
+	if !strings.Contains(norm, `panic("assertion")`) {
+		t.Error("String panic should have been retained")
+	}
+	// Error assertion should be rewritten
+	if !strings.Contains(norm, `return errors.New("fatal")`) {
+		t.Error("Error panic should have been rewritten")
 	}
 }
 

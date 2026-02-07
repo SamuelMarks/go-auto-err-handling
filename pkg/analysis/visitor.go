@@ -81,7 +81,8 @@ func Detect(pkgs []*packages.Package, flt *filter.Filter, debug bool) ([]Injecti
 					checkForChains(pkg.TypesInfo, exprStmt.X, func(c *ast.CallExpr) {
 						addPoint(c, exprStmt, nil)
 					})
-					return false
+					// Continue descent to find nested errors (e.g. in function arguments)
+					return true
 				}
 
 				// Case 2: Assignment Statement (Assigned to _)
@@ -126,7 +127,8 @@ func Detect(pkgs []*packages.Package, flt *filter.Filter, debug bool) ([]Injecti
 							addPoint(c, assignStmt, assignStmt)
 						})
 					}
-					return false
+					// Continue descent
+					return true
 				}
 
 				// Case 3: Defer Statement
@@ -140,7 +142,8 @@ func Detect(pkgs []*packages.Package, flt *filter.Filter, debug bool) ([]Injecti
 					checkForChains(pkg.TypesInfo, deferStmt.Call, func(c *ast.CallExpr) {
 						addPoint(c, deferStmt, nil)
 					})
-					return false
+					// Continue descent (critical for closures in defer)
+					return true
 				}
 
 				// Case 4: Go Statement
@@ -154,7 +157,8 @@ func Detect(pkgs []*packages.Package, flt *filter.Filter, debug bool) ([]Injecti
 					checkForChains(pkg.TypesInfo, goStmt.Call, func(c *ast.CallExpr) {
 						addPoint(c, goStmt, nil)
 					})
-					return false
+					// Continue descent
+					return true
 				}
 
 				// Case 5: If Statement (Embedded call in condition)

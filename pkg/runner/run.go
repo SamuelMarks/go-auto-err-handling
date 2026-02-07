@@ -39,6 +39,7 @@ type Options struct {
 	DryRun               bool
 	UseDefaultExclusions bool
 	PanicToReturn        bool
+	RetainPanics         bool // New option
 	Paths                []string
 	MainHandler          string
 	ErrorTemplate        string
@@ -241,17 +242,22 @@ func applyRefactors(mgr *dstManager, points []analysis.InjectionPoint, opts Opti
 			continue
 		}
 
+		// Respect test refactoring flag.
+		// If disable flag is set, skip any test handling.
 		if !opts.EnableTestRefactor {
-			if ctx.Decl != nil && filter.IsTestHandler(ctx.Decl) {
+			if ctx.TestParam != "" {
 				continue
 			}
 		}
 
 		hasErr := hasErrorReturn(ctx.Sig)
-		injector := rewrite.NewInjector(p.Pkg, opts.ErrorTemplate, opts.MainHandler)
+		injector := rewrite.NewInjector(p.Pkg, opts.ErrorTemplate, opts.MainHandler, opts.RetainPanics)
 
 		if hasErr {
 			if opts.EnablePreexistingErr {
+				if ctx.TestParam != "" {
+					injector.TestParam = ctx.TestParam
+				}
 				applied, err := injector.RewriteFile(dstFile, p.File, []analysis.InjectionPoint{p})
 				if err != nil {
 					return totalChanges, err
@@ -264,18 +270,34 @@ func applyRefactors(mgr *dstManager, points []analysis.InjectionPoint, opts Opti
 				}
 			}
 		} else if opts.EnableNonExistingErr {
-			if ctx.Decl == nil || ctx.IsLiteral() {
+			// If it's a Closure literal without a test param context, skip it.
+			if ctx.IsLiteral() && ctx.TestParam == "" {
 				continue
 			}
-			if filter.IsTestHandler(ctx.Decl) {
-				continue
-			}
-			if refactor.IsEntryPoint(p.Pkg.TypesInfo.ObjectOf(ctx.Decl.Name).(*types.Func)) {
-				if err := refactor.HandleEntryPoint(p.Pkg, dstFile, p.Call, p.Stmt, opts.MainHandler); err == nil {
+
+			// Test Handler Handling (inject t.Fatal instead of signature change)
+			if ctx.TestParam != "" {
+				if err := refactor.HandleTestError(p.Pkg, dstFile, p.Call, p.Stmt, ctx.TestParam); err == nil {
 					totalChanges++
 					mgr.MarkModified(p.File)
 					opts.Reporter.IncHandled()
 				}
+				continue
+			}
+
+			// Main/Init Entry Point Handling
+			if ctx.Decl != nil {
+				if refactor.IsEntryPoint(p.Pkg.TypesInfo.ObjectOf(ctx.Decl.Name).(*types.Func)) {
+					if err := refactor.HandleEntryPoint(p.Pkg, dstFile, p.Call, p.Stmt, opts.MainHandler); err == nil {
+						totalChanges++
+						mgr.MarkModified(p.File)
+						opts.Reporter.IncHandled()
+					}
+					continue
+				}
+			}
+
+			if ctx.Decl == nil {
 				continue
 			}
 
@@ -319,7 +341,7 @@ func applyRefactors(mgr *dstManager, points []analysis.InjectionPoint, opts Opti
 	if opts.PanicToReturn {
 		for id, pkg := range mgr.pkgs {
 			_ = id
-			inj := rewrite.NewInjector(pkg, opts.ErrorTemplate, opts.MainHandler)
+			inj := rewrite.NewInjector(pkg, opts.ErrorTemplate, opts.MainHandler, opts.RetainPanics)
 			for _, f := range pkg.Syntax {
 				dstFile, err := mgr.Get(pkg, f)
 				if err != nil {
@@ -382,17 +404,25 @@ func applyRefactors(mgr *dstManager, points []analysis.InjectionPoint, opts Opti
 					}
 
 					isTerm := false
-					if ctx.Decl != nil {
+					testParam := ""
+					if ctx.TestParam != "" {
+						isTerm = true
+						testParam = ctx.TestParam
+					} else if ctx.Decl != nil {
 						fnObj := pkg.TypesInfo.ObjectOf(ctx.Decl.Name).(*types.Func)
-						if refactor.IsEntryPoint(fnObj) || filter.IsTestHandler(ctx.Decl) {
+						if refactor.IsEntryPoint(fnObj) {
 							isTerm = true
 						}
 					}
 
-					inj := rewrite.NewInjector(pkg, opts.ErrorTemplate, opts.MainHandler)
+					inj := rewrite.NewInjector(pkg, opts.ErrorTemplate, opts.MainHandler, opts.RetainPanics)
 
 					if isTerm {
-						refactor.HandleEntryPoint(pkg, dstFile, call, stmt, opts.MainHandler)
+						if testParam != "" {
+							refactor.HandleTestError(pkg, dstFile, call, stmt, testParam)
+						} else {
+							refactor.HandleEntryPoint(pkg, dstFile, call, stmt, opts.MainHandler)
+						}
 						mgr.MarkModified(f)
 						totalChanges++
 						continue

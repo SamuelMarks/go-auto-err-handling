@@ -15,7 +15,7 @@ import (
 	"golang.org/x/tools/go/packages"
 )
 
-// MainHandlerStrategy defines how errors should be handled in entry points.
+// MainHandlerStrategy defines how errors should be handled in entry points like main or init.
 type MainHandlerStrategy string
 
 const (
@@ -43,7 +43,7 @@ const (
 // initialTarget: The function object whose signature was initially modified.
 // strategy: The strategy to use for terminal handlers.
 //
-// Returns the total number of call sites updated.
+// Returns the total number of call sites updated and any error encountered.
 func PropagateCallers(pkgs []*packages.Package, initialTarget *types.Func, strategy string) (int, error) {
 	if initialTarget == nil {
 		return 0, fmt.Errorf("target function is nil")
@@ -120,8 +120,26 @@ func PropagateCallers(pkgs []*packages.Package, initialTarget *types.Func, strat
 }
 
 // processCallSiteDST handles the refactoring for a single usage using DST.
+//
+// pkg: The package containing the call.
+// astFile: The AST file containing the call.
+// dstFile: The DST file associated with the AST.
+// id: The identifier in the AST representing the function call name.
+// target: The types.Func object of the function being called.
+// strategy: The main handler strategy string.
+//
 // Returns 1 if updated, and the new function object if recursion is needed.
 func processCallSiteDST(pkg *packages.Package, astFile *ast.File, dstFile *dst.File, id *ast.Ident, target *types.Func, strategy string) (int, *types.Func, error) {
+	if astFile == nil {
+		return 0, nil, fmt.Errorf("astFile is nil")
+	}
+	if dstFile == nil {
+		return 0, nil, fmt.Errorf("dstFile is nil")
+	}
+	if id == nil {
+		return 0, nil, fmt.Errorf("identifier is nil")
+	}
+
 	// Find the components in AST first to understand context
 	path, _ := astutil.PathEnclosingInterval(astFile, id.Pos(), id.Pos())
 
@@ -177,15 +195,23 @@ func processCallSiteDST(pkg *packages.Package, astFile *ast.File, dstFile *dst.F
 
 	// Decision: Bubble or Handle?
 	var nextTarget *types.Func
+	var dstDecl *dst.FuncDecl
+
+	// Map decl to DST if present, as it's needed for signature updates or defer logic
+	// If decl is nil (e.g. main/init logic or literal), funcObj might be nil or valid.
+	if decl != nil {
+		res, _ := mapAstToDst(astFile, dstFile, decl)
+		if f, ok := res.(*dst.FuncDecl); ok {
+			dstDecl = f
+		}
+	}
 
 	if !isTerminal && decl != nil && funcObj != nil {
 		canReturn := canReturnError(sig)
 
 		// Upgrade Signature if needed
 		if !canReturn {
-			// Locate DST Decl
-			dstDeclNode, _ := mapAstToDst(astFile, dstFile, decl)
-			if dstDecl, ok := dstDeclNode.(*dst.FuncDecl); ok {
+			if dstDecl != nil {
 				changed, err := AddErrorToSignatureDST(dstDecl) // Refactor package helper
 				if err != nil {
 					return 0, nil, err
@@ -208,8 +234,19 @@ func processCallSiteDST(pkg *packages.Package, astFile *ast.File, dstFile *dst.F
 	}
 
 	// Perform DST Rewrite of the call site
-	// We need the enclosing signature (potentially updated).
-	if err := refactorCallSiteDST(dstStmt, dstParent, sig, isTerminal, MainHandlerStrategy(strategy), testParam); err != nil {
+	context := rewriteContext{
+		dstFile:        dstFile,
+		stmt:           dstStmt,
+		parent:         dstParent,
+		enclosingSig:   sig,
+		enclosingFnDst: dstDecl,
+		isTerminal:     isTerminal,
+		strategy:       MainHandlerStrategy(strategy),
+		testParam:      testParam,
+		targetSig:      target.Type().(*types.Signature), // Pass the called function's new signature
+	}
+
+	if err := refactorCallSiteDST(context); err != nil {
 		return 0, nil, err
 	}
 
@@ -217,10 +254,14 @@ func processCallSiteDST(pkg *packages.Package, astFile *ast.File, dstFile *dst.F
 }
 
 // HandleEntryPoint injects terminal error handling for a call site within an entry point (main/init) using DST.
+//
+// pkg: The package info.
+// dstFile: The DST file to modify.
+// call: The AST call expression target.
+// stmt: The AST statement definition.
+// strategy: The handling strategy (log, panic, etc).
 func HandleEntryPoint(pkg *packages.Package, dstFile *dst.File, call *ast.CallExpr, stmt ast.Stmt, strategy string) error {
-	// Need AST file to map. Assuming caller has context, or we re-find it.
-	// For simplicity in this helper, we need astFile.
-	// We'll rely on finding it in pkg.
+	// Need AST file to map. We rely on finding it in pkg.
 	astFile := findFile(pkg, stmt.Pos())
 	if astFile == nil {
 		return fmt.Errorf("could not locate AST file for stmt")
@@ -230,42 +271,305 @@ func HandleEntryPoint(pkg *packages.Package, dstFile *dst.File, call *ast.CallEx
 	if dstStmt == nil {
 		return fmt.Errorf("failed to locate entry point statement in DST")
 	}
-	return refactorCallSiteDST(dstStmt, dstParent, nil, true, MainHandlerStrategy(strategy), "")
+
+	ctx := rewriteContext{
+		dstFile:      dstFile,
+		stmt:         dstStmt,
+		parent:       dstParent,
+		enclosingSig: nil,
+		isTerminal:   true,
+		strategy:     MainHandlerStrategy(strategy),
+		testParam:    "",
+	}
+	return refactorCallSiteDST(ctx)
+}
+
+// HandleTestError injects terminal error handling for a call site within a test function or subtest closure.
+// It uses `testParamName` (e.g. "t") to invoke `t.Fatal(err)`.
+//
+// pkg: The package info.
+// dstFile: The DST file to modify.
+// call: The AST call expression target.
+// stmt: The AST statement definition.
+// testParamName: The name of the testing parameter (e.g. "t" or "b").
+func HandleTestError(pkg *packages.Package, dstFile *dst.File, call *ast.CallExpr, stmt ast.Stmt, testParamName string) error {
+	astFile := findFile(pkg, stmt.Pos())
+	if astFile == nil {
+		return fmt.Errorf("could not locate AST file for stmt")
+	}
+
+	dstStmt, dstParent := mapAstToDst(astFile, dstFile, stmt)
+	if dstStmt == nil {
+		return fmt.Errorf("failed to locate test statement in DST")
+	}
+
+	ctx := rewriteContext{
+		dstFile:      dstFile,
+		stmt:         dstStmt,
+		parent:       dstParent,
+		enclosingSig: nil,
+		isTerminal:   true,
+		strategy:     "",
+		testParam:    testParamName,
+	}
+	return refactorCallSiteDST(ctx)
+}
+
+// rewriteContext aggregates arguments for refactoring to reduce signature complexity.
+type rewriteContext struct {
+	dstFile        *dst.File
+	stmt           dst.Node
+	parent         dst.Node
+	enclosingSig   *types.Signature // Signature of the function containing the call
+	enclosingFnDst *dst.FuncDecl    // DST of function containing the call (if applicable)
+	isTerminal     bool
+	strategy       MainHandlerStrategy
+	testParam      string
+	targetSig      *types.Signature // Signature of the function being called
+}
+
+// enclosing returns enclosingSig alias to match struct field.
+func (r *rewriteContext) enclosing() *types.Signature {
+	return r.enclosingSig
 }
 
 // refactorCallSiteDST modifies the DST to handle the extra error return.
-func refactorCallSiteDST(stmt dst.Node, parent dst.Node, enclosingSig *types.Signature, isTerminal bool, strategy MainHandlerStrategy, testParam string) error {
+// It handles Expression, Assignment, Go, and Defer statements.
+func refactorCallSiteDST(ctx rewriteContext) error {
+	stmt := ctx.stmt.(dst.Stmt)
+
 	// Identify Statement Type
 	switch s := stmt.(type) {
 	case *dst.ExprStmt:
 		// Convert ExprStmt to Assign + Check
 		// call() -> if err := call(); err != nil ...
 		call := s.X
-		// Generate Check Block
-		block := generateCheckBlock(call, enclosingSig, isTerminal, strategy, testParam)
 
-		replaceInParent(parent, stmt, block)
+		// Passthrough Optimization
+		isTail := false
+		if block, ok := ctx.parent.(*dst.BlockStmt); ok {
+			// Find index
+			for i, st := range block.List {
+				if st == stmt {
+					if i == len(block.List)-1 {
+						isTail = true
+					}
+					break
+				}
+			}
+		}
+
+		if isTail && !ctx.isTerminal && ctx.enclosingSig != nil && ctx.targetSig != nil {
+			if types.Identical(ctx.enclosingSig.Results(), ctx.targetSig.Results()) {
+				// Optimization: return call()
+				// Note: call() in ExprStmt context ignores results (though in this case it likely returned nothing before rewrite).
+				// We assume after rewrite it returns full tuple.
+				ret := &dst.ReturnStmt{
+					Results: []dst.Expr{dst.Clone(call).(dst.Expr)},
+				}
+				replaceInParent(ctx.parent, stmt, ret)
+				return nil
+			}
+		}
+
+		// Generate Check Block
+		block := generateCheckBlock(call, ctx.enclosing(), ctx.isTerminal, ctx.strategy, ctx.testParam)
+
+		replaceInParent(ctx.parent, stmt, block)
 
 	case *dst.AssignStmt:
 		// x := call() -> x, err := call(); if err != nil ...
 		// Append 'err' to LHS
 		s.Lhs = append(s.Lhs, dst.NewIdent("err"))
 
-		// Check invalidation of `_`
-		for _, lhs := range s.Lhs {
-			// If previously `_ = call()`, we now have `_, err = call()`. Valid.
-			_ = lhs
-		}
+		// Check invalidation of `_` handled implicitly by valid Go assignment
 
 		// 2. Construct Check
-		check := generateBasicCheck(enclosingSig, isTerminal, strategy, testParam)
+		check := generateBasicCheck(ctx.enclosing(), ctx.isTerminal, ctx.strategy, ctx.testParam)
 
 		// 3. Insert Check After Assignment
-		insertAfterInParent(parent, stmt, check)
+		insertAfterInParent(ctx.parent, stmt, check)
+
+	case *dst.GoStmt:
+		// go call() -> go func(){ if err := call(); err != nil { handle } }()
+		return refactorGoStmt(ctx, s)
+
+	case *dst.DeferStmt:
+		// defer call() -> defer func(){ err = errors.Join(err, call()) }()
+		return refactorDeferStmt(ctx, s)
 
 	default:
 		return fmt.Errorf("unsupported statement type for propagation: %T", stmt)
 	}
+	return nil
+}
+
+// refactorGoStmt transforms a 'go call()' where call() now returns an error
+// into an anonymous closure that handles the error terminally (log usually).
+//
+// ctx: The rewrite context.
+// gs: The GoStmt node.
+func refactorGoStmt(ctx rewriteContext, gs *dst.GoStmt) error {
+	// Construct the body of the closure:
+	// if err := call(); err != nil { log.Fatal(err) }
+	// Important: We cannot return from a go routine to the parent, so we MUST use terminal strategy.
+
+	// Extract the call
+	call := dst.Clone(gs.Call).(*dst.CallExpr)
+
+	// We use logic similar to `generateCheckBlock` but ensure terminal logic
+	// If the user specified 'panic', we panic. If 'log-fatal', we log.
+	// We force isTerminal=true for the context of the goroutine body.
+	checkStmt := generateCheckBlock(call, nil, true, ctx.strategy, "")
+
+	// Create closure: func() { <body> }
+	fnLit := &dst.FuncLit{
+		Type: &dst.FuncType{
+			Params:  &dst.FieldList{},
+			Results: nil,
+		},
+		Body: &dst.BlockStmt{
+			List: []dst.Stmt{checkStmt},
+		},
+	}
+
+	// Create new go statement: go func(){}()
+	newGo := &dst.GoStmt{
+		Call: &dst.CallExpr{
+			Fun:  fnLit,
+			Args: nil,
+		},
+	}
+
+	// Replace
+	replaceInParent(ctx.parent, gs, newGo)
+	return nil
+}
+
+// refactorDeferStmt transforms a 'defer call()' where call() now returns an error.
+//
+// If the enclosing function returns an error, it attempts to capture the deferred
+// error using 'errors.Join' (requires named returns).
+// If the enclosing function does not return an error (or is main), it logs the error.
+//
+// ctx: The rewrite context.
+// ds: The DeferStmt node.
+func refactorDeferStmt(ctx rewriteContext, ds *dst.DeferStmt) error {
+	call := dst.Clone(ds.Call).(*dst.CallExpr)
+	parentCanReturnErr := canReturnError(ctx.enclosing())
+
+	var body *dst.BlockStmt
+
+	if parentCanReturnErr && ctx.enclosingFnDst != nil {
+		// Strategy: Capture.
+		// 1. Ensure named returns exist on the enclosing function so we can reference 'err'.
+		_, err := EnsureNamedReturnsDST(ctx.enclosingFnDst)
+		if err != nil {
+			return err
+		}
+		// If changed, the caller might need to know, but since we are modifying DST in place, fine.
+
+		// 2. Find the name of the error return variable.
+		errVar := getErrorReturnNameDST(ctx.enclosingFnDst.Type)
+		if errVar == "" {
+			// Fallback if failed to find name
+			return refactorDeferLogFallback(ctx, call, ds)
+		}
+
+		// 3. Construct: err = errors.Join(err, call())
+		ensureImportDST(ctx.dstFile, "errors") // Require invalid 'errors' import
+
+		assign := &dst.AssignStmt{
+			Lhs: []dst.Expr{dst.NewIdent(errVar)},
+			Tok: token.ASSIGN,
+			Rhs: []dst.Expr{
+				&dst.CallExpr{
+					Fun: &dst.SelectorExpr{
+						X:   dst.NewIdent("errors"),
+						Sel: dst.NewIdent("Join"),
+					},
+					Args: []dst.Expr{
+						dst.NewIdent(errVar),
+						call,
+					},
+				},
+			},
+		}
+
+		body = &dst.BlockStmt{
+			List: []dst.Stmt{assign},
+		}
+	} else {
+		// Strategy: Log Fallback.
+		// Enclosing function is void, main, or we couldn't resolve details.
+		return refactorDeferLogFallback(ctx, call, ds)
+	}
+
+	// Wrap in closure
+	fnLit := &dst.FuncLit{
+		Type: &dst.FuncType{Params: &dst.FieldList{}},
+		Body: body,
+	}
+
+	newDefer := &dst.DeferStmt{
+		Call: &dst.CallExpr{Fun: fnLit},
+	}
+
+	replaceInParent(ctx.parent, ds, newDefer)
+	return nil
+}
+
+// refactorDeferLogFallback generates a defer wrapper that logs the error.
+// defer func() { if err := call(); err != nil { log.Printf("deferred error: %v", err) } }()
+func refactorDeferLogFallback(ctx rewriteContext, call *dst.CallExpr, ds *dst.DeferStmt) error {
+	ensureImportDST(ctx.dstFile, "log")
+
+	// Assign: err := call()
+	assign := &dst.AssignStmt{
+		Lhs: []dst.Expr{dst.NewIdent("err")},
+		Tok: token.DEFINE,
+		Rhs: []dst.Expr{call},
+	}
+
+	// Check: if err != nil
+	cond := &dst.BinaryExpr{
+		X:  dst.NewIdent("err"),
+		Op: token.NEQ,
+		Y:  dst.NewIdent("nil"),
+	}
+
+	// Log stmt
+	logCall := &dst.CallExpr{
+		Fun: &dst.SelectorExpr{
+			X:   dst.NewIdent("log"),
+			Sel: dst.NewIdent("Printf"),
+		},
+		Args: []dst.Expr{
+			&dst.BasicLit{Kind: token.STRING, Value: `"deferred error: %v"`},
+			dst.NewIdent("err"),
+		},
+	}
+
+	ifStmt := &dst.IfStmt{
+		Init: assign,
+		Cond: cond,
+		Body: &dst.BlockStmt{
+			List: []dst.Stmt{
+				&dst.ExprStmt{X: logCall},
+			},
+		},
+	}
+
+	fnLit := &dst.FuncLit{
+		Type: &dst.FuncType{Params: &dst.FieldList{}},
+		Body: &dst.BlockStmt{List: []dst.Stmt{ifStmt}},
+	}
+
+	newDefer := &dst.DeferStmt{
+		Call: &dst.CallExpr{Fun: fnLit},
+	}
+
+	replaceInParent(ctx.parent, ds, newDefer)
 	return nil
 }
 
@@ -314,9 +618,7 @@ func generateBasicCheck(sig *types.Signature, isTerminal bool, strategy MainHand
 }
 
 func generateCheckBlock(callExpr dst.Expr, sig *types.Signature, isTerminal bool, strategy MainHandlerStrategy, testParam string) *dst.IfStmt {
-	// Call expression needs to be cloned to be moved?
-	// It is `s.X`. Since we replace the ExprStmt, we can take ownership or clone.
-	// Cloning is safer.
+	// Call expression needs to be cloned to be moved
 	assign := &dst.AssignStmt{
 		Lhs: []dst.Expr{dst.NewIdent("err")},
 		Tok: token.DEFINE,
@@ -503,8 +805,9 @@ func applyTraversalStep(node dst.Node, step tStep) (dst.Node, error) {
 	}
 
 	if step.Index >= 0 {
+		// Use literal error description "dst slice index out of bounds" to match test expectations
 		if fieldVal.Kind() != reflect.Slice || step.Index >= fieldVal.Len() {
-			return nil, fmt.Errorf("slice access error")
+			return nil, fmt.Errorf("dst slice index out of bounds")
 		}
 		if res, ok := fieldVal.Index(step.Index).Interface().(dst.Node); ok {
 			return res, nil
@@ -565,6 +868,8 @@ func findEnclosingFuncDetails(path []ast.Node, info *types.Info) (*types.Signatu
 }
 
 // IsEntryPoint checks if the function is main() or init().
+//
+// fn: The function type object.
 func IsEntryPoint(fn *types.Func) bool {
 	if fn.Name() == "init" {
 		return true
@@ -581,4 +886,49 @@ func canReturnError(sig *types.Signature) bool {
 	}
 	last := sig.Results().At(sig.Results().Len() - 1)
 	return last.Type().String() == "error" || last.Type().String() == "builtin.error"
+}
+
+func getErrorReturnNameDST(ft *dst.FuncType) string {
+	if ft.Results == nil {
+		return ""
+	}
+	var lastErrName string
+	for _, field := range ft.Results.List {
+		if isErrorDstExprWrapper(field.Type) {
+			for _, name := range field.Names {
+				if name.Name == "err" {
+					return "err"
+				}
+				lastErrName = name.Name
+			}
+		}
+	}
+	return lastErrName
+}
+
+func isErrorDstExprWrapper(expr dst.Expr) bool {
+	if id, ok := expr.(*dst.Ident); ok {
+		return id.Name == "error"
+	}
+	return false
+}
+
+func ensureImportDST(file *dst.File, path string) {
+	pathStr := fmt.Sprintf(`"%s"`, path)
+	for _, imp := range file.Imports {
+		if imp.Path != nil && imp.Path.Value == pathStr {
+			return
+		}
+	}
+	spec := &dst.ImportSpec{
+		Path: &dst.BasicLit{Kind: token.STRING, Value: pathStr},
+	}
+	decl := &dst.GenDecl{
+		Tok:   token.IMPORT,
+		Specs: []dst.Spec{spec},
+	}
+	// Append to top of file
+	file.Decls = append([]dst.Decl{decl}, file.Decls...)
+	// Synchronize Imports slice to avoid duplicates if called multiple times in same pass
+	file.Imports = append(file.Imports, spec)
 }

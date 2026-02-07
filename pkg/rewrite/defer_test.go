@@ -12,7 +12,7 @@ func TestRewriteDefers_DST(t *testing.T) {
 
 func Close() error { return nil }
 
-// Anonymous signatures ignored
+// Anonymous signatures modified & normalized
 func DoWork() (int, error) {
 	defer Close()
 	return 1, nil
@@ -34,11 +34,6 @@ func Top() {
 `
 	injector, astFile, dstFile := setupDstEnv(t, src, false)
 
-	// Mock valid type info for Close (which looks like error return)
-	// setupDstEnv basic check might fail to resolve 'Close' return type without func body analysis in strict mode,
-	// but our Injector logic relies on Pkg.TypesInfo.
-	// Since 'Close' is in same package, it should resolve.
-
 	changed, err := injector.RewriteDefers(dstFile, astFile)
 	if err != nil {
 		t.Fatalf("RewriteDefers failed: %v", err)
@@ -50,12 +45,22 @@ func Top() {
 	out := renderDstFile(t, dstFile)
 	norm := normalizeStr(out)
 
-	// Case 1: DoWork (Anonymous) -> Ignored
-	if strings.Contains(out, "func DoWork() (i int, err error)") {
-		t.Error("DoWork should not be modified (anonymous return)")
+	// Case 1: DoWork (Anonymous) -> Should be named and normalized
+	// Expect: func DoWork() (i int, err error)
+	// Expect: i, err = 1, nil; return
+	if strings.Contains(out, "func DoWork() (int, error)") {
+		t.Error("DoWork signature not updated")
+	}
+	if !strings.Contains(norm, "i int, err error") {
+		t.Error("DoWork signature naming incorrect")
+	}
+	// Check for normalized assignment "i, err = 1, nil"
+	if !strings.Contains(norm, "i, err = 1, nil") {
+		t.Errorf("DoWork return normalization failed. Got: %s", norm)
 	}
 
-	// Case 2: DoNamed -> Rewritten
+	// Case 2: DoNamed -> Rewritten (but returns not normalized as they were already named, unless tool force-applies it anyway check)
+	// EnsureNamedReturnsDST returns false if already named, so normalizer is skipped.
 	if !strings.Contains(norm, `defer func() { err = errors.Join(err, Close()) }()`) {
 		t.Errorf("DoNamed not rewritten. Got:\n%s", out)
 	}
@@ -63,6 +68,40 @@ func Top() {
 	// Case 3: Closure -> Rewritten
 	if !strings.Contains(norm, `func() (err error) { defer func() { err = errors.Join(err, Close()) }() return nil }`) {
 		t.Errorf("Closure not rewritten. Got:\n%s", out)
+	}
+}
+
+func TestRewriteDefers_Normalization(t *testing.T) {
+	// Tests explicit -> naked normalization
+	src := `package main
+func Close() error { return nil }
+// Explicit return should be normalized when named returns are forced
+func NormalizeMe() error {
+	defer Close()
+	return nil
+}`
+	injector, astFile, dstFile := setupDstEnv(t, src, false)
+	changed, err := injector.RewriteDefers(dstFile, astFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !changed {
+		t.Fatal("Expected change")
+	}
+
+	out := renderDstFile(t, dstFile)
+	norm := normalizeStr(out)
+
+	// Signature should be named
+	if !strings.Contains(norm, "func NormalizeMe() (err error)") {
+		t.Error("Signature not named")
+	}
+	// Return should be normalized: err = nil; return
+	if !strings.Contains(norm, "err = nil") {
+		t.Error("Assignment missing from normalization")
+	}
+	if !strings.Contains(norm, "return }") { // Check naked return at end
+		t.Error("Naked return missing")
 	}
 }
 

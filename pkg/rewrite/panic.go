@@ -18,6 +18,13 @@ import (
 // Analysis is performed on the AST (for type safety), and transformations are applied
 // to the DST (for comment preservation).
 //
+// It performs basic reachability analysis: if replacing a panic removal exposes a
+// fall-through path in a non-void function (i.e. missing return), it injects a
+// terminal return statement.
+//
+// If RetainPanics is enabled, it skips panics that do not appear to wrap errors
+// (e.g. string assertions).
+//
 // dstFile: The DST file to modify.
 // astFile: The AST file corresponding to the DST file (used for type analysis).
 //
@@ -44,6 +51,15 @@ func (i *Injector) RewritePanics(dstFile *dst.File, astFile *ast.File) (bool, er
 			}
 			if call, ok := n.(*ast.CallExpr); ok {
 				if i.isPanicCall(call) {
+					// Check RetainPanics logic
+					if i.RetainPanics {
+						// Only allow if arg is error
+						if len(call.Args) > 0 {
+							if !i.isErrorArg(call.Args[0]) {
+								return true // Skip this panic
+							}
+						}
+					}
 					panicCalls = append(panicCalls, call)
 				}
 			}
@@ -114,9 +130,166 @@ func (i *Injector) RewritePanics(dstFile *dst.File, astFile *ast.File) (bool, er
 				applied = true
 			}
 		}
+
+		// 3. Control Flow Check: Ensure function terminates if we removed panics
+		// Only check if we modified the function.
+		// Use astFn to get types for zero value generation.
+		if err := i.ensureTerminalReturn(dstFn, astFn); err != nil {
+			// soft failure?
+			// return applied, err
+		}
 	}
 
 	return applied, nil
+}
+
+// ensureTerminalReturn checks if the function body falls through appearing to miss a return statement
+// (common when converting panic -> return errors in if-blocks).
+// If so, it appends a zero-value return statement.
+func (i *Injector) ensureTerminalReturn(fn *dst.FuncDecl, astFn *ast.FuncDecl) error {
+	if fn.Body == nil {
+		return nil
+	}
+	if i.isTerminating(fn.Body) {
+		return nil
+	}
+
+	// Not terminating. Check if signature expects returns.
+	if fn.Type.Results == nil || len(fn.Type.Results.List) == 0 {
+		return nil
+	}
+
+	// Generate zero returns based on AST types (more reliable than DST for types)
+	var results []dst.Expr
+
+	// Iterate using AST type info
+	if astFn != nil && astFn.Type.Results != nil {
+		for _, field := range astFn.Type.Results.List {
+			// Resolve type from AST
+			// We need to check TypeInfo for the Type Expr to get types.Type
+			// Or traverse logic locally.
+			count := len(field.Names)
+			if count == 0 {
+				count = 1
+			}
+
+			// Lookup type
+			var t types.Type
+			if i.Pkg != nil && i.Pkg.TypesInfo != nil {
+				if tv, ok := i.Pkg.TypesInfo.Types[field.Type]; ok {
+					t = tv.Type
+				}
+			}
+
+			for k := 0; k < count; k++ {
+				var z dst.Expr
+				if t != nil {
+					// Use ASTGen
+					var err error
+					z, err = astgen.ZeroExprDST(t, astgen.ZeroCtx{})
+					if err != nil {
+						// Fallback to guess
+						z = guessZeroDSTFromExpr(field.Type) // heuristic on AST expr
+					}
+				} else {
+					// Fallback
+					z = dst.NewIdent("nil")
+				}
+				results = append(results, z)
+			}
+		}
+	} else {
+		// Fallback purely on DST structure if AST mapping weak
+		results = i.generateZerosFromDST(fn.Type)
+	}
+
+	// Append return stmt
+	ret := &dst.ReturnStmt{
+		Results: results,
+	}
+	// Formatting: ensure newline
+	ret.Decorations().Before = dst.NewLine
+
+	fn.Body.List = append(fn.Body.List, ret)
+	return nil
+}
+
+func (i *Injector) isTerminating(stmt dst.Stmt) bool {
+	switch s := stmt.(type) {
+	case *dst.ReturnStmt:
+		return true
+	case *dst.BlockStmt:
+		if len(s.List) == 0 {
+			return false
+		}
+		return i.isTerminating(s.List[len(s.List)-1])
+	case *dst.IfStmt:
+		// Needs both branches
+		if s.Else == nil {
+			return false
+		}
+		return i.isTerminating(s.Body) && i.isTerminating(s.Else)
+	case *dst.ForStmt:
+		// Infinite loop without break?
+		// Simple heuristic: if Cond is missing, assume infinite.
+		// (Advanced: check for breaks. We do simple check).
+		if s.Cond == nil {
+			return true // "for {" is terminating unless broken, assume safe to not add return after
+		}
+		return false // "for cond {" might not run
+	case *dst.SwitchStmt:
+		// Needs default and all cases terminating
+		hasDefault := false
+		for _, clause := range s.Body.List {
+			cc, ok := clause.(*dst.CaseClause)
+			if !ok {
+				continue
+			}
+			if cc.List == nil {
+				hasDefault = true
+			}
+			// Check list of statements in case
+			if len(cc.Body) == 0 {
+				if !hasDefault {
+					// empty case might fallthrough? No, implicit break.
+					// If empty, it doesn't terminate.
+					return false
+				}
+			} else {
+				if !i.isTerminating(&dst.BlockStmt{List: cc.Body}) {
+					return false
+				}
+			}
+		}
+		return hasDefault
+	case *dst.SelectStmt:
+		// Similar to switch, needs default
+		hasDefault := false
+		for _, clause := range s.Body.List {
+			cc, ok := clause.(*dst.CommClause)
+			if !ok {
+				continue
+			}
+			if cc.Comm == nil {
+				hasDefault = true
+			}
+			if len(cc.Body) == 0 {
+				return false // break
+			}
+			if !i.isTerminating(&dst.BlockStmt{List: cc.Body}) {
+				return false
+			}
+		}
+		return hasDefault
+	case *dst.ExprStmt:
+		// Check for panic
+		if call, ok := s.X.(*dst.CallExpr); ok {
+			if id, ok := call.Fun.(*dst.Ident); ok && id.Name == "panic" {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // replaceDstStmt matches a statement by pointer identity and replaces it in a BlockStmt.
@@ -155,6 +328,15 @@ func (i *Injector) isPanicCall(call *ast.CallExpr) bool {
 	return false
 }
 
+func (i *Injector) isErrorArg(arg ast.Expr) bool {
+	if i.Pkg != nil && i.Pkg.TypesInfo != nil {
+		if tv, ok := i.Pkg.TypesInfo.Types[arg]; ok {
+			return i.isErrorType(tv.Type)
+		}
+	}
+	return false
+}
+
 func (i *Injector) hasTrailingErrorReturnDST(fn *dst.FuncDecl) bool {
 	if fn.Type.Results == nil || len(fn.Type.Results.List) == 0 {
 		return false
@@ -174,39 +356,45 @@ func (i *Injector) generateReturnFromPanicDST(fn *dst.FuncDecl, panicCall *dst.C
 	astgen.ClearDecorations(dstArg)
 	astArg := astPanicCall.Args[0]
 
-	var results []dst.Expr
-	resFields := fn.Type.Results.List
-	totalReturns := 0
-	for _, f := range resFields {
-		if len(f.Names) > 0 {
-			totalReturns += len(f.Names)
-		} else {
-			totalReturns++
-		}
+	// Use heuristic DST zero generation corresponding to result slots
+	// We want to match the *current* DST signature (which might have been updated).
+	// Since we are inside the rewrite, relying on basic heuristics for now is safer
+	// than trying to resync with AST which might be stale regarding the new "error" return.
+	results := i.generateZerosFromDST(fn.Type)
+
+	// Determine if we need to wrap the error
+	errExpr := i.convertPanicArgToErrorDST(dstArg, astArg)
+
+	// The last result in 'results' should be the error slot.
+	// If the function returns (int, int, error), generateZerosFromDST produces (0, 0, nil).
+	// We replace the last 'nil' with our errExpr.
+	if len(results) > 0 {
+		results[len(results)-1] = errExpr
+	} else {
+		// Should not happen if AddErrorToSignatureDST worked
+		results = append(results, errExpr)
 	}
 
-	processedCount := 0
-	targetCount := totalReturns - 1
+	return &dst.ReturnStmt{Results: results}, nil
+}
 
-	for _, f := range resFields {
-		count := len(f.Names)
+func (i *Injector) generateZerosFromDST(ft *dst.FuncType) []dst.Expr {
+	var results []dst.Expr
+	if ft.Results == nil {
+		return results
+	}
+
+	for _, field := range ft.Results.List {
+		count := len(field.Names)
 		if count == 0 {
 			count = 1
 		}
 		for k := 0; k < count; k++ {
-			if processedCount >= targetCount {
-				break
-			}
-			z := guessZeroDST(f.Type)
+			z := guessZeroDST(field.Type)
 			results = append(results, z)
-			processedCount++
 		}
 	}
-
-	errExpr := i.convertPanicArgToErrorDST(dstArg, astArg)
-	results = append(results, errExpr)
-
-	return &dst.ReturnStmt{Results: results}, nil
+	return results
 }
 
 func guessZeroDST(t dst.Expr) dst.Expr {
@@ -223,6 +411,24 @@ func guessZeroDST(t dst.Expr) dst.Expr {
 			return &dst.BasicLit{Kind: token.STRING, Value: `""`}
 		}
 	case *dst.StarExpr, *dst.MapType, *dst.ArrayType, *dst.ChanType, *dst.FuncType, *dst.InterfaceType:
+		return dst.NewIdent("nil")
+	}
+	return dst.NewIdent("nil")
+}
+
+func guessZeroDSTFromExpr(expr ast.Expr) dst.Expr {
+	// Simple mapping from AST expr to DST zero
+	switch x := expr.(type) {
+	case *ast.Ident:
+		if x.Name == "string" {
+			return &dst.BasicLit{Kind: token.STRING, Value: `""`}
+		}
+		if x.Name == "bool" {
+			return dst.NewIdent("false")
+		}
+		// Assume numeric default
+		return &dst.BasicLit{Kind: token.INT, Value: "0"}
+	case *ast.StarExpr, *ast.ArrayType, *ast.MapType, *ast.InterfaceType, *ast.ChanType:
 		return dst.NewIdent("nil")
 	}
 	return dst.NewIdent("nil")
