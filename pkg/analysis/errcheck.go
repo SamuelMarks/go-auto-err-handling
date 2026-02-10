@@ -28,6 +28,9 @@ type fileContext struct {
 	file *ast.File
 }
 
+// filepathAbs is a test hook for stubbing filepath.Abs.
+var filepathAbs = filepath.Abs
+
 // NewErrcheckParser initializes a parser by indexing the provided loaded packages.
 //
 // pkgs: The packages loaded by the loader that correspond to the analysis target.
@@ -38,7 +41,7 @@ func NewErrcheckParser(pkgs []*packages.Package) *ErrcheckParser {
 			if pos := pkg.Fset.Position(syntax.Pos()); pos.Filename != "" {
 				// We normalize to absolute path to ensure matching works regardless of
 				// how errcheck reports paths (relative vs abs).
-				abs, err := filepath.Abs(pos.Filename)
+				abs, err := filepathAbs(pos.Filename)
 				if err == nil {
 					fm[abs] = fileContext{pkg: pkg, file: syntax}
 				}
@@ -79,7 +82,7 @@ func (p *ErrcheckParser) Parse(reader io.Reader) ([]InjectionPoint, error) {
 		}
 
 		// Resolve File
-		absPath, err := filepath.Abs(path)
+		absPath, err := filepathAbs(path)
 		if err != nil {
 			continue
 		}

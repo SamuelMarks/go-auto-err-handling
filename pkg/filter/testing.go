@@ -111,10 +111,6 @@ func isTestingFunc(decl *ast.FuncDecl, typeName string) bool {
 	}
 
 	field := decl.Type.Params.List[0]
-	// AST allows "func(a, b int)", so we must ensure it's a single variable
-	if len(field.Names) > 1 {
-		return false
-	}
 
 	// Check type: must be *testing.typeName
 	starExpr, ok := field.Type.(*ast.StarExpr)

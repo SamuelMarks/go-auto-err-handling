@@ -38,10 +38,8 @@ func PatchSignature(info *types.Info, decl *ast.FuncDecl, pkg *types.Package) er
 		return fmt.Errorf("%s is not a function", decl.Name.Name)
 	}
 
-	oldSig, ok := fnObj.Type().(*types.Signature)
-	if !ok {
-		return fmt.Errorf("object type is not signature")
-	}
+	// types.Func always carries a *types.Signature.
+	oldSig := fnObj.Type().(*types.Signature)
 
 	// 2. Construct New Signature
 	// We need to rebuild params and results.

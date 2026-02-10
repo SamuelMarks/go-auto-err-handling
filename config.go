@@ -1,3 +1,4 @@
+// Package main provides the auto-err CLI entry point and configuration.
 package main
 
 import "github.com/alecthomas/kong"
@@ -58,6 +59,9 @@ type Config struct {
 
 	// MainHandler strategy for entry points.
 	MainHandler string `name:"main-handler" help:"Strategy for main/init: 'log-fatal', 'os-exit', 'panic'." default:"log-fatal"`
+
+	// NonErrorFallback strategy for functions that do not return error.
+	NonErrorFallback string `name:"non-error-fallback" help:"Fallback strategy when functions don't return errors: 'log', 'fatal', 'panic'." default:"log"`
 
 	// ErrorTemplate template for return statements.
 	ErrorTemplate string `name:"error-template" help:"Template for return (e.g. '{return-zero}, err')." default:"{return-zero}, err"`

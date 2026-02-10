@@ -22,9 +22,10 @@ type InjectionPoint struct {
 	// Call is the function call expression returning the error.
 	Call *ast.CallExpr
 	// Assign is the assignment statement (e.g., "_ = foo()"). Nil if it's a bare expression, defer, go, or gen decl.
+	// If the call is inside a composite literal, Assign points to the statement holding the literal (if AssignStmt).
 	Assign *ast.AssignStmt
 	// Stmt is the statement wrapping the call.
-	// Can be *ast.ExprStmt, *ast.AssignStmt, *ast.DeferStmt, *ast.GoStmt, *ast.IfStmt, *ast.SwitchStmt, or nil for Global Decls.
+	// Can be *ast.ExprStmt, *ast.AssignStmt, *ast.DeferStmt, *ast.GoStmt, *ast.IfStmt, *ast.SwitchStmt, *ast.ReturnStmt, or nil for Global Decls.
 	Stmt ast.Stmt
 	// Pos is the position of the error return (usually the call site).
 	Pos token.Pos
@@ -34,7 +35,7 @@ type InjectionPoint struct {
 // It detects calls processing errors that are ignored via blank identifier,
 // treated as expression statements, ignored in defer/go statements,
 // embedded in control structures, ignored in global variable initializers,
-// or hidden within method chains (`foo().bar()`).
+// hidden within method chains (`foo().bar()`), or embedded in composite literals.
 //
 // It respects the "// auto-err:ignore" directive. If this text appears in comments
 // associated with the statement, the injection point is skipped.
@@ -67,6 +68,13 @@ func Detect(pkgs []*packages.Package, flt *filter.Filter, debug bool) ([]Injecti
 					}
 				}
 
+				// Helper to scan CompositeLiterals
+				scanComposite := func(root ast.Expr, stmt ast.Stmt, assign *ast.AssignStmt) {
+					checkForCompositeLit(pkg.TypesInfo, root, func(c *ast.CallExpr) {
+						addPoint(c, stmt, assign)
+					})
+				}
+
 				// Case 1: Expression Statement (Bare call)
 				if exprStmt, ok := node.(*ast.ExprStmt); ok {
 					// Check root call
@@ -81,15 +89,15 @@ func Detect(pkgs []*packages.Package, flt *filter.Filter, debug bool) ([]Injecti
 					checkForChains(pkg.TypesInfo, exprStmt.X, func(c *ast.CallExpr) {
 						addPoint(c, exprStmt, nil)
 					})
+					// Check CompositeLit inside ExprStmt (e.g. &S{f()})
+					scanComposite(exprStmt.X, exprStmt, nil)
+
 					// Continue descent to find nested errors (e.g. in function arguments)
 					return true
 				}
 
 				// Case 2: Assignment Statement (Assigned to _)
 				if assignStmt, ok := node.(*ast.AssignStmt); ok {
-					// Handle Tuple Assignment (1 Call -> N Vars)
-					// Handle N:N Assignment (N Calls -> N Vars)
-
 					// Iterate over RHS to handle N:N or 1:N cases
 					for i, rhs := range assignStmt.Rhs {
 						if call, ok := rhs.(*ast.CallExpr); ok {
@@ -100,11 +108,9 @@ func Detect(pkgs []*packages.Package, flt *filter.Filter, debug bool) ([]Injecti
 
 								if len(assignStmt.Lhs) == len(assignStmt.Rhs) {
 									// N:N Case. e.g. x, y = a(), b()
-									// Here, each RHS returns exactly 1 value (one of them is error)
 									lhsExpr = assignStmt.Lhs[i]
 								} else {
 									// 1:N Case (Tuple). e.g. x, y = f()
-									// RHS has 1, LHS has N.
 									// errorIndex indicates position in the tuple (0-indexed)
 									if errorIndex < len(assignStmt.Lhs) {
 										lhsExpr = assignStmt.Lhs[errorIndex]
@@ -117,8 +123,6 @@ func Detect(pkgs []*packages.Package, flt *filter.Filter, debug bool) ([]Injecti
 								} else if debug {
 									logDebug(pkg, call, "Error not assigned to blank identifier")
 								}
-							} else if debug {
-								logDebug(pkg, call, "AssignStmt RHS does not return error")
 							}
 						}
 
@@ -126,8 +130,10 @@ func Detect(pkgs []*packages.Package, flt *filter.Filter, debug bool) ([]Injecti
 						checkForChains(pkg.TypesInfo, rhs, func(c *ast.CallExpr) {
 							addPoint(c, assignStmt, assignStmt)
 						})
+
+						// Check CompositeLit in RHS
+						scanComposite(rhs, assignStmt, assignStmt)
 					}
-					// Continue descent
 					return true
 				}
 
@@ -142,7 +148,6 @@ func Detect(pkgs []*packages.Package, flt *filter.Filter, debug bool) ([]Injecti
 					checkForChains(pkg.TypesInfo, deferStmt.Call, func(c *ast.CallExpr) {
 						addPoint(c, deferStmt, nil)
 					})
-					// Continue descent (critical for closures in defer)
 					return true
 				}
 
@@ -157,7 +162,6 @@ func Detect(pkgs []*packages.Package, flt *filter.Filter, debug bool) ([]Injecti
 					checkForChains(pkg.TypesInfo, goStmt.Call, func(c *ast.CallExpr) {
 						addPoint(c, goStmt, nil)
 					})
-					// Continue descent
 					return true
 				}
 
@@ -170,7 +174,6 @@ func Detect(pkgs []*packages.Package, flt *filter.Filter, debug bool) ([]Injecti
 							logDebug(pkg, call, "Embedded if-condition call does not return error")
 						}
 					}
-					// Chains inside condition? Probably too complex for "SafeEmbeddedCall" logic.
 					return true
 				}
 
@@ -184,7 +187,16 @@ func Detect(pkgs []*packages.Package, flt *filter.Filter, debug bool) ([]Injecti
 					return true
 				}
 
-				// Case 7: GenDecl (Global Variable Init)
+				// Case 7: Return Statement
+				// Returning a struct containing a failing call: return &S{F: fail()}
+				if retStmt, ok := node.(*ast.ReturnStmt); ok {
+					for _, res := range retStmt.Results {
+						scanComposite(res, retStmt, nil)
+					}
+					return true
+				}
+
+				// Case 8: GenDecl (Global Variable Init)
 				if genDecl, ok := node.(*ast.GenDecl); ok && genDecl.Tok == token.VAR {
 					for _, spec := range genDecl.Specs {
 						if vSpec, ok := spec.(*ast.ValueSpec); ok {
@@ -197,6 +209,10 @@ func Detect(pkgs []*packages.Package, flt *filter.Filter, debug bool) ([]Injecti
 								}
 								// Check Chains in Global Init
 								checkForChains(pkg.TypesInfo, rhs, func(c *ast.CallExpr) {
+									addPoint(c, nil, nil)
+								})
+								// Composite Global Init? var x = S{F: fail()}
+								checkForCompositeLit(pkg.TypesInfo, rhs, func(c *ast.CallExpr) {
 									addPoint(c, nil, nil)
 								})
 							}
@@ -229,6 +245,45 @@ func checkForChains(info *types.Info, root ast.Expr, callback func(*ast.CallExpr
 				if isUnhandledError(info, call) {
 					callback(call)
 				}
+			}
+		}
+		return true
+	})
+}
+
+// checkForCompositeLit recursively scans composite literals for embedded error calls.
+//
+// info: Type info.
+// root: The expression to inspect.
+// callback: Function to invoke when a call returning an unhandled error is found.
+func checkForCompositeLit(info *types.Info, root ast.Expr, callback func(*ast.CallExpr)) {
+	if root == nil {
+		return
+	}
+	// We only start if the root itself is a CompositeLit, or we traverse into one.
+	ast.Inspect(root, func(n ast.Node) bool {
+		// Stop if we hit a node that introduces a new function scope.
+		if _, ok := n.(*ast.FuncLit); ok {
+			return false
+		}
+
+		if lit, ok := n.(*ast.CompositeLit); ok {
+			for _, elt := range lit.Elts {
+				// Elt can be `Expr` (array/slice) or `KeyValueExpr` (struct/map)
+				var valueExpr ast.Expr
+				if kv, ok := elt.(*ast.KeyValueExpr); ok {
+					valueExpr = kv.Value
+				} else {
+					valueExpr = elt
+				}
+
+				// Check if value is a direct call
+				if call, ok := valueExpr.(*ast.CallExpr); ok {
+					if isUnhandledError(info, call) {
+						callback(call)
+					}
+				}
+				// Recursion happens naturally as Inspect continues
 			}
 		}
 		return true

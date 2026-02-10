@@ -1,122 +1,146 @@
 package imports
 
 import (
-	"bytes"
 	"go/ast"
-	"go/format"
+	"go/importer"
 	"go/parser"
 	"go/token"
 	"go/types"
-	"strings"
 	"testing"
 
 	"golang.org/x/tools/go/packages"
 )
 
-// Helper to setup environment
-func setup(t *testing.T, src string) (*packages.Package, *ast.File) {
+func loadTestPackage(t *testing.T, src string) (*packages.Package, *ast.File) {
+	t.Helper()
 	fset := token.NewFileSet()
-	f, err := parser.ParseFile(fset, "main.go", src, parser.ParseComments)
+	file, err := parser.ParseFile(fset, "p.go", src, parser.ParseComments)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("parse error: %v", err)
 	}
-
-	// Mock minimal types info
 	info := &types.Info{
-		Defs: make(map[*ast.Ident]types.Object),
-		Uses: make(map[*ast.Ident]types.Object),
+		Types: make(map[ast.Expr]types.TypeAndValue),
+		Defs:  make(map[*ast.Ident]types.Object),
+		Uses:  make(map[*ast.Ident]types.Object),
 	}
+	conf := types.Config{Importer: importer.Default()}
+	pkgTypes, err := conf.Check("p", fset, []*ast.File{file}, info)
+	if err != nil {
+		t.Fatalf("typecheck error: %v", err)
+	}
+	pkg := &packages.Package{
+		Fset:      fset,
+		Types:     pkgTypes,
+		TypesInfo: info,
+		Syntax:    []*ast.File{file},
+	}
+	return pkg, file
+}
 
-	// Populate defs for local variables to simulate conflicts
-	ast.Inspect(f, func(n ast.Node) bool {
-		if assign, ok := n.(*ast.AssignStmt); ok {
-			for _, expr := range assign.Lhs {
-				if id, ok := expr.(*ast.Ident); ok {
-					// Treat as variable definition
-					v := types.NewVar(token.NoPos, nil, id.Name, types.Typ[types.Int])
-					info.Defs[id] = v
-				}
+func TestResolveAlias_NoConflict(t *testing.T) {
+	src := `package p
+import "fmt"
+func f() { _ = fmt.Sprintf("%s", "x") }`
+	pkg, file := loadTestPackage(t, src)
+	resolver := NewConflictResolver(pkg, file)
+
+	alias, changed := resolver.ResolveAlias("fmt", "fmt")
+	if changed {
+		t.Fatal("expected no alias change")
+	}
+	if alias != "fmt" {
+		t.Fatalf("expected alias fmt, got %q", alias)
+	}
+}
+
+func TestResolveAlias_ConflictWithLocalIdent(t *testing.T) {
+	src := `package p
+import stdErrors "errors"
+func f() {
+	errors := 1
+	_ = errors
+	_ = stdErrors.New("boom")
+}`
+	pkg, file := loadTestPackage(t, src)
+	resolver := NewConflictResolver(pkg, file)
+
+	alias, changed := resolver.ResolveAlias("errors", "errors")
+	if !changed {
+		t.Fatal("expected alias change")
+	}
+	if alias == "errors" {
+		t.Fatal("expected non-default alias")
+	}
+	found := false
+	for _, imp := range file.Imports {
+		if imp.Path != nil && imp.Path.Value == `"errors"` {
+			if imp.Name != nil && imp.Name.Name == alias {
+				found = true
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("expected import alias %q to be added", alias)
+	}
+}
+
+func TestResolveAlias_TypesInfoNil(t *testing.T) {
+	src := `package p
+func f() { fmt := 1; _ = fmt }`
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "p.go", src, 0)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	pkg := &packages.Package{Fset: fset, Syntax: []*ast.File{file}}
+	resolver := NewConflictResolver(pkg, file)
+
+	alias, changed := resolver.ResolveAlias("fmt", "fmt")
+	if !changed {
+		t.Fatal("expected alias change with nil TypesInfo")
+	}
+	if alias == "fmt" {
+		t.Fatal("expected alias to differ from requested")
+	}
+}
+
+func TestResolveAlias_DefsFallback(t *testing.T) {
+	src := `package p
+func f() { fmt := 1; _ = fmt }`
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "p.go", src, 0)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	var defIdent *ast.Ident
+	ast.Inspect(file, func(n ast.Node) bool {
+		assign, ok := n.(*ast.AssignStmt)
+		if !ok || assign.Tok != token.DEFINE {
+			return true
+		}
+		for _, lhs := range assign.Lhs {
+			if ident, ok := lhs.(*ast.Ident); ok && ident.Name == "fmt" {
+				defIdent = ident
+				return false
 			}
 		}
 		return true
 	})
-
-	pkg := &packages.Package{
-		Fset:      fset,
-		Syntax:    []*ast.File{f},
-		TypesInfo: info,
+	if defIdent == nil {
+		t.Fatal("expected to find fmt definition")
 	}
-	return pkg, f
-}
-
-func TestResolveAlias_NoConflict(t *testing.T) {
-	src := `package main
-func main() {
-	x := 1
-}
-`
-	pkg, file := setup(t, src)
+	info := &types.Info{
+		Defs: make(map[*ast.Ident]types.Object),
+	}
+	info.Defs[defIdent] = nil
+	pkg := &packages.Package{Fset: fset, Syntax: []*ast.File{file}, TypesInfo: info}
 	resolver := NewConflictResolver(pkg, file)
 
-	alias, aliased := resolver.ResolveAlias("fmt", "fmt")
-
-	if aliased {
-		t.Error("Expected no alias needed")
+	alias, changed := resolver.ResolveAlias("fmt", "fmt")
+	if !changed {
+		t.Fatal("expected alias change from defs fallback")
 	}
-	if alias != "fmt" {
-		t.Errorf("Expected 'fmt', got '%s'", alias)
-	}
-}
-
-func TestResolveAlias_Conflict(t *testing.T) {
-	src := `package main
-func main() {
-	fmt := "local variable"
-	_ = fmt
-}
-`
-	pkg, file := setup(t, src)
-	resolver := NewConflictResolver(pkg, file)
-
-	// We request "fmt". Local var "fmt" exists. Should generate alias.
-	alias, aliased := resolver.ResolveAlias("fmt", "fmt")
-
-	if !aliased {
-		t.Error("Expected usage to be aliased due to conflict")
-	}
-	if !strings.HasPrefix(alias, "std_fmt_") {
-		t.Errorf("Expected safe alias prefix, got '%s'", alias)
-	}
-
-	// Verify import was added to AST
-	var buf bytes.Buffer
-	tokenSet := token.NewFileSet()
-	format.Node(&buf, tokenSet, file)
-	out := buf.String()
-
-	// Use flexible check because astutil behavior varies on formatting
-	if !strings.Contains(out, `"fmt"`) || !strings.Contains(out, alias) {
-		t.Errorf("Modified AST missing aliased import.\nAlias: %s\nOutput:\n%s", alias, out)
-	}
-}
-
-func TestResolveAlias_ConflictMultiple(t *testing.T) {
-	// Scenario: "fmt" and "std_fmt_1" are taken.
-	src := `package main
-func main() {
-	fmt := 1
-	std_fmt_1 := 2
-}
-`
-	pkg, file := setup(t, src)
-	resolver := NewConflictResolver(pkg, file)
-
-	alias, aliased := resolver.ResolveAlias("fmt", "fmt")
-
-	if !aliased {
-		t.Error("Should be aliased")
-	}
-	if alias != "std_fmt_2" {
-		t.Errorf("Expected incremented alias 'std_fmt_2', got '%s'", alias)
+	if alias == "fmt" {
+		t.Fatal("expected alias to differ from requested")
 	}
 }

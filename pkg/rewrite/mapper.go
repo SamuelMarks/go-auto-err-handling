@@ -11,6 +11,18 @@ import (
 	"golang.org/x/tools/go/ast/astutil"
 )
 
+// pathEnclosingIntervalFunc is a test hook for overriding astutil.PathEnclosingInterval.
+var pathEnclosingIntervalFunc = astutil.PathEnclosingInterval
+
+// determineStepFunc is a test hook for overriding determineStep.
+var determineStepFunc = determineStep
+
+// findDstNodeFunc is a test hook for overriding FindDstNode.
+var findDstNodeFunc = FindDstNode
+
+// canInterfaceFunc is a test hook for overriding reflect.Value.CanInterface behavior.
+var canInterfaceFunc = func(v reflect.Value) bool { return v.CanInterface() }
+
 // DstMapResult holds the result of a mapping operation, containing the target DST node
 // and its immediate parent (container).
 type DstMapResult struct {
@@ -40,7 +52,7 @@ func FindDstNode(fset *token.FileSet, dstFile *dst.File, astFile *ast.File, targ
 	}
 
 	// 1. Calculate the path in the AST.
-	path, _ := astutil.PathEnclosingInterval(astFile, targetNode.Pos(), targetNode.End())
+	path, _ := pathEnclosingIntervalFunc(astFile, targetNode.Pos(), targetNode.End())
 	if len(path) == 0 {
 		return DstMapResult{}, fmt.Errorf("no AST node found covering position %d", targetNode.Pos())
 	}
@@ -71,7 +83,7 @@ func FindDstNode(fset *token.FileSet, dstFile *dst.File, astFile *ast.File, targ
 		astParent := path[i+1]
 		astChild := path[i]
 
-		step, err := determineStep(astParent, astChild)
+		step, err := determineStepFunc(astParent, astChild)
 		if err != nil {
 			return DstMapResult{}, fmt.Errorf("failed to map step at depth %d (%T -> %T): %w", i, astParent, astChild, err)
 		}
@@ -114,7 +126,7 @@ func determineStep(parent, child ast.Node) (traversalStep, error) {
 
 		if fieldVal.Kind() == reflect.Slice {
 			for idx := 0; idx < fieldVal.Len(); idx++ {
-				if !fieldVal.Index(idx).CanInterface() {
+				if !canInterfaceFunc(fieldVal.Index(idx)) {
 					continue
 				}
 				elem := fieldVal.Index(idx).Interface()

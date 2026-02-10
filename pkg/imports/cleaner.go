@@ -1,3 +1,4 @@
+// Package imports normalizes and cleans import sets after rewrites.
 package imports
 
 import (

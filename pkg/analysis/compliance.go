@@ -1,3 +1,4 @@
+// Package analysis finds unhandled error sites and analyzes interface compliance.
 package analysis
 
 import (

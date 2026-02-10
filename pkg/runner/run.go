@@ -13,16 +13,12 @@ import (
 
 	"github.com/SamuelMarks/go-auto-err-handling/pkg/analysis"
 	"github.com/SamuelMarks/go-auto-err-handling/pkg/filter"
-	"github.com/SamuelMarks/go-auto-err-handling/pkg/loader"
-	"github.com/SamuelMarks/go-auto-err-handling/pkg/refactor"
 	"github.com/SamuelMarks/go-auto-err-handling/pkg/report"
 	"github.com/SamuelMarks/go-auto-err-handling/pkg/rewrite"
 	"github.com/dave/dst"
-	"github.com/dave/dst/decorator"
 	"github.com/hexops/gotextdiff"
 	"github.com/hexops/gotextdiff/myers"
 	"github.com/hexops/gotextdiff/span"
-	"golang.org/x/tools/go/ast/astutil"
 	"golang.org/x/tools/go/packages"
 	"golang.org/x/tools/imports" // Added for imports.Process
 )
@@ -42,10 +38,12 @@ type Options struct {
 	RetainPanics         bool // New option
 	Paths                []string
 	MainHandler          string
+	NonErrorFallback     string
 	ErrorTemplate        string
 	Reporter             *report.Reporter
 }
 
+// Run executes analysis and rewrites based on the provided options.
 func Run(opts Options) error {
 	if opts.Check {
 		opts.DryRun = true
@@ -63,7 +61,7 @@ func Run(opts Options) error {
 			log.Printf("%s Loading packages...", prefix)
 		}
 
-		pkgs, err := loader.LoadPackages(opts.Paths, ".")
+		pkgs, err := loadPackagesFn(opts.Paths, ".")
 		if err != nil {
 			return fmt.Errorf("load failed: %w", err)
 		}
@@ -78,9 +76,9 @@ func Run(opts Options) error {
 		}
 		flt := filter.New(opts.ExcludeGlob, globs)
 
-		registry := analysis.NewInterfaceRegistry(pkgs)
+		registry := newInterfaceRegistryFn(pkgs)
 
-		points, err := analysis.Detect(pkgs, flt, opts.DryRun)
+		points, err := detectFn(pkgs, flt, opts.DryRun)
 		if err != nil {
 			return fmt.Errorf("analysis failed: %w", err)
 		}
@@ -106,8 +104,8 @@ func Run(opts Options) error {
 
 		log.Printf("Found %d unhandled errors.", len(points))
 
-		mgr := newDstManager(pkgs)
-		count, err := applyRefactors(mgr, points, opts, registry)
+		mgr := newDstManagerFn(pkgs)
+		count, err := applyRefactorsFn(mgr, points, opts, registry)
 		if err != nil {
 			return err
 		}
@@ -153,6 +151,7 @@ func newDstManager(pkgs []*packages.Package) *dstManager {
 	return m
 }
 
+// Get returns the decorated DST file for the given AST file, caching it on first use.
 func (m *dstManager) Get(pkg *packages.Package, astFile *ast.File) (*dst.File, error) {
 	tokFile := m.fset.File(astFile.Pos())
 	if tokFile == nil {
@@ -164,8 +163,7 @@ func (m *dstManager) Get(pkg *packages.Package, astFile *ast.File) (*dst.File, e
 		return d, nil
 	}
 
-	dec := decorator.NewDecorator(m.fset)
-	d, err := dec.DecorateFile(astFile)
+	d, err := decorateFileFn(m.fset, astFile)
 	if err != nil {
 		return nil, err
 	}
@@ -173,6 +171,7 @@ func (m *dstManager) Get(pkg *packages.Package, astFile *ast.File) (*dst.File, e
 	return d, nil
 }
 
+// MarkModified records that the given AST file was modified.
 func (m *dstManager) MarkModified(astFile *ast.File) {
 	tokFile := m.fset.File(astFile.Pos())
 	if tokFile != nil {
@@ -180,6 +179,7 @@ func (m *dstManager) MarkModified(astFile *ast.File) {
 	}
 }
 
+// PrintDiffs writes diffs for modified files to the provided writer.
 func (m *dstManager) PrintDiffs(w *os.File) error {
 	paths := make([]string, 0, len(m.modified))
 	for k := range m.modified {
@@ -188,14 +188,14 @@ func (m *dstManager) PrintDiffs(w *os.File) error {
 	sort.Strings(paths)
 
 	for _, path := range paths {
-		orig, err := os.ReadFile(path)
+		orig, err := readFileFn(path)
 		if err != nil {
 			return err
 		}
 
 		d := m.cache[path]
 		var buf bytes.Buffer
-		if err := decorator.NewRestorer().Fprint(&buf, d); err != nil {
+		if err := restorerFprintFn(&buf, d); err != nil {
 			return err
 		}
 
@@ -206,15 +206,16 @@ func (m *dstManager) PrintDiffs(w *os.File) error {
 	return nil
 }
 
+// Save writes modified files back to disk.
 func (m *dstManager) Save() error {
 	for path := range m.modified {
 		d := m.cache[path]
-		f, err := os.Create(path)
+		f, err := createFileFn(path)
 		if err != nil {
 			return err
 		}
 		defer f.Close()
-		if err := decorator.NewRestorer().Fprint(f, d); err != nil {
+		if err := restorerFprintFn(f, d); err != nil {
 			return err
 		}
 	}
@@ -223,9 +224,6 @@ func (m *dstManager) Save() error {
 
 func applyRefactors(mgr *dstManager, points []analysis.InjectionPoint, opts Options, registry *analysis.InterfaceRegistry) (int, error) {
 	totalChanges := 0
-
-	propQueue := make([]*types.Func, 0)
-	visited := make(map[*types.Func]bool)
 
 	for _, p := range points {
 		if !opts.EnableThirdPartyErr && isThirdParty(p) {
@@ -237,7 +235,7 @@ func applyRefactors(mgr *dstManager, points []analysis.InjectionPoint, opts Opti
 			return totalChanges, err
 		}
 
-		ctx := FindEnclosingFunc(p.Pkg, p.File, p.Pos)
+		ctx := findEnclosingFuncFn(p.Pkg, p.File, p.Pos)
 		if ctx == nil {
 			continue
 		}
@@ -252,13 +250,14 @@ func applyRefactors(mgr *dstManager, points []analysis.InjectionPoint, opts Opti
 
 		hasErr := hasErrorReturn(ctx.Sig)
 		injector := rewrite.NewInjector(p.Pkg, opts.ErrorTemplate, opts.MainHandler, opts.RetainPanics)
+		injector.NonErrorFallback = opts.NonErrorFallback
 
 		if hasErr {
 			if opts.EnablePreexistingErr {
 				if ctx.TestParam != "" {
 					injector.TestParam = ctx.TestParam
 				}
-				applied, err := injector.RewriteFile(dstFile, p.File, []analysis.InjectionPoint{p})
+				applied, err := rewriteFileFn(injector, dstFile, p.File, []analysis.InjectionPoint{p})
 				if err != nil {
 					return totalChanges, err
 				}
@@ -277,7 +276,7 @@ func applyRefactors(mgr *dstManager, points []analysis.InjectionPoint, opts Opti
 
 			// Test Handler Handling (inject t.Fatal instead of signature change)
 			if ctx.TestParam != "" {
-				if err := refactor.HandleTestError(p.Pkg, dstFile, p.Call, p.Stmt, ctx.TestParam); err == nil {
+				if err := handleTestErrorFn(p.Pkg, dstFile, p.Call, p.Stmt, ctx.TestParam); err == nil {
 					totalChanges++
 					mgr.MarkModified(p.File)
 					opts.Reporter.IncHandled()
@@ -287,8 +286,8 @@ func applyRefactors(mgr *dstManager, points []analysis.InjectionPoint, opts Opti
 
 			// Main/Init Entry Point Handling
 			if ctx.Decl != nil {
-				if refactor.IsEntryPoint(p.Pkg.TypesInfo.ObjectOf(ctx.Decl.Name).(*types.Func)) {
-					if err := refactor.HandleEntryPoint(p.Pkg, dstFile, p.Call, p.Stmt, opts.MainHandler); err == nil {
+				if isEntryPointFn(p.Pkg.TypesInfo.ObjectOf(ctx.Decl.Name).(*types.Func)) {
+					if err := handleEntryPointFn(p.Pkg, dstFile, p.Call, p.Stmt, opts.MainHandler); err == nil {
 						totalChanges++
 						mgr.MarkModified(p.File)
 						opts.Reporter.IncHandled()
@@ -302,9 +301,9 @@ func applyRefactors(mgr *dstManager, points []analysis.InjectionPoint, opts Opti
 			}
 
 			fnObj := p.Pkg.TypesInfo.ObjectOf(ctx.Decl.Name).(*types.Func)
-			conflicts, _ := registry.CheckCompliance(fnObj)
+			conflicts, _ := checkComplianceFn(registry, fnObj)
 			if len(conflicts) > 0 {
-				applied, _ := injector.LogFallback(dstFile, p.File, p)
+				applied, _ := logFallbackFn(injector, dstFile, p.File, p)
 				if applied {
 					totalChanges++
 					mgr.MarkModified(p.File)
@@ -312,15 +311,15 @@ func applyRefactors(mgr *dstManager, points []analysis.InjectionPoint, opts Opti
 				continue
 			}
 
-			changed, _ := refactor.AddErrorToSignature(p.Pkg.Fset, ctx.Decl)
+			changed, _ := addErrorToSignatureFn(p.Pkg.Fset, ctx.Decl)
 			if changed {
-				refactor.PatchSignature(p.Pkg.TypesInfo, ctx.Decl, fnObj.Pkg())
-				res, _ := rewrite.FindDstNode(mgr.fset, dstFile, p.File, ctx.Decl)
+				patchSignatureFn(p.Pkg.TypesInfo, ctx.Decl, fnObj.Pkg())
+				res, _ := findDstNodeFn(mgr.fset, dstFile, p.File, ctx.Decl)
 				if dstDecl, ok := res.Node.(*dst.FuncDecl); ok {
-					refactor.AddErrorToSignatureDST(dstDecl)
+					_, _ = addErrorToSignatureDSTFn(dstDecl)
 				}
 
-				applied, err := injector.RewriteFile(dstFile, p.File, []analysis.InjectionPoint{p})
+				applied, err := rewriteFileFn(injector, dstFile, p.File, []analysis.InjectionPoint{p})
 				if err != nil {
 					return totalChanges, err
 				}
@@ -328,11 +327,13 @@ func applyRefactors(mgr *dstManager, points []analysis.InjectionPoint, opts Opti
 					totalChanges++
 					mgr.MarkModified(p.File)
 
-					newObj := p.Pkg.TypesInfo.ObjectOf(ctx.Decl.Name).(*types.Func)
-					if !visited[newObj] {
-						visited[newObj] = true
-						propQueue = append(propQueue, newObj)
+					// Trigger recursive propagation
+					newObj := p.Pkg.TypesInfo.ObjectOf(ctx.Decl.Name)
+					propCount, err := propagateCallersFn([]*packages.Package{p.Pkg}, mgr, newObj, opts.MainHandler)
+					if err != nil {
+						return totalChanges, err
 					}
+					totalChanges += propCount
 				}
 			}
 		}
@@ -342,12 +343,13 @@ func applyRefactors(mgr *dstManager, points []analysis.InjectionPoint, opts Opti
 		for id, pkg := range mgr.pkgs {
 			_ = id
 			inj := rewrite.NewInjector(pkg, opts.ErrorTemplate, opts.MainHandler, opts.RetainPanics)
+			inj.NonErrorFallback = opts.NonErrorFallback
 			for _, f := range pkg.Syntax {
 				dstFile, err := mgr.Get(pkg, f)
 				if err != nil {
 					continue
 				}
-				applied, err := inj.RewritePanics(dstFile, f)
+				applied, err := rewritePanicsFn(inj, dstFile, f)
 				if err != nil {
 					log.Printf("Panic rewrite warning: %v", err)
 				}
@@ -359,126 +361,28 @@ func applyRefactors(mgr *dstManager, points []analysis.InjectionPoint, opts Opti
 		}
 	}
 
-	for len(propQueue) > 0 {
-		target := propQueue[0]
-		propQueue = propQueue[1:]
-
-		for _, pkg := range mgr.pkgs {
-			for id, obj := range pkg.TypesInfo.Uses {
-				if obj == target {
-					f := findFileInPkg(pkg, id.Pos())
-					if f == nil {
-						continue
-					}
-					dstFile, _ := mgr.Get(pkg, f)
-
-					ctx := FindEnclosingFunc(pkg, f, id.Pos())
-					if ctx == nil {
-						continue
-					}
-
-					path, _ := astutil.PathEnclosingInterval(f, id.Pos(), id.Pos())
-					var call *ast.CallExpr
-					var stmt ast.Stmt
-					var assign *ast.AssignStmt
-
-					for _, n := range path {
-						if c, ok := n.(*ast.CallExpr); ok && call == nil {
-							call = c
-						}
-						if s, ok := n.(ast.Stmt); ok && call != nil {
-							stmt = s
-							if a, ok := n.(*ast.AssignStmt); ok {
-								assign = a
-							}
-							break
-						}
-					}
-
-					if call == nil || stmt == nil {
-						continue
-					}
-
-					point := analysis.InjectionPoint{
-						Pkg: pkg, File: f, Call: call, Stmt: stmt, Assign: assign, Pos: call.Pos(),
-					}
-
-					isTerm := false
-					testParam := ""
-					if ctx.TestParam != "" {
-						isTerm = true
-						testParam = ctx.TestParam
-					} else if ctx.Decl != nil {
-						fnObj := pkg.TypesInfo.ObjectOf(ctx.Decl.Name).(*types.Func)
-						if refactor.IsEntryPoint(fnObj) {
-							isTerm = true
-						}
-					}
-
-					inj := rewrite.NewInjector(pkg, opts.ErrorTemplate, opts.MainHandler, opts.RetainPanics)
-
-					if isTerm {
-						if testParam != "" {
-							refactor.HandleTestError(pkg, dstFile, call, stmt, testParam)
-						} else {
-							refactor.HandleEntryPoint(pkg, dstFile, call, stmt, opts.MainHandler)
-						}
-						mgr.MarkModified(f)
-						totalChanges++
-						continue
-					}
-
-					if ctx.Decl != nil && !hasErrorReturn(ctx.Sig) {
-						refactor.AddErrorToSignature(pkg.Fset, ctx.Decl)
-						refactor.PatchSignature(pkg.TypesInfo, ctx.Decl, pkg.Types)
-
-						res, _ := rewrite.FindDstNode(mgr.fset, dstFile, f, ctx.Decl)
-						if dstDecl, ok := res.Node.(*dst.FuncDecl); ok {
-							refactor.AddErrorToSignatureDST(dstDecl)
-						}
-
-						newObj := pkg.TypesInfo.ObjectOf(ctx.Decl.Name).(*types.Func)
-						if !visited[newObj] {
-							visited[newObj] = true
-							propQueue = append(propQueue, newObj)
-						}
-					}
-
-					applied, err := inj.RewriteFile(dstFile, f, []analysis.InjectionPoint{point})
-					if err == nil && applied {
-						mgr.MarkModified(f)
-						totalChanges++
-					}
-				}
-			}
-		}
-	}
-
 	return totalChanges, nil
 }
 
 func isThirdParty(p analysis.InjectionPoint) bool {
-	info := p.Pkg.TypesInfo
-	var obj types.Object
-	if id, ok := p.Call.Fun.(*ast.Ident); ok {
-		obj = info.ObjectOf(id)
-	} else if sel, ok := p.Call.Fun.(*ast.SelectorExpr); ok {
-		obj = info.ObjectOf(sel.Sel)
-	}
-
-	if obj != nil && obj.Pkg() != nil {
+	if p.Pkg == nil || p.Pkg.TypesInfo == nil {
 		return false
 	}
-	return false
-}
 
-func findFileInPkg(pkg *packages.Package, pos token.Pos) *ast.File {
-	for _, f := range pkg.Syntax {
-		if f.Pos() <= pos && pos < f.End() {
-			return f
-		}
+	info := p.Pkg.TypesInfo
+	var obj types.Object
+	switch fun := p.Call.Fun.(type) {
+	case *ast.Ident:
+		obj = info.ObjectOf(fun)
+	case *ast.SelectorExpr:
+		obj = info.ObjectOf(fun.Sel)
 	}
-	return nil
+
+	if obj == nil || obj.Pkg() == nil || p.Pkg.Types == nil {
+		return false
+	}
+
+	return obj.Pkg().Path() != p.Pkg.Types.Path()
 }
 
 func hasErrorReturn(sig *types.Signature) bool {

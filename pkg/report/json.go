@@ -1,3 +1,4 @@
+// Package report collects and serializes rewrite statistics.
 package report
 
 import (

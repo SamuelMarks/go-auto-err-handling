@@ -12,6 +12,14 @@ import (
 	"golang.org/x/tools/go/ast/astutil"
 )
 
+// addErrorToSignatureDST is a test hook for overriding AddErrorToSignatureDST behavior.
+var addErrorToSignatureDST = refactor.AddErrorToSignatureDST
+
+// ensureTerminalReturnFunc is a test hook for overriding ensureTerminalReturn behavior.
+var ensureTerminalReturnFunc = func(i *Injector, fn *dst.FuncDecl, astFn *ast.FuncDecl) error {
+	return i.ensureTerminalReturn(fn, astFn)
+}
+
 // RewritePanics scans the provided DST file for explicit explicit panic calls (e.g., panic(err))
 // and converts them into return statements with an error.
 //
@@ -80,7 +88,7 @@ func (i *Injector) RewritePanics(dstFile *dst.File, astFile *ast.File) (bool, er
 
 	// 2. Apply Transformations to DST
 	for astFn, panics := range candidates {
-		mapRes, err := FindDstNode(i.Fset, dstFile, astFile, astFn)
+		mapRes, err := findDstNodeFunc(i.Fset, dstFile, astFile, astFn)
 		if err != nil {
 			return applied, fmt.Errorf("failed to map function %s to DST: %w", astFn.Name.Name, err)
 		}
@@ -91,7 +99,7 @@ func (i *Injector) RewritePanics(dstFile *dst.File, astFile *ast.File) (bool, er
 
 		needsSigUpdate := !i.hasTrailingErrorReturnDST(dstFn)
 		if needsSigUpdate {
-			changed, err := refactor.AddErrorToSignatureDST(dstFn)
+			changed, err := addErrorToSignatureDST(dstFn)
 			if err != nil {
 				return applied, err
 			}
@@ -101,7 +109,7 @@ func (i *Injector) RewritePanics(dstFile *dst.File, astFile *ast.File) (bool, er
 		}
 
 		for _, astPanic := range panics {
-			panicMapRes, err := FindDstNode(i.Fset, dstFile, astFile, astPanic)
+			panicMapRes, err := findDstNodeFunc(i.Fset, dstFile, astFile, astPanic)
 			if err != nil {
 				return applied, fmt.Errorf("failed to map panic call to DST: %w", err)
 			}
@@ -134,7 +142,7 @@ func (i *Injector) RewritePanics(dstFile *dst.File, astFile *ast.File) (bool, er
 		// 3. Control Flow Check: Ensure function terminates if we removed panics
 		// Only check if we modified the function.
 		// Use astFn to get types for zero value generation.
-		if err := i.ensureTerminalReturn(dstFn, astFn); err != nil {
+		if err := ensureTerminalReturnFunc(i, dstFn, astFn); err != nil {
 			// soft failure?
 			// return applied, err
 		}

@@ -67,6 +67,56 @@ func TestZeroExprDST(t *testing.T) {
 	}
 }
 
+// TestZeroExpr_Shadowing verifies detection of shadowed types.
+func TestZeroExpr_Shadowing(t *testing.T) {
+	// Setup a named type "MyStruct"
+	namedM := types.NewNamed(
+		types.NewTypeName(token.NoPos, nil, "MyStruct", nil),
+		types.NewStruct(nil, nil),
+		nil,
+	)
+
+	// Context that simulates "MyStruct" being shadowed (unsafe)
+	shadowCtx := ZeroCtx{
+		IsNameSafe: func(name string, expected types.Object) bool {
+			if name == "MyStruct" {
+				return false // Simulate shadowing
+			}
+			return true
+		},
+	}
+
+	// Context that simulates "MyStruct" being safe
+	safeCtx := ZeroCtx{
+		IsNameSafe: func(name string, expected types.Object) bool {
+			return true
+		},
+	}
+
+	t.Run("AST_Shadowed", func(t *testing.T) {
+		_, err := ZeroExpr(namedM, shadowCtx)
+		if err == nil {
+			t.Error("Expected error for shadowed type, got nil")
+		} else if !strings.Contains(err.Error(), "shadowed") {
+			t.Errorf("Unexpected error: %v", err)
+		}
+	})
+
+	t.Run("DST_Shadowed", func(t *testing.T) {
+		_, err := ZeroExprDST(namedM, shadowCtx)
+		if err == nil {
+			t.Error("Expected error for shadowed type, got nil")
+		}
+	})
+
+	t.Run("AST_Safe", func(t *testing.T) {
+		_, err := ZeroExpr(namedM, safeCtx)
+		if err != nil {
+			t.Errorf("Unexpected error: %v", err)
+		}
+	})
+}
+
 // renderDstNode wraps a node in a dummy File to use Restorer.Fprint securely.
 func renderDstNode(t *testing.T, node dst.Node) string {
 	var buf bytes.Buffer

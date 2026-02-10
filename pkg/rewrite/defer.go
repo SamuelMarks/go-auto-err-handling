@@ -1,3 +1,4 @@
+// Package rewrite injects error handling into AST/DST nodes.
 package rewrite
 
 import (
@@ -10,6 +11,9 @@ import (
 	"github.com/dave/dst/dstutil"
 	"golang.org/x/tools/go/ast/astutil"
 )
+
+// ensureNamedReturnsDST is a test hook for forcing EnsureNamedReturnsDST errors.
+var ensureNamedReturnsDST = refactor.EnsureNamedReturnsDST
 
 // RewriteDefers scans the file for defer statements (including inside closures).
 // It converts defers that ignore errors into a pattern using errors.Join.
@@ -67,7 +71,7 @@ func (i *Injector) RewriteDefers(dstFile *dst.File, astFile *ast.File) (bool, er
 
 	// Process FuncDecls
 	for astDecl, defers := range targets {
-		res, err := FindDstNode(i.Fset, dstFile, astFile, astDecl)
+		res, err := findDstNodeFunc(i.Fset, dstFile, astFile, astDecl)
 		if err != nil {
 			return applied, err
 		}
@@ -77,7 +81,7 @@ func (i *Injector) RewriteDefers(dstFile *dst.File, astFile *ast.File) (bool, er
 		}
 
 		// Ensure named returns allows capturing the error in defer
-		changed, err := refactor.EnsureNamedReturnsDST(dstDecl)
+		changed, err := ensureNamedReturnsDST(dstDecl)
 		if err != nil {
 			return applied, err
 		}
@@ -100,7 +104,7 @@ func (i *Injector) RewriteDefers(dstFile *dst.File, astFile *ast.File) (bool, er
 
 	// Process FuncLits
 	for astLit, defers := range litTargets {
-		res, err := FindDstNode(i.Fset, dstFile, astFile, astLit)
+		res, err := findDstNodeFunc(i.Fset, dstFile, astFile, astLit)
 		if err != nil {
 			return applied, err
 		}
@@ -112,7 +116,7 @@ func (i *Injector) RewriteDefers(dstFile *dst.File, astFile *ast.File) (bool, er
 		// FuncLit doesn't have a Decl wrapper for EnsureNamedReturnsDST which takes *FuncDecl
 		// We wrap it temporarily as EnsureNamedReturnsDST only inspects Type field.
 		wrapperDecl := &dst.FuncDecl{Type: dstLit.Type}
-		changed, err := refactor.EnsureNamedReturnsDST(wrapperDecl)
+		changed, err := ensureNamedReturnsDST(wrapperDecl)
 		if err != nil {
 			return applied, err
 		}
@@ -137,7 +141,7 @@ func (i *Injector) RewriteDefers(dstFile *dst.File, astFile *ast.File) (bool, er
 func (i *Injector) rewriteDefersInDST(body *dst.BlockStmt, astDefers []*ast.DeferStmt, astFile *ast.File, dstFile *dst.File, errName string) bool {
 	changed := false
 	for _, astDefer := range astDefers {
-		res, err := FindDstNode(i.Fset, dstFile, astFile, astDefer)
+		res, err := findDstNodeFunc(i.Fset, dstFile, astFile, astDefer)
 		if err != nil {
 			continue
 		}

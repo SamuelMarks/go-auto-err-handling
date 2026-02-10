@@ -1,3 +1,4 @@
+// Package filter applies file and symbol filters to skip noisy error sites.
 package filter
 
 // DefaultSymbolGlobs defines a list of function signatures that are commonly ignored

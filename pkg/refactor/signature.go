@@ -12,27 +12,18 @@ import (
 )
 
 // AddErrorToSignature modifies a function declaration signature to include an error return type.
-// It performs smart anonymization of return values to prefer idiomatic Go signatures.
-//
-// fset: The FileSet for position handling.
-// decl: The function declaration to modify.
-//
-// Returns true if the signature was modified.
 func AddErrorToSignature(fset *token.FileSet, decl *ast.FuncDecl) (bool, error) {
 	if decl == nil {
 		return false, fmt.Errorf("function declaration is nil")
 	}
 
-	// Initialize Results if nil (e.g., void function)
 	if decl.Type.Results == nil {
 		decl.Type.Results = &ast.FieldList{}
 	}
 
-	// Clear positions to allow reformatting
 	decl.Type.Results.Opening = token.NoPos
 	decl.Type.Results.Closing = token.NoPos
 
-	// 1. Analyze Context
 	hasNamedReturns := false
 	for _, field := range decl.Type.Results.List {
 		if len(field.Names) > 0 {
@@ -46,11 +37,9 @@ func AddErrorToSignature(fset *token.FileSet, decl *ast.FuncDecl) (bool, error) 
 		hasNakedReturns = scanForNakedReturns(decl.Body)
 	}
 
-	// 2. Strategy Decision
 	preserveNames := hasNakedReturns
 	wasVoid := len(decl.Type.Results.List) == 0
 
-	// 3. Apply Anonymization (if applicable)
 	var injectedStmts []ast.Stmt
 
 	if hasNamedReturns && !preserveNames {
@@ -58,10 +47,7 @@ func AddErrorToSignature(fset *token.FileSet, decl *ast.FuncDecl) (bool, error) 
 
 		for _, field := range decl.Type.Results.List {
 			typeExpr := field.Type
-
-			// Handle multi-name fields like "func() (a, b int)"
 			for _, name := range field.Names {
-				// Inject var if used
 				if isNameUsed(decl.Body, name.Name) {
 					declStmt := &ast.DeclStmt{
 						Decl: &ast.GenDecl{
@@ -76,9 +62,8 @@ func AddErrorToSignature(fset *token.FileSet, decl *ast.FuncDecl) (bool, error) 
 					}
 					injectedStmts = append(injectedStmts, declStmt)
 				}
-				// Append anonymous field for THIS specific variable types.
 				newResultList = append(newResultList, &ast.Field{
-					Type: typeExpr, // Sharing pointer is fine for AST logic
+					Type: typeExpr,
 				})
 			}
 		}
@@ -87,17 +72,14 @@ func AddErrorToSignature(fset *token.FileSet, decl *ast.FuncDecl) (bool, error) 
 		hasNamedReturns = false
 	}
 
-	// 4. Prepend Injected Variables (if any)
 	if len(injectedStmts) > 0 {
 		decl.Body.List = append(injectedStmts, decl.Body.List...)
 	}
 
-	// 5. Append 'error' field
 	errorType := &ast.Ident{Name: "error"}
 	var newField *ast.Field
 
 	if hasNamedReturns {
-		// Calculate safe name avoiding collisions
 		usedNames := make(map[string]bool)
 		if decl.Type.Params != nil {
 			for _, f := range decl.Type.Params.List {
@@ -132,25 +114,17 @@ func AddErrorToSignature(fset *token.FileSet, decl *ast.FuncDecl) (bool, error) 
 
 	decl.Type.Results.List = append(decl.Type.Results.List, newField)
 
-	// 6. Update Return Statements
 	astutil.Apply(decl.Body, func(c *astutil.Cursor) bool {
 		node := c.Node()
-
-		// Skip nested function literals or declarations
 		if _, isFuncLit := node.(*ast.FuncLit); isFuncLit {
 			return false
 		}
 		if _, isFuncDecl := node.(*ast.FuncDecl); isFuncDecl {
 			return false
 		}
-
-		// Handle Return Statements
 		if ret, isRet := node.(*ast.ReturnStmt); isRet {
 			isNaked := hasNamedReturns && len(ret.Results) == 0
-
 			if !isNaked && (len(ret.Results) > 0 || wasVoid) {
-				// We append explicit nil. Semantic zero values for other types would be better,
-				// but without type info here, we rely on the fact we only appended error.
 				ret.Results = append(ret.Results, &ast.Ident{Name: "nil"})
 			}
 			return false
@@ -158,7 +132,6 @@ func AddErrorToSignature(fset *token.FileSet, decl *ast.FuncDecl) (bool, error) 
 		return true
 	}, nil)
 
-	// 7. Handle Void Fallthrough
 	if wasVoid {
 		needsAppend := true
 		if len(decl.Body.List) > 0 {
@@ -177,11 +150,6 @@ func AddErrorToSignature(fset *token.FileSet, decl *ast.FuncDecl) (bool, error) 
 }
 
 // AddErrorToSignatureDST modifies a DST function declaration signature to include an error return type.
-// It leverages dst.FieldList for automatic formatting.
-//
-// decl: The DST function declaration.
-//
-// Returns true if changed.
 func AddErrorToSignatureDST(decl *dst.FuncDecl) (bool, error) {
 	if decl == nil {
 		return false, fmt.Errorf("function declaration is nil")
@@ -191,7 +159,6 @@ func AddErrorToSignatureDST(decl *dst.FuncDecl) (bool, error) {
 		decl.Type.Results = &dst.FieldList{}
 	}
 
-	// 1. Analyze Context
 	hasNamedReturns := false
 	for _, field := range decl.Type.Results.List {
 		if len(field.Names) > 0 {
@@ -208,7 +175,6 @@ func AddErrorToSignatureDST(decl *dst.FuncDecl) (bool, error) {
 	preserveNames := hasNakedReturns
 	wasVoid := len(decl.Type.Results.List) == 0
 
-	// 2. Anonymization Strategy
 	var injectedStmts []dst.Stmt
 
 	if hasNamedReturns && !preserveNames {
@@ -216,9 +182,7 @@ func AddErrorToSignatureDST(decl *dst.FuncDecl) (bool, error) {
 
 		for _, field := range decl.Type.Results.List {
 			typeExpr := field.Type
-
 			for _, name := range field.Names {
-				// Check usage to decide whether to declare a var or just drop the name
 				if isNameUsedDST(decl.Body, name.Name) {
 					declStmt := &dst.DeclStmt{
 						Decl: &dst.GenDecl{
@@ -233,7 +197,6 @@ func AddErrorToSignatureDST(decl *dst.FuncDecl) (bool, error) {
 					}
 					injectedStmts = append(injectedStmts, declStmt)
 				}
-				// Append anonymous field result
 				newResultList = append(newResultList, &dst.Field{
 					Type: dst.Clone(typeExpr).(dst.Expr),
 				})
@@ -247,7 +210,6 @@ func AddErrorToSignatureDST(decl *dst.FuncDecl) (bool, error) {
 		decl.Body.List = append(injectedStmts, decl.Body.List...)
 	}
 
-	// 3. Append error field
 	errorType := dst.NewIdent("error")
 	var newField *dst.Field
 
@@ -284,19 +246,13 @@ func AddErrorToSignatureDST(decl *dst.FuncDecl) (bool, error) {
 
 	decl.Type.Results.List = append(decl.Type.Results.List, newField)
 
-	// 4. Update Returns
 	dst.Inspect(decl.Body, func(n dst.Node) bool {
-		// Stop at closures
 		if _, isFuncLit := n.(*dst.FuncLit); isFuncLit {
 			return false
 		}
-
 		if ret, ok := n.(*dst.ReturnStmt); ok {
 			isNaked := hasNamedReturns && len(ret.Results) == 0
-			// If not naked, append zero value for error (nil)
 			if !isNaked && (len(ret.Results) > 0 || wasVoid) {
-				// We use "nil" because 'error' interface zero value is always nil.
-				// We do not need robust astgen logic here unless we are adding non-interface types.
 				ret.Results = append(ret.Results, dst.NewIdent("nil"))
 			}
 			return false
@@ -304,9 +260,6 @@ func AddErrorToSignatureDST(decl *dst.FuncDecl) (bool, error) {
 		return true
 	})
 
-	// 5. Void Fallthrough handling
-	// If function was void, it might rely on implicit return at end of block.
-	// We must add explicit return nil.
 	if wasVoid {
 		needsAppend := true
 		if len(decl.Body.List) > 0 {
@@ -315,7 +268,6 @@ func AddErrorToSignatureDST(decl *dst.FuncDecl) (bool, error) {
 			}
 		}
 		if needsAppend {
-			// Using astgen for cleanliness, though explicit ident is fine for error
 			val, _ := astgen.ZeroExprDST(types.Universe.Lookup("error").Type(), astgen.ZeroCtx{})
 			decl.Body.List = append(decl.Body.List, &dst.ReturnStmt{
 				Results: []dst.Expr{val},
@@ -326,12 +278,21 @@ func AddErrorToSignatureDST(decl *dst.FuncDecl) (bool, error) {
 	return true, nil
 }
 
+// AddErrorToFuncTypeDST modifies a standalone DST function type signature.
+func AddErrorToFuncTypeDST(ft *dst.FuncType) (bool, error) {
+	if ft == nil {
+		return false, fmt.Errorf("ft is nil")
+	}
+	if ft.Results == nil {
+		ft.Results = &dst.FieldList{}
+	}
+	ft.Results.List = append(ft.Results.List, &dst.Field{
+		Type: dst.NewIdent("error"),
+	})
+	return true, nil
+}
+
 // EnsureNamedReturns checks AST function declarations for unnamed return values and names them.
-// This is critical for rewrites that introduce defer closures which capture return values.
-//
-// fset: FileSet for position information.
-// decl: The candidate function declaration.
-// info: Type info package (optional, allows smarter naming).
 func EnsureNamedReturns(fset *token.FileSet, decl *ast.FuncDecl, info *types.Info) (bool, error) {
 	if decl == nil {
 		return false, fmt.Errorf("function declaration is nil")
@@ -382,7 +343,6 @@ func EnsureNamedReturns(fset *token.FileSet, decl *ast.FuncDecl, info *types.Inf
 }
 
 // EnsureNamedReturnsDST checks DST function declarations for unnamed return values and names them.
-// It uses heuristics for naming since TypeInfo is often not associated with DST nodes.
 func EnsureNamedReturnsDST(decl *dst.FuncDecl) (bool, error) {
 	if decl == nil {
 		return false, fmt.Errorf("function declaration is nil")
@@ -538,22 +498,17 @@ func isErrorDstExpr(expr dst.Expr) bool {
 	return false
 }
 
-// nameForDstExpr mimics NameForExpr logic but for DST nodes.
-// It provides heuristics for naming variables based on types (e.g. *http.Client -> client).
 func nameForDstExpr(expr dst.Expr) string {
 	if expr == nil {
 		return "v"
 	}
-
 	core := unwrapDstExpr(expr)
-
 	var typeName string
 	switch t := core.(type) {
 	case *dst.Ident:
 		typeName = t.Name
 	case *dst.SelectorExpr:
 		typeName = t.Sel.Name
-		// Heuristics for pkg.Type using keys from naming.go's defaultMap
 		if x, ok := t.X.(*dst.Ident); ok {
 			full := x.Name + "." + t.Sel.Name
 			if val, ok := defaultTypeMap[full]; ok {
@@ -563,13 +518,9 @@ func nameForDstExpr(expr dst.Expr) string {
 	default:
 		return "v"
 	}
-
-	// defaultTypeMap is defined in naming.go and is package-private to refactor
 	if val, ok := defaultTypeMap[typeName]; ok {
 		return val
 	}
-
-	// Reuse toVariableName from naming.go
 	return toVariableName(typeName)
 }
 

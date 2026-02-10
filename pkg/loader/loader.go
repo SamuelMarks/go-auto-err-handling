@@ -1,3 +1,4 @@
+// Package loader wraps go/packages with module-aware loading behavior.
 package loader
 
 import (
@@ -9,6 +10,9 @@ import (
 
 	"golang.org/x/tools/go/packages"
 )
+
+// packagesLoad is a test hook for stubbing packages.Load.
+var packagesLoad = packages.Load
 
 // LoadPackages loads Go packages matching the provided patterns from the specified directory.
 // It uses a configuration that ensures AST syntax trees, type information, and type-checked objects are loaded.
@@ -42,7 +46,7 @@ func LoadPackages(patterns []string, dir string) ([]*packages.Package, error) {
 		Env:   os.Environ(),
 	}
 
-	pkgs, err := packages.Load(cfg, patterns...)
+	pkgs, err := packagesLoad(cfg, patterns...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to call packages.Load: %w", err)
 	}
@@ -67,7 +71,7 @@ func LoadPackages(patterns []string, dir string) ([]*packages.Package, error) {
 			}
 		}
 
-		pkgs, err = packages.Load(cfg, recursivePatterns...)
+		pkgs, err = packagesLoad(cfg, recursivePatterns...)
 		if err != nil {
 			return nil, fmt.Errorf("failed to retry packages.Load: %w", err)
 		}

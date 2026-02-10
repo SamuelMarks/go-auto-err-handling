@@ -248,3 +248,90 @@ func TestFoo(t *testing.T) {
 		t.Error("Expected IsLiteral true for subtest closure")
 	}
 }
+
+func TestFindEnclosingFunc_TopLevelTestParam(t *testing.T) {
+	src := `package main
+import "testing"
+
+func TestTop(t *testing.T) {
+	x := 1
+	_ = x
+}
+`
+	_, file, pkg := setupEnclosingEnv(t, src)
+
+	pos := findNodePos(file, func(n ast.Node) bool {
+		if id, ok := n.(*ast.Ident); ok && id.Name == "x" {
+			return true
+		}
+		return false
+	})
+
+	ctx := FindEnclosingFunc(pkg, file, pos)
+	if ctx == nil {
+		t.Fatal("expected context for top-level test")
+	}
+	if ctx.TestParam != "t" {
+		t.Fatalf("expected TestParam 't', got %q", ctx.TestParam)
+	}
+}
+
+func TestFindEnclosingFunc_LiteralMissingTypeInfo(t *testing.T) {
+	fset := token.NewFileSet()
+	src := `package main
+func run() {
+	func() {
+		y := 2
+		_ = y
+	}()
+}`
+	file, err := parser.ParseFile(fset, "main.go", src, 0)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	pkg := &packages.Package{
+		Fset:      fset,
+		Syntax:    []*ast.File{file},
+		TypesInfo: &types.Info{Types: map[ast.Expr]types.TypeAndValue{}},
+	}
+
+	pos := findNodePos(file, func(n ast.Node) bool {
+		if id, ok := n.(*ast.Ident); ok && id.Name == "y" {
+			return true
+		}
+		return false
+	})
+
+	if ctx := FindEnclosingFunc(pkg, file, pos); ctx != nil {
+		t.Fatal("expected nil context when func literal type info missing")
+	}
+}
+
+func TestIsSubtestCall_FallbackTypes(t *testing.T) {
+	sel := &ast.SelectorExpr{
+		X:   ast.NewIdent("t"),
+		Sel: ast.NewIdent("Run"),
+	}
+	call := &ast.CallExpr{Fun: sel}
+
+	info := &types.Info{Types: map[ast.Expr]types.TypeAndValue{}}
+	testingPkg := types.NewPackage("testing", "testing")
+	named := types.NewNamed(types.NewTypeName(token.NoPos, testingPkg, "T", nil), types.NewStruct(nil, nil), nil)
+	info.Types[sel.X] = types.TypeAndValue{Type: types.NewPointer(named)}
+
+	if !isSubtestCall(call, info) {
+		t.Fatal("expected subtest call via fallback types info")
+	}
+
+	info.Types[sel.X] = types.TypeAndValue{Type: named}
+	if isSubtestCall(call, info) {
+		t.Fatal("expected non-pointer testing.T to fail subtest detection")
+	}
+}
+
+func TestIsSubtestCall_NonRunSelector(t *testing.T) {
+	call := &ast.CallExpr{Fun: &ast.SelectorExpr{X: ast.NewIdent("t"), Sel: ast.NewIdent("Skip")}}
+	if isSubtestCall(call, &types.Info{}) {
+		t.Fatal("expected non-Run selector to be false")
+	}
+}

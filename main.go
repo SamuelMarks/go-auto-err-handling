@@ -12,11 +12,15 @@ import (
 // version is set via linker flags during build (e.g., -ldflags "-X main.version=1.0.0")
 var version = "dev"
 
+// runFn and fatalf are package-level hooks to simplify testing main behavior.
+var runFn = run
+var fatalf = log.Fatal
+
 // main is the CLI entry point.
 // It executes the runner and handles fatal errors (including check failures) by exiting with status 1.
 func main() {
-	if err := run(os.Args[1:], os.Stdout); err != nil {
-		log.Fatal(err)
+	if err := runFn(os.Args[1:], os.Stdout); err != nil {
+		fatalf(err)
 	}
 }
 
@@ -26,7 +30,7 @@ func main() {
 // stdout: Writer for logs and output.
 func run(args []string, stdout io.Writer) error {
 	var cfg Config
-	parser, err := kong.New(&cfg,
+	parser, err := kongNew(&cfg,
 		kong.Name("auto-err"),
 		kong.Description("Automatically inject error handling into Go code."),
 		kong.Writers(stdout, io.Discard),
@@ -59,6 +63,7 @@ func run(args []string, stdout io.Writer) error {
 		UseDefaultExclusions: cfg.UseDefaultExclusions,
 		Paths:                cfg.Paths,
 		MainHandler:          cfg.MainHandler,
+		NonErrorFallback:     cfg.NonErrorFallback,
 		ErrorTemplate:        cfg.ErrorTemplate,
 	}
 
@@ -70,5 +75,11 @@ func run(args []string, stdout io.Writer) error {
 		log.Printf("Mode: CI Check (Verification)")
 	}
 
-	return runner.Run(opts)
+	return runRunner(opts)
 }
+
+// runRunner is a test hook for swapping runner execution.
+var runRunner = runner.Run
+
+// kongNew is a test hook for swapping the Kong parser constructor.
+var kongNew = kong.New

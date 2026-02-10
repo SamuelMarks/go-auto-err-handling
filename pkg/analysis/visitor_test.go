@@ -38,6 +38,10 @@ func multi() (int, string, error) {
 // Check Global Var Detection
 var _ = canFail() // Should be detected (GenDecl/ValueSpec)
 
+type S struct {
+	F error
+}
+
 func main() {
 	// Ignored error (Expression Statement)
 	canFail()
@@ -69,6 +73,18 @@ func main() {
 
 	// Ignored error in Go statement
 	go canFail()
+
+	// Composite Literal (Assignment)
+	_ = S{
+		F: canFail(),
+	}
+
+    // Composite Literal (Return, implicitly via Wrapper)
+    Wrapper()
+}
+
+func Wrapper() *S {
+    return &S{F: canFail()}
 }
 `)
 	if err := os.WriteFile(filepath.Join(tmpDir, "main.go"), src, 0644); err != nil {
@@ -121,14 +137,16 @@ func testIgnored() {
 	// 5. x, s, _ = multi() in main.go (Tuple Assign 2)
 	// 6. defer canFail() in main.go (DeferStmt)
 	// 7. go canFail() in main.go (GoStmt)
+	// 8. _ = S{F: canFail()} (Assignment Composite)
+	// 9. return &S{F: canFail()} (Return Composite)
 	// ignoredFunc() should be filtered out.
 	// fmt.Println should be filtered out.
 
-	expectedCount := 7
+	expectedCount := 9
 	if len(points) != expectedCount {
 		t.Errorf("expected %d injection points, got %d", expectedCount, len(points))
 		for i, p := range points {
-			t.Logf("Point %d: File=%s Line=%d Call=%s", i, p.Pkg.Fset.Position(p.Pos).Filename, p.Pkg.Fset.Position(p.Pos).Line, p.Call.Fun)
+			t.Logf("Point %d: File=%s Line=%d Call=%s Stmt=%T", i, p.Pkg.Fset.Position(p.Pos).Filename, p.Pkg.Fset.Position(p.Pos).Line, p.Call.Fun, p.Stmt)
 		}
 	}
 
@@ -139,26 +157,41 @@ func testIgnored() {
 	hasDeferStmt := false
 	hasGoStmt := false
 	hasGlobal := false
+	hasReturn := false
+	hasComposite := 0
 
 	for _, p := range points {
 		// Global point has Stmt == nil or check if nil
 		if p.Stmt == nil {
 			hasGlobal = true
 		} else {
-			switch p.Stmt.(type) {
+			switch s := p.Stmt.(type) {
 			case *ast.ExprStmt:
 				hasExprStmt = true
 			case *ast.DeferStmt:
 				hasDeferStmt = true
 			case *ast.GoStmt:
 				hasGoStmt = true
+			case *ast.ReturnStmt:
+				hasReturn = true
 			case *ast.AssignStmt:
 				// Verify it's blank assignment inside
 				if p.Assign != nil {
 					// Check simple case
 					if len(p.Assign.Lhs) == 1 {
 						if id, ok := p.Assign.Lhs[0].(*ast.Ident); ok && id.Name == "_" {
-							hasAssignStmt = true
+							// Could be standard assign or composite assign
+							// Check if RHS is CompositeLit
+							foundComp := false
+							for _, r := range s.Rhs {
+								if _, ok := r.(*ast.CompositeLit); ok {
+									hasComposite++
+									foundComp = true
+								}
+							}
+							if !foundComp {
+								hasAssignStmt = true
+							}
 						}
 					}
 					// Check tuple case
@@ -188,6 +221,13 @@ func testIgnored() {
 	if !hasGoStmt {
 		t.Error("Did not detect go statement 'go canFail()'")
 	}
+	if !hasReturn {
+		t.Error("Did not detect return statement with nested call")
+	}
+	// Note: hasComposite check is slightly heuristic above, but covers `_ = S{...}` case
+	if hasComposite == 0 {
+		t.Error("Did not detect assignment with composite literal")
+	}
 }
 
 // TestDetect_Empty checks behavior on clean code.
@@ -196,7 +236,7 @@ func TestDetect_Empty(t *testing.T) {
 	src := []byte(`package main
 func task() error { return nil }
 func main() {
-	if err := task(); err != nil { panic(err) }
+  if err := task(); err != nil { panic(err) }
 }`)
 	_ = os.WriteFile(filepath.Join(tmpDir, "go.mod"), []byte("module valid\ngo 1.22\n"), 0644)
 	_ = os.WriteFile(filepath.Join(tmpDir, "main.go"), src, 0644)
@@ -217,7 +257,7 @@ func TestDetect_FilterFile(t *testing.T) {
 	src := []byte(`package main
 func fail() error { return nil }
 func main() {
-	fail()
+  fail()
 }`)
 	_ = os.WriteFile(filepath.Join(tmpDir, "go.mod"), []byte("module filefilter\ngo 1.22\n"), 0644)
 	_ = os.WriteFile(filepath.Join(tmpDir, "skip_me.go"), src, 0644)
@@ -245,8 +285,8 @@ func TestDetect_ResolvesSymbols(t *testing.T) {
 type S struct{}
 func (s *S) Fail() error { return nil }
 func main() {
-	s := &S{}
-	s.Fail()
+  s := &S{}
+  s.Fail()
 }`)
 	_ = os.WriteFile(filepath.Join(tmpDir, "go.mod"), []byte("module methods\ngo 1.22\n"), 0644)
 	_ = os.WriteFile(filepath.Join(tmpDir, "main.go"), src, 0644)
@@ -284,11 +324,11 @@ func TestDetect_LocalFuncVariable(t *testing.T) {
 	tmpDir := t.TempDir()
 	src := []byte(`package main
 func main() {
-	// Define a local function variable
-	localFail := func() error { return nil }
-	
-	// Call it - usually returns error
-	localFail()
+  // Define a local function variable
+  localFail := func() error { return nil }
+  
+  // Call it - usually returns error
+  localFail()
 }
 `)
 	_ = os.WriteFile(filepath.Join(tmpDir, "go.mod"), []byte("module localvar\ngo 1.22\n"), 0644)
@@ -325,22 +365,22 @@ func TestDetect_Directives(t *testing.T) {
 	src := []byte(`package main
 func fail() error { return nil }
 func main() {
-	// Case 1: Expression statement with ignore
-	fail() // auto-err:ignore
+  // Case 1: Expression statement with ignore
+  fail() // auto-err:ignore
 
-	// Case 2: Assignment with ignore
-	_ = fail() // auto-err:ignore
+  // Case 2: Assignment with ignore
+  _ = fail() // auto-err:ignore
 
-	// Case 3: Defer with ignore (block comment placement usually binds to stmt)
-	// auto-err:ignore
-	defer fail()
+  // Case 3: Defer with ignore (block comment placement usually binds to stmt)
+  // auto-err:ignore
+  defer fail()
 
-	// Case 4: Go statement with ignore
-	// auto-err:ignore
-	go fail()
+  // Case 4: Go statement with ignore
+  // auto-err:ignore
+  go fail()
 
-	// Case 5: Unhandled, should be detected
-	fail()
+  // Case 5: Unhandled, should be detected
+  fail()
 }
 `)
 	_ = os.WriteFile(filepath.Join(tmpDir, "go.mod"), []byte("module directives\ngo 1.22\n"), 0644)

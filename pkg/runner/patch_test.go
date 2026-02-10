@@ -98,10 +98,53 @@ func Target() int { return 1 }
 	if tv.Type != sigAfter {
 		t.Error("Info.Types[FuncDecl.Type] was not updated")
 	}
+
+	// Ensure uses that pointed to the old object are updated.
+	useIdent := ast.NewIdent("Target")
+	info.Uses[useIdent] = objAfter
+	if err := PatchSignature(info, targetDecl, pkg); err != nil {
+		t.Fatalf("PatchSignature failed on second pass: %v", err)
+	}
+	if info.Uses[useIdent] == objAfter {
+		t.Error("Expected Uses map to be updated to new function object")
+	}
 }
 
 func TestPatchSignature_NilInputs(t *testing.T) {
 	if err := PatchSignature(nil, nil, nil); err == nil {
 		t.Error("Expected error for nil inputs")
+	}
+}
+
+func TestPatchSignature_ObjectErrors(t *testing.T) {
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "main.go", "package main\nfunc Foo() {}", 0)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	var decl *ast.FuncDecl
+	for _, d := range file.Decls {
+		if fd, ok := d.(*ast.FuncDecl); ok {
+			decl = fd
+			break
+		}
+	}
+	if decl == nil {
+		t.Fatal("expected func decl")
+	}
+
+	pkg := types.NewPackage("main", "main")
+	info := &types.Info{
+		Defs: make(map[*ast.Ident]types.Object),
+		Uses: make(map[*ast.Ident]types.Object),
+	}
+
+	if err := PatchSignature(info, decl, pkg); err == nil {
+		t.Fatal("expected error when object is missing")
+	}
+
+	info.Defs[decl.Name] = types.NewVar(token.NoPos, pkg, "Foo", types.Typ[types.Int])
+	if err := PatchSignature(info, decl, pkg); err == nil {
+		t.Fatal("expected error for non-function object")
 	}
 }

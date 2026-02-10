@@ -7,6 +7,7 @@ import (
 	"go/parser"
 	"go/printer"
 	"go/token"
+	"io"
 	"regexp"
 	"strings"
 
@@ -14,6 +15,14 @@ import (
 	"github.com/dave/dst"
 	"github.com/dave/dst/decorator"
 )
+
+// printerFprint is a test hook for forcing printer failures.
+var printerFprint = printer.Fprint
+
+// restorerFprint is a test hook for forcing restorer failures.
+var restorerFprint = func(r *decorator.Restorer, w io.Writer, f *dst.File) error {
+	return r.Fprint(w, f)
+}
 
 // RenderTemplate transforms a template into a list of AST expressions (Legacy).
 func RenderTemplate(tmpl string, zeroExprs []ast.Expr, errName string, funcName string) ([]ast.Expr, []string, error) {
@@ -27,7 +36,7 @@ func RenderTemplate(tmpl string, zeroExprs []ast.Expr, errName string, funcName 
 	fset := token.NewFileSet()
 	for _, z := range zeroExprs {
 		var buf bytes.Buffer
-		if err := printer.Fprint(&buf, fset, z); err != nil {
+		if err := printerFprint(&buf, fset, z); err != nil {
 			return nil, nil, fmt.Errorf("failed to render zero expr: %w", err)
 		}
 		zerosParts = append(zerosParts, buf.String())
@@ -93,7 +102,7 @@ func RenderTemplateDST(tmpl string, zeroExprs []dst.Expr, errName string, funcNa
 				},
 			},
 		}
-		if err := restorer.Fprint(&buf, file); err != nil {
+		if err := restorerFprint(restorer, &buf, file); err != nil {
 			return nil, nil, fmt.Errorf("failed to render zero expr: %w", err)
 		}
 		// Extract cleaned string from "package p\n\nvar _ = expr"

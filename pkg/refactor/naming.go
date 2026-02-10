@@ -1,3 +1,4 @@
+// Package refactor updates signatures and call sites to propagate errors.
 package refactor
 
 import (

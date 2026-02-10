@@ -1,3 +1,4 @@
+// Package runner orchestrates analysis, refactoring, and persistence.
 package runner
 
 import (

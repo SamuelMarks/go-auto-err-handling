@@ -1,3 +1,4 @@
+// Package astgen generates AST/DST nodes for zero values and helpers.
 package astgen
 
 import (
@@ -11,16 +12,29 @@ import (
 	"github.com/dave/dst/decorator"
 )
 
+// decoratorParse is a test hook for stubbing decorator.Parse.
+var decoratorParse = decorator.Parse
+
 // ZeroCtx holds configuration and context for generating zero values.
 type ZeroCtx struct {
 	// Qualifier formats package names in type strings.
+	// If nil, types.TypeString uses default qualification (pkg.Name).
 	Qualifier types.Qualifier
 
 	// Overrides maps a fully qualified type string to a Go expression string.
+	// e.g. "*k8s.io/api/admission/v1.AdmissionResponse" -> "&v1.AdmissionResponse{Allowed: false}"
 	Overrides map[string]string
 
 	// MakeMapsAndChans, if true, causes maps and channels to be initialized via 'make(...)'.
 	MakeMapsAndChans bool
+
+	// IsNameSafe checks if the given identifier string resolves to the expected Object
+	// in the target scope. This prevents generating code that would effectively be shadowed
+	// by local variables (e.g. producing "MyStruct{}" when "MyStruct" is a local variable).
+	//
+	// It is called with the identifier name (e.g. "MyStruct") and the expected type object.
+	// If the name in the scope does not bind to the expected object, it should return false.
+	IsNameSafe func(name string, expected types.Object) bool
 }
 
 // ZeroExpr generates an ast.Expr representing the zero value (Legacy AST version).
@@ -54,7 +68,7 @@ func ZeroExpr(t types.Type, ctx ZeroCtx) (ast.Expr, error) {
 		}
 		return &ast.Ident{Name: "nil"}, nil
 	case *types.Struct, *types.Array:
-		return compositeZeroAST(t, ctx.Qualifier)
+		return compositeZeroAST(t, ctx)
 	case *types.Tuple:
 		return nil, fmt.Errorf("tuple types are not supported for single value generation")
 	default:
@@ -88,7 +102,7 @@ func ZeroExprDST(t types.Type, ctx ZeroCtx) (dst.Expr, error) {
 		}
 		return &dst.Ident{Name: "nil"}, nil
 	case *types.Struct, *types.Array:
-		return compositeZeroDST(t, ctx.Qualifier)
+		return compositeZeroDST(t, ctx)
 	case *types.Tuple:
 		return nil, fmt.Errorf("tuple types are not supported for single value generation")
 	default:
@@ -114,12 +128,28 @@ func basicZeroAST(b *types.Basic) (ast.Expr, error) {
 	}
 }
 
-func compositeZeroAST(t types.Type, q types.Qualifier) (ast.Expr, error) {
-	typeStr := types.TypeString(t, q)
+func compositeZeroAST(t types.Type, ctx ZeroCtx) (ast.Expr, error) {
+	typeStr := types.TypeString(t, ctx.Qualifier)
 	typeExpr, err := parser.ParseExpr(typeStr)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse type string '%s': %w", typeStr, err)
 	}
+
+	// Shadow Protection
+	if ctx.IsNameSafe != nil {
+		if named, ok := t.(*types.Named); ok {
+			// If ParseExpr gave us a simple Ident (e.g. "MyStruct"), verify it.
+			// If it gave a Selector (e.g. "pkg.MyStruct"), shadowing check is complex here
+			// (need to check pkg name), but Qualifier logic typically resolves package conflicts.
+			// Currently we mostly protect against local type shadowing.
+			if id, ok := typeExpr.(*ast.Ident); ok {
+				if !ctx.IsNameSafe(id.Name, named.Obj()) {
+					return nil, fmt.Errorf("type name %q is shadowed in the target scope", id.Name)
+				}
+			}
+		}
+	}
+
 	ClearPositions(typeExpr)
 	return &ast.CompositeLit{Type: typeExpr, Elts: nil}, nil
 }
@@ -162,12 +192,24 @@ func basicZeroDST(b *types.Basic) (dst.Expr, error) {
 	}
 }
 
-func compositeZeroDST(t types.Type, q types.Qualifier) (dst.Expr, error) {
-	typeStr := types.TypeString(t, q)
+func compositeZeroDST(t types.Type, ctx ZeroCtx) (dst.Expr, error) {
+	typeStr := types.TypeString(t, ctx.Qualifier)
 	typeExpr, err := parseDstType(typeStr)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse type string '%s': %w", typeStr, err)
 	}
+
+	// Shadow Protection
+	if ctx.IsNameSafe != nil {
+		if named, ok := t.(*types.Named); ok {
+			if id, ok := typeExpr.(*dst.Ident); ok {
+				if !ctx.IsNameSafe(id.Name, named.Obj()) {
+					return nil, fmt.Errorf("type name %q is shadowed in the target scope", id.Name)
+				}
+			}
+		}
+	}
+
 	return &dst.CompositeLit{Type: typeExpr, Elts: nil}, nil
 }
 
@@ -268,7 +310,7 @@ func ClearDecorations(node dst.Node) {
 // parseDstExpr extracts a DST expression from a string.
 func parseDstExpr(exprStr string) (dst.Expr, error) {
 	src := "package p; var _ = " + exprStr
-	f, err := decorator.Parse(src)
+	f, err := decoratorParse(src)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse override expr: %w", err)
 	}
@@ -288,7 +330,7 @@ func parseDstExpr(exprStr string) (dst.Expr, error) {
 // parseDstType extracts a DST type from a string.
 func parseDstType(typeStr string) (dst.Expr, error) {
 	src := "package p; type _ " + typeStr
-	f, err := decorator.Parse(src)
+	f, err := decoratorParse(src)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse type string: %w", err)
 	}
