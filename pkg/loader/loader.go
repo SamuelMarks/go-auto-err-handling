@@ -32,18 +32,22 @@ func LoadPackages(patterns []string, dir string) ([]*packages.Package, error) {
 	// We need Syntax for AST manipulation.
 	mode := packages.NeedName |
 		packages.NeedFiles |
-		packages.NeedCompiledGoFiles |
 		packages.NeedImports |
 		packages.NeedTypes |
 		packages.NeedTypesInfo |
 		packages.NeedSyntax |
 		packages.NeedModule
 
+	env := filterEnv(os.Environ(), "GOCOVERDIR", "GOCACHE")
+	cacheDir := filepath.Join(os.TempDir(), "go-auto-err-handling-gocache")
+	_ = os.MkdirAll(cacheDir, 0o755)
+	env = append(env, "GOCACHE="+cacheDir)
+
 	cfg := &packages.Config{
 		Mode:  mode,
 		Dir:   dir,
 		Tests: true, // Analyze test files as well
-		Env:   os.Environ(),
+		Env:   env,
 	}
 
 	pkgs, err := packagesLoad(cfg, patterns...)
@@ -90,6 +94,28 @@ func LoadPackages(patterns []string, dir string) ([]*packages.Package, error) {
 	}
 
 	return pkgs, nil
+}
+
+func filterEnv(env []string, keys ...string) []string {
+	if len(keys) == 0 {
+		return env
+	}
+	drop := make(map[string]struct{}, len(keys))
+	for _, key := range keys {
+		drop[key] = struct{}{}
+	}
+	out := make([]string, 0, len(env))
+	for _, entry := range env {
+		name := entry
+		if key, _, ok := strings.Cut(entry, "="); ok {
+			name = key
+		}
+		if _, ok := drop[name]; ok {
+			continue
+		}
+		out = append(out, entry)
+	}
+	return out
 }
 
 // shouldRetryRecursive determines if the loader should attempt to reload with recursion.

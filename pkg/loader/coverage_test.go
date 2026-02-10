@@ -115,6 +115,64 @@ func TestLoadPackages_RecursiveSuccess(t *testing.T) {
 	}
 }
 
+func TestLoadPackages_StripsCoverDir(t *testing.T) {
+	orig := packagesLoad
+	defer func() { packagesLoad = orig }()
+
+	if err := os.Setenv("GOCOVERDIR", t.TempDir()); err != nil {
+		t.Fatalf("set env: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Unsetenv("GOCOVERDIR") })
+
+	var gotEnv []string
+	packagesLoad = func(cfg *packages.Config, _ ...string) ([]*packages.Package, error) {
+		gotEnv = append([]string(nil), cfg.Env...)
+		return []*packages.Package{{PkgPath: "example.com/p", GoFiles: []string{"p.go"}}}, nil
+	}
+
+	if _, err := LoadPackages([]string{"."}, ""); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	expectedCache := filepath.Join(os.TempDir(), "go-auto-err-handling-gocache")
+	foundCache := false
+	for _, entry := range gotEnv {
+		if strings.HasPrefix(entry, "GOCOVERDIR=") {
+			t.Fatalf("expected GOCOVERDIR to be stripped from env")
+		}
+		if entry == "GOCACHE="+expectedCache {
+			foundCache = true
+		}
+	}
+	if !foundCache {
+		t.Fatalf("expected GOCACHE to be set to %s", expectedCache)
+	}
+}
+
+func TestFilterEnv_NoKeys(t *testing.T) {
+	env := []string{"A=1", "B=2"}
+	got := filterEnv(env)
+	if !reflect.DeepEqual(got, env) {
+		t.Fatalf("expected env unchanged, got %v", got)
+	}
+}
+
+func TestFilterEnv_DropsKeys(t *testing.T) {
+	env := []string{"A=1", "GOCOVERDIR=/tmp/cover", "B=2", "NOEQUALS"}
+	got := filterEnv(env, "GOCOVERDIR")
+	if strings.Join(got, ",") == strings.Join(env, ",") {
+		t.Fatalf("expected filtered env, got %v", got)
+	}
+	for _, entry := range got {
+		if strings.HasPrefix(entry, "GOCOVERDIR=") {
+			t.Fatalf("expected GOCOVERDIR to be removed")
+		}
+	}
+	if !strings.Contains(strings.Join(got, ","), "NOEQUALS") {
+		t.Fatalf("expected entry without '=' to be preserved")
+	}
+}
+
 func TestShouldRetryRecursive_Cases(t *testing.T) {
 	tmpDir := t.TempDir()
 	goModPath := filepath.Join(tmpDir, "go.mod")

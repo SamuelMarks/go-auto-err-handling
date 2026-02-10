@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"go/ast"
+	"go/parser"
 	"go/token"
 	"io"
 	"os"
@@ -90,7 +91,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 
 func computeCoverage(dir string) (coverageStats, []missingDoc, error) {
 	cfg := &packages.Config{
-		Mode: packages.NeedName | packages.NeedSyntax | packages.NeedFiles,
+		Mode: packages.NeedName | packages.NeedFiles,
 		Dir:  dir,
 		Env:  append(os.Environ(), "GOWORK=off"),
 	}
@@ -107,6 +108,16 @@ func computeCoverage(dir string) (coverageStats, []missingDoc, error) {
 	for _, pkg := range pkgs {
 		for _, pkgErr := range pkg.Errors {
 			loadErrs = append(loadErrs, pkgErr.Error())
+		}
+		syntax, fset, parseErrs := parsePackageSyntax(pkg)
+		if len(parseErrs) > 0 {
+			loadErrs = append(loadErrs, parseErrs...)
+		}
+		if fset != nil {
+			pkg.Fset = fset
+		}
+		if syntax != nil {
+			pkg.Syntax = syntax
 		}
 	}
 	if len(loadErrs) > 0 {
@@ -198,6 +209,32 @@ func computeCoverage(dir string) (coverageStats, []missingDoc, error) {
 	}
 
 	return stats, missing, nil
+}
+
+func parsePackageSyntax(pkg *packages.Package) ([]*ast.File, *token.FileSet, []string) {
+	if pkg == nil {
+		return nil, nil, nil
+	}
+	files := append([]string{}, pkg.GoFiles...)
+	if len(files) == 0 {
+		files = append(files, pkg.CompiledGoFiles...)
+	}
+	if len(files) == 0 {
+		return nil, nil, nil
+	}
+
+	fset := token.NewFileSet()
+	syntax := make([]*ast.File, 0, len(files))
+	var parseErrs []string
+	for _, file := range files {
+		parsed, err := parser.ParseFile(fset, file, nil, parser.ParseComments)
+		if err != nil {
+			parseErrs = append(parseErrs, err.Error())
+			continue
+		}
+		syntax = append(syntax, parsed)
+	}
+	return syntax, fset, parseErrs
 }
 
 func percent(documented, total int) float64 {

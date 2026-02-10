@@ -263,6 +263,28 @@ func TestComputeCoverage_EmptySyntax(t *testing.T) {
 	})
 }
 
+func TestComputeCoverage_ParseErrors(t *testing.T) {
+	moduleDir := writeModule(t, map[string]string{
+		"badpkg/bad.go": "package badpkg\n\nfunc Broken( {\n",
+	})
+	badFile := filepath.Join(moduleDir, "badpkg", "bad.go")
+
+	withPackagesLoadStub(t, func(cfg *packages.Config, patterns ...string) ([]*packages.Package, error) {
+		return []*packages.Package{{GoFiles: []string{badFile}}}, nil
+	}, func() {
+		_, _, err := computeCoverage(moduleDir)
+		if err == nil {
+			t.Fatalf("expected parse error")
+		}
+		if !strings.Contains(err.Error(), "package load errors") {
+			t.Fatalf("expected load errors prefix")
+		}
+		if !strings.Contains(err.Error(), "bad.go") {
+			t.Fatalf("expected file name in error")
+		}
+	})
+}
+
 func TestComputeCoverage_DocumentedTypesAndSkips(t *testing.T) {
 	moduleDir := writeModule(t, map[string]string{
 		"pkgdoc/doc.go":   "// Package pkgdoc docs.\npackage pkgdoc\n",
@@ -282,6 +304,10 @@ func TestComputeCoverage_DocumentedTypesAndSkips(t *testing.T) {
 }
 
 func TestHelpers(t *testing.T) {
+	syntax, fset, errs := parsePackageSyntax(nil)
+	if syntax != nil || fset != nil || len(errs) != 0 {
+		t.Fatalf("expected nil parse results for nil package")
+	}
 	if percent(0, 0) != 100 {
 		t.Fatalf("expected 100 for empty total")
 	}
