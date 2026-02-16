@@ -2,6 +2,8 @@ package runner
 
 import (
 	"errors"
+	"go/ast"
+	"go/token"
 	"os"
 	"strings"
 	"testing"
@@ -9,7 +11,6 @@ import (
 	"github.com/SamuelMarks/go-auto-err-handling/pkg/analysis"
 	"github.com/SamuelMarks/go-auto-err-handling/pkg/filter"
 	"github.com/dave/dst"
-	"go/token"
 	"golang.org/x/tools/go/packages"
 )
 
@@ -124,5 +125,32 @@ func TestRun_ApplyRefactorsAndIOErrors(t *testing.T) {
 	}
 	if err := Run(Options{Paths: []string{"."}}); err == nil {
 		t.Fatal("expected Save error")
+	}
+}
+
+func TestRun_PanicDstError(t *testing.T) {
+	hooks := saveRunnerHooks()
+	defer hooks.restore()
+
+	loadPackagesFn = func([]string, string) ([]*packages.Package, error) {
+		fset, astFile := parseTestFile(t)
+		pkg := &packages.Package{
+			ID:     "p",
+			Fset:   fset,
+			Syntax: []*ast.File{astFile},
+		}
+		return []*packages.Package{pkg}, nil
+	}
+	detectFn = func([]*packages.Package, *filter.Filter, bool) ([]analysis.InjectionPoint, error) {
+		return nil, nil // No points, but PanicToReturn is true, so should proceed
+	}
+	// Make Get fail by failing implementation hook
+	decorateFileFn = func(*token.FileSet, *ast.File) (*dst.File, error) {
+		return nil, errors.New("dst boom")
+	}
+
+	// This should run without error, just logging the warning internally (not captured unless we pipe log)
+	if err := Run(Options{Paths: []string{"."}, PanicToReturn: true}); err != nil {
+		t.Fatalf("expected Run to succeed despite dst error in panic loop, got %v", err)
 	}
 }

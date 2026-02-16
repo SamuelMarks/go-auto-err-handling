@@ -6,7 +6,9 @@ import (
 	"go/token"
 	"go/types"
 	"reflect"
+	"strings"
 
+	"github.com/SamuelMarks/go-auto-err-handling/pkg/analysis"
 	"github.com/SamuelMarks/go-auto-err-handling/pkg/astgen"
 	"github.com/SamuelMarks/go-auto-err-handling/pkg/filter"
 	"github.com/dave/dst"
@@ -318,6 +320,13 @@ func processCallSiteDST(pkg *packages.Package, astFile *ast.File, dstFile *dst.F
 		return 0, nil, fmt.Errorf("failed to map stmt")
 	}
 
+	// Also map the call, needed for precise replacement in complex statements (e.g. if/switch)
+	dstCallNode, _ := mapAstToDst(astFile, dstFile, call)
+	var dstCall *dst.CallExpr
+	if c, ok := dstCallNode.(*dst.CallExpr); ok {
+		dstCall = c
+	}
+
 	sig, funcObj, decl := findEnclosingFuncDetails(path, pkg.TypesInfo)
 
 	isTerminal := false
@@ -379,6 +388,7 @@ func processCallSiteDST(pkg *packages.Package, astFile *ast.File, dstFile *dst.F
 		dstFile:        dstFile,
 		stmt:           dstStmt,
 		parent:         dstParent,
+		call:           dstCall,
 		enclosingSig:   sig,
 		enclosingFnDst: dstDecl,
 		isTerminal:     isTerminal,
@@ -406,10 +416,17 @@ func HandleEntryPoint(pkg *packages.Package, dstFile *dst.File, call *ast.CallEx
 	if dstStmt == nil {
 		return fmt.Errorf("failed to map stmt")
 	}
+	dstCallNode, _ := mapAstToDst(astFile, dstFile, call)
+	var dstCall *dst.CallExpr
+	if c, ok := dstCallNode.(*dst.CallExpr); ok {
+		dstCall = c
+	}
+
 	ctx := rewriteContext{
 		dstFile:    dstFile,
 		stmt:       dstStmt,
 		parent:     dstParent,
+		call:       dstCall,
 		isTerminal: true,
 		strategy:   MainHandlerStrategy(strategy),
 		scope:      getScope(pkg, stmt),
@@ -428,10 +445,17 @@ func HandleTestError(pkg *packages.Package, dstFile *dst.File, call *ast.CallExp
 	if dstStmt == nil {
 		return fmt.Errorf("failed to map stmt")
 	}
+	dstCallNode, _ := mapAstToDst(astFile, dstFile, call)
+	var dstCall *dst.CallExpr
+	if c, ok := dstCallNode.(*dst.CallExpr); ok {
+		dstCall = c
+	}
+
 	ctx := rewriteContext{
 		dstFile:    dstFile,
 		stmt:       dstStmt,
 		parent:     dstParent,
+		call:       dstCall,
 		isTerminal: true,
 		testParam:  testParamName,
 		scope:      getScope(pkg, stmt),
@@ -444,6 +468,7 @@ type rewriteContext struct {
 	dstFile        *dst.File
 	stmt           dst.Node
 	parent         dst.Node
+	call           dst.Expr
 	enclosingSig   *types.Signature
 	enclosingFnDst *dst.FuncDecl
 	isTerminal     bool
@@ -458,9 +483,17 @@ func (r *rewriteContext) enclosing() *types.Signature { return r.enclosingSig }
 
 func refactorCallSiteDST(ctx rewriteContext) error {
 	stmt := ctx.stmt.(dst.Stmt)
+	// If the call wasn't resolved but we need it for extraction (e.g. IfStmt), we fail early.
+	// For basic stmts like ExprStmt/AssignStmt we might extract from stmt if ctx.call is nil.
+
 	switch s := stmt.(type) {
 	case *dst.ExprStmt:
 		call := s.X
+		// Override if resolved call is available (though ExprStmt.X is usually it)
+		if ctx.call != nil {
+			call = ctx.call
+		}
+
 		// PASSTHROUGH OPTIMIZATION
 		// If usage is tail call and signatures match, just return
 		isTail := false
@@ -496,6 +529,14 @@ func refactorCallSiteDST(ctx rewriteContext) error {
 		return refactorGoStmt(ctx, s)
 	case *dst.DeferStmt:
 		return refactorDeferStmt(ctx, s)
+	case *dst.ReturnStmt:
+		return refactorReturnStmt(ctx, s)
+	case *dst.IfStmt:
+		return refactorIfStmt(ctx, s)
+	case *dst.SwitchStmt:
+		return refactorSwitchStmt(ctx, s)
+	case *dst.TypeSwitchStmt:
+		return refactorTypeSwitchStmt(ctx, s)
 	default:
 		return fmt.Errorf("unsupported stmt type for refactor: %T", stmt)
 	}
@@ -505,6 +546,12 @@ func refactorCallSiteDST(ctx rewriteContext) error {
 func refactorGoStmt(ctx rewriteContext, gs *dst.GoStmt) error {
 	// Wrap in closure: go func() { if err := call(); err != nil ... }()
 	call := dst.Clone(gs.Call).(*dst.CallExpr)
+	if ctx.call != nil {
+		if c, ok := ctx.call.(*dst.CallExpr); ok {
+			call = dst.Clone(c).(*dst.CallExpr)
+		}
+	}
+
 	subCtx := ctx
 	subCtx.isTerminal = true // Go routines always terminal handling
 	// Don't pass testing params into goroutines (safety)
@@ -615,11 +662,278 @@ func refactorDeferLogFallback(ctx rewriteContext, call *dst.CallExpr, ds *dst.De
 	return nil
 }
 
+func refactorReturnStmt(ctx rewriteContext, ret *dst.ReturnStmt) error {
+	// return call() -> call now returns (val, err).
+	// If enclosing function signatures match, we just update the call (done implicitly by replacement logic if needed,
+	// but mostly we assume call node in DST is updated via AST map if we were doing in-place, but we are rewriting).
+	// Since mapping is precise, we can just replace the return.
+	// Actually, if signatures match, `return call()` is valid.
+	if !ctx.isTerminal && ctx.enclosingSig != nil && ctx.targetSig != nil {
+		if types.Identical(ctx.enclosingSig.Results(), ctx.targetSig.Results()) {
+			// No change needed logically, but we should make sure the AST/DST is clean.
+			// Just ensure we return the call.
+			return nil
+		}
+	}
+
+	// Signature mismatch: we must extract, check, and return.
+	// e.g. return val, call() where call() added error? That's complex tuple unpacking.
+	// Assuming `return call()` for now.
+	if ctx.call == nil {
+		// Try to find call in results
+		if len(ret.Results) == 1 {
+			if c, ok := ret.Results[0].(*dst.CallExpr); ok {
+				ctx.call = c
+			}
+		}
+	}
+	if ctx.call == nil {
+		return fmt.Errorf("could not locate call in return stmt")
+	}
+
+	// Extract
+	// val, err := call()
+	// if err != nil { return ..., err }
+	// return val
+	stmts, err := liftCallAndCheck(ctx, ctx.call, true)
+	if err != nil {
+		return err
+	}
+
+	// The `val` from assignment needs to be returned.
+	// We need variable names.
+	// See liftCallAndCheck definition below. It creates `assign` and `check`.
+	assign := stmts[0].(*dst.AssignStmt)
+	var newResults []dst.Expr
+	for _, lhs := range assign.Lhs {
+		if id, ok := lhs.(*dst.Ident); ok {
+			if id.Name != "err" && !strings.HasPrefix(id.Name, "_") {
+				newResults = append(newResults, dst.NewIdent(id.Name))
+			}
+		}
+	}
+
+	// append nil/error success value if signature requires it
+	if ctx.enclosingSig != nil {
+		res := ctx.enclosingSig.Results()
+		// If last param is error type, we must append a success-path 'nil'
+		if res.Len() > 0 {
+			last := res.At(res.Len() - 1)
+			if last.Type().String() == "error" || last.Type().String() == "builtin.error" {
+				newResults = append(newResults, dst.NewIdent("nil"))
+			}
+		}
+	}
+
+	finalReturn := &dst.ReturnStmt{Results: newResults}
+	replaceInParent(ctx.parent, ret, &dst.BlockStmt{List: append(stmts, finalReturn)})
+	return nil
+}
+
+func refactorIfStmt(ctx rewriteContext, s *dst.IfStmt) error {
+	// Lift from Init or Cond
+	var target dst.Node
+	if s.Init != nil && containsDstNode(s.Init, ctx.call) {
+		target = s.Init
+	} else if containsDstNode(s.Cond, ctx.call) {
+		target = s.Cond
+	} else {
+		return fmt.Errorf("call not found in if stmt components")
+	}
+
+	stmts, err := liftCallAndCheck(ctx, ctx.call, false)
+	if err != nil {
+		return err
+	}
+
+	// Update condition/init to use temp var
+	if target == s.Cond {
+		// Cond was `call()`, now `val`.
+		// Assign is `val, err := call()`.
+		assign := stmts[0].(*dst.AssignStmt)
+		var valVar dst.Expr
+		if len(assign.Lhs) > 1 {
+			valVar = assign.Lhs[0] // Assume value is first
+		} else {
+			// Weird Boolean? If call returns (bool, error), then yes.
+			valVar = assign.Lhs[0]
+		}
+		s.Cond = dst.Clone(valVar).(dst.Expr)
+	} else {
+		// Init was `x := call()`. Now `x, err := call()`.
+		// We lift checking BEFORE the if.
+		// Wait, `if x := call(); x { ... }`
+		// becomes `x, err := call(); if err != nil ...; if x { ... }`
+		s.Init = nil // Moved out
+	}
+
+	// Insert block containing [Assign, Check, IfStmt]
+	// preserve decorations
+	block := &dst.BlockStmt{List: append(stmts, s)}
+	replaceInParent(ctx.parent, s, block)
+	return nil
+}
+
+func refactorSwitchStmt(ctx rewriteContext, s *dst.SwitchStmt) error {
+	// Lift from Init or Tag
+	var target dst.Node
+	if s.Init != nil && containsDstNode(s.Init, ctx.call) {
+		target = s.Init
+	} else if s.Tag != nil && containsDstNode(s.Tag, ctx.call) {
+		target = s.Tag
+	} else {
+		return fmt.Errorf("call not found in switch stmt")
+	}
+
+	stmts, err := liftCallAndCheck(ctx, ctx.call, false)
+	if err != nil {
+		return err
+	}
+
+	if target == s.Tag {
+		assign := stmts[0].(*dst.AssignStmt)
+		valVar := assign.Lhs[0]
+		s.Tag = dst.Clone(valVar).(dst.Expr)
+	} else {
+		s.Init = nil
+	}
+
+	block := &dst.BlockStmt{List: append(stmts, s)}
+	replaceInParent(ctx.parent, s, block)
+	return nil
+}
+
+func refactorTypeSwitchStmt(ctx rewriteContext, s *dst.TypeSwitchStmt) error {
+	// Lift from Init or Assign
+	var target dst.Node
+	if s.Init != nil && containsDstNode(s.Init, ctx.call) {
+		target = s.Init
+	} else if s.Assign != nil && containsDstNode(s.Assign, ctx.call) {
+		target = s.Assign
+	} else {
+		return fmt.Errorf("call not found in type switch")
+	}
+
+	stmts, err := liftCallAndCheck(ctx, ctx.call, false)
+	if err != nil {
+		return err
+	}
+
+	if target == s.Assign {
+		// switch v := call().(type) -> val, err := call(); check; switch v := val.(type)
+		assign := stmts[0].(*dst.AssignStmt)
+		valVar := assign.Lhs[0]
+
+		// Update assign stmt in switch
+		if as, ok := s.Assign.(*dst.AssignStmt); ok {
+			if ta, ok := as.Rhs[0].(*dst.TypeAssertExpr); ok {
+				ta.X = dst.Clone(valVar).(dst.Expr)
+			}
+		} else if es, ok := s.Assign.(*dst.ExprStmt); ok {
+			if ta, ok := es.X.(*dst.TypeAssertExpr); ok {
+				ta.X = dst.Clone(valVar).(dst.Expr)
+			}
+		}
+	} else {
+		s.Init = nil
+	}
+
+	block := &dst.BlockStmt{List: append(stmts, s)}
+	replaceInParent(ctx.parent, s, block)
+	return nil
+}
+
+// liftCallAndCheck generates `val, err := call()` and `if err != nil { ... }`.
+// It handles unique naming for `val` and `err`.
+func liftCallAndCheck(ctx rewriteContext, call dst.Expr, useExistingVars bool) ([]dst.Stmt, error) {
+	if call == nil {
+		return nil, fmt.Errorf("nil call")
+	}
+	callClone := dst.Clone(call).(dst.Expr)
+	astgen.ClearDecorations(callClone)
+
+	// Determine variable names
+	errName := "err"
+	valName := "val"
+	if ctx.scope != nil {
+		errName = analysis.GenerateUniqueName(ctx.scope, "err")
+		valName = analysis.GenerateUniqueName(ctx.scope, "val")
+	}
+
+	// Assume targetSig is available to determine if we need `val` or tuple decomposition
+	// For simplicity, we create `val, err := call()`. If it was void, `err := call()`.
+	// Since propagation means signature changed to add error, it definitely returns error now.
+	// If it was void before, it returns just expected error?
+	// We check `targetSig`.
+	isTuple := false
+	if ctx.targetSig != nil && ctx.targetSig.Results().Len() > 1 {
+		isTuple = true
+	}
+
+	var lhs []dst.Expr
+	if isTuple {
+		lhs = append(lhs, dst.NewIdent(valName))
+	}
+	lhs = append(lhs, dst.NewIdent(errName))
+
+	assign := &dst.AssignStmt{
+		Lhs: lhs,
+		Tok: token.DEFINE,
+		Rhs: []dst.Expr{callClone},
+	}
+
+	// Generate check block
+	// `if err != nil { ... }`
+	cond := &dst.BinaryExpr{
+		X:  dst.NewIdent(errName),
+		Op: token.NEQ,
+		Y:  dst.NewIdent("nil"),
+	}
+
+	var body *dst.BlockStmt
+	if ctx.isTerminal {
+		body = generateDstTerminalBody(ctx.strategy, ctx.testParam)
+	} else {
+		zeroCtx := astgen.ZeroCtx{
+			IsNameSafe: func(name string, expected types.Object) bool {
+				if ctx.scope == nil {
+					return true
+				}
+				_, obj := ctx.scope.LookupParent(name, ctx.pos)
+				if obj == nil {
+					return true
+				}
+				return obj == expected
+			},
+		}
+		body = generateDstReturnBody(ctx.enclosingSig, zeroCtx)
+	}
+
+	check := &dst.IfStmt{
+		Cond: cond,
+		Body: body,
+	}
+
+	return []dst.Stmt{assign, check}, nil
+}
+
 func replaceInParent(parent, oldNode, newNode dst.Node) {
 	if b, ok := parent.(*dst.BlockStmt); ok {
+		// Standard sequential replacement
 		for i, stmt := range b.List {
 			if stmt == oldNode {
+				// If substitution is a BlockStmt, verify content.
+				// Actually dst.BlockStmt is a Stmt, so we can put it in List directly.
 				b.List[i] = newNode.(dst.Stmt)
+				return
+			}
+		}
+	}
+	// Case statements
+	if cc, ok := parent.(*dst.CaseClause); ok {
+		for i, stmt := range cc.Body {
+			if stmt == oldNode {
+				cc.Body[i] = newNode.(dst.Stmt)
 				return
 			}
 		}
@@ -988,4 +1302,22 @@ func findIdentForObj(f *ast.File, obj types.Object) *ast.Ident {
 		return true
 	})
 	return match
+}
+
+func containsDstNode(root dst.Node, target dst.Node) bool {
+	if root == nil || target == nil {
+		return false
+	}
+	found := false
+	dst.Inspect(root, func(n dst.Node) bool {
+		if found {
+			return false
+		}
+		if n == target {
+			found = true
+			return false
+		}
+		return true
+	})
+	return found
 }

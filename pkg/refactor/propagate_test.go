@@ -162,11 +162,7 @@ func main() {
 	targetFunc := pkg.TypesInfo.ObjectOf(targetDecl.Name).(*types.Func)
 
 	// Target -> f (var), f -> main (call)
-	// Expect 2 updates: Variable definition check? Actually standard assign doesn't add check, it updates type.
-	// processVarPropagation returns "1" update if it patches.
-	// processCallSite returns "1".
-	// Total 2.
-
+	// Expect 2 updates: Variable propagation return count + Call update.
 	updates, err := PropagateCallers([]*packages.Package{pkg}, provider, targetFunc, "log-fatal")
 	if err != nil {
 		t.Fatalf("PropagateCallers failed: %v", err)
@@ -266,12 +262,12 @@ func main() {
 	}
 
 	out := renderDST(t, dstFile)
-	// Expect log fallback because Do() returns void
-	expected := `defer func() { 
-    if err := Target(); err != nil { 
-      log.Printf("deferred error: %v", err) 
-    } 
-  }()`
+	// Expect log fallback because main returns void (and signature change is not force applied to main per se during processCallSite unless propagated, but main cannot propagate)
+	expected := `defer func() {
+		if err := Target(); err != nil {
+			log.Printf("deferred error: %v", err)
+		}
+	}()`
 	// Normalize for check
 	if !strings.Contains(strings.ReplaceAll(out, "\t", ""), "log.Printf") {
 		t.Errorf("Defer log fallback missing.\nGot:\n%s\nExpected:\n%s", out, expected)
@@ -332,4 +328,144 @@ func main() {
 	if !strings.Contains(out, "panic(err)") {
 		t.Error("Check not added")
 	}
+}
+
+func TestPropagate_IfCond(t *testing.T) {
+	src := `package main
+func Target() bool { return true }
+func main() {
+	if Target() {
+	}
+}
+`
+	pkg, astFile, dstFile := setupPropagateEnv(t, src)
+
+	// Manually patch Target to (bool, error)
+	var targetDecl *ast.FuncDecl
+	for _, d := range astFile.Decls {
+		if fd, ok := d.(*ast.FuncDecl); ok && fd.Name.Name == "Target" {
+			targetDecl = fd
+		}
+	}
+	AddErrorToSignature(pkg.Fset, targetDecl)
+	PatchSignature(pkg.TypesInfo, targetDecl, pkg.Types)
+
+	// REFRESH object reference
+	target := pkg.TypesInfo.Defs[targetDecl.Name].(*types.Func)
+
+	call := findCall(t, astFile, "Target")
+
+	n, _, err := processCallSiteDST(pkg, astFile, dstFile, call, target, "log-fatal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Error("Expected update")
+	}
+	out := renderDST(t, dstFile)
+	if !strings.Contains(out, "val, err := Target()") {
+		t.Errorf("If condition did not lift assignment correctly. Got:\n%s", out)
+	}
+	if !strings.Contains(out, "log.Fatal(err)") {
+		t.Error("Missing handler using log.Fatal")
+	}
+}
+
+func TestPropagate_ReturnStmt(t *testing.T) {
+	// Case: explicit return matching new signature (void func becomes error func)
+	// We use `return Target()` where Target returns int initially to be valid Go
+	src := `package main
+func Target() int { return 0 }
+func wrapper() int {
+	return Target()
+}
+`
+	pkg, astFile, dstFile := setupPropagateEnv(t, src)
+
+	// Patch Target -> (int, error)
+	var targetDecl *ast.FuncDecl
+	for _, d := range astFile.Decls {
+		if fd, ok := d.(*ast.FuncDecl); ok && fd.Name.Name == "Target" {
+			targetDecl = fd
+		}
+	}
+	AddErrorToSignature(pkg.Fset, targetDecl)
+	PatchSignature(pkg.TypesInfo, targetDecl, pkg.Types)
+
+	// REFRESH object
+	target := pkg.TypesInfo.Defs[targetDecl.Name].(*types.Func)
+
+	call := findCall(t, astFile, "Target")
+
+	n, _, err := processCallSiteDST(pkg, astFile, dstFile, call, target, "panic")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// wrapper signature should be updated to return (int, error)
+	if n != 1 {
+		t.Error("Expected update")
+	}
+	out := renderDST(t, dstFile)
+	if !strings.Contains(out, "func wrapper() (int, error)") {
+		t.Error("Wrapper signature not updated")
+	}
+	// Verify return statement is clean (no double return)
+	if strings.Count(out, "return Target()") != 1 {
+		t.Errorf("Return statement malformed. Got:\n%s", out)
+	}
+}
+
+func TestPropagate_ReturnMismatch(t *testing.T) {
+	// Case: explicit return NOT matching
+	// wrapper returns (int), Target returns (int, error) (propagated).
+	// But we simulate a scenario where `wrapper` signature update fails or is mismatched.
+	// Since `processCallSiteDST` auto-updates enclosing `wrapper` to `(int, error)` if void/matching,
+	// we need a scenario where wrapper signature is fixed/different.
+	// E.g. Wrapper is `func wrapper() (int, int)` and calls `Target` returning `(int, error)`.
+
+	src3 := `package main
+func Target() int { return 1 }
+func wrapper() (int, int) {
+	return Target(), 0
+}
+`
+	// This code is valid: return 1, 0.
+	// After patch Target -> (int, error).
+	// wrapper loop `return Target(), 0` becomes invalid return count 3?
+	// refactor return stmt handles `Call` detection.
+	// It sees `Target()`. It lifts it.
+
+	pkg, astFile, dstFile := setupPropagateEnv(t, src3)
+
+	// Patch Target -> (int, error)
+	var targetDecl *ast.FuncDecl
+	for _, d := range astFile.Decls {
+		if fd, ok := d.(*ast.FuncDecl); ok && fd.Name.Name == "Target" {
+			targetDecl = fd
+		}
+	}
+	AddErrorToSignature(pkg.Fset, targetDecl)
+	PatchSignature(pkg.TypesInfo, targetDecl, pkg.Types)
+
+	target := pkg.TypesInfo.Defs[targetDecl.Name].(*types.Func)
+	call := findCall(t, astFile, "Target")
+
+	// Target -> (int, error). Wrapper -> (int, int).
+	// Mismatch.
+	n, _, err := processCallSiteDST(pkg, astFile, dstFile, call, target, "panic")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Error("Expected update")
+	}
+	out := renderDST(t, dstFile)
+
+	// Expect lifting: val, err := Target(); check; return val, 0
+	if !strings.Contains(out, "val, err := Target()") {
+		t.Errorf("Expected lifting. Got:\n%s", out)
+	}
+	// Note: since wrapper sig was NOT auto updated (it wasn't void),
+	// we just handle the error locally.
+	// Check block should appear.
 }

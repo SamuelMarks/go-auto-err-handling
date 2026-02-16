@@ -51,4 +51,23 @@ func TestAddAliasedImport(t *testing.T) {
 	if imp.Name == nil || imp.Name.Name != "fmt2" {
 		t.Fatalf("expected alias fmt2, got %+v", imp.Name)
 	}
+
+	// Test case where usage check returns true (simulate by checking existing import)
+	fileWithImp, err := parser.ParseFile(fset, "p2.go", "package p\nimport \"fmt\"\n", 0)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	addAliasedImport(fset, fileWithImp, "fmt3", "fmt")
+	// Verify it added the alias or updated. Implementation of astutil.AddNamedImport
+	// usually adds a new import spec if name differs.
+	found := false
+	for _, i := range fileWithImp.Imports {
+		if i.Name != nil && i.Name.Name == "fmt3" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatal("expected alias fmt3 to be added despite existing import")
+	}
 }
