@@ -503,8 +503,8 @@ func TestProcessCallSite_TestHelper(t *testing.T) {
 import "testing"
 func Target() {}
 func helper(t *testing.T) {
-  t.Helper()
-  Target()
+	t.Helper()
+	Target()
 }
 `
 	pkg, astFile, dstFile := setupPropagateEnv(t, src)
@@ -570,8 +570,8 @@ func TestProcessCallSite_UnsupportedStmtError(t *testing.T) {
 	src := `package main
 func Target() bool { return true }
 func Caller() {
-  for Target() {
-  }
+	for Target() {
+	}
 }
 `
 	// Note: IfStmt is now supported, so changed test case to ForStmt which is still unsupported in this context
@@ -814,8 +814,8 @@ func TestEnsureImportDST(t *testing.T) {
 func TestGetScope(t *testing.T) {
 	src := `package main
 func main() {
-  var x int
-  _ = x
+	var x int
+	_ = x
 }
 `
 	fset := token.NewFileSet()

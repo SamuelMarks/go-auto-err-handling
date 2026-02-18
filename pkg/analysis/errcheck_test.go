@@ -61,11 +61,11 @@ func TestErrcheckParser_Parse(t *testing.T) {
 	// 1. Setup Codebase
 	src := `package main
 
-func fail() error { return nil } 
+func fail() error { return nil }
 
-func main() { 
-  fail() 
-} 
+func main() {
+	fail()
+}
 `
 	tmpDir := t.TempDir()
 	filename := filepath.Join(tmpDir, "main.go")
@@ -99,8 +99,8 @@ func main() {
 	inputData := fmt.Sprintf(`
 invalid_line_format
 /path/to/missing/file.go:1:1: missing
-%s:%d:%d:   fail
-%s:999:1:   out_of_bounds_line
+%s:%d:%d:	fail
+%s:999:1:	out_of_bounds_line
 `, absPath, failPos.Line, failPos.Column, absPath)
 
 	// 4. Execute
@@ -152,10 +152,10 @@ invalid_line_format
 // TestErrcheckParser_EdgeCases verifies behavior on obscure inputs.
 func TestErrcheckParser_EdgeCases(t *testing.T) {
 	src := `package main
-func f() error { return nil } 
-func main() { 
-  _ = f() 
-} 
+func f() error { return nil }
+func main() {
+	_ = f()
+}
 `
 	tmpDir := t.TempDir()
 	filename := filepath.Join(tmpDir, "edge.go")

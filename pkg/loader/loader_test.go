@@ -22,11 +22,11 @@ func TestLoadPackages(t *testing.T) {
 	// Write a valid Go file
 	mainGoParams := []byte(`package main
 
-import "fmt" 
+import "fmt"
 
-func main() { 
-  fmt.Println("Hello, World!") 
-} 
+func main() {
+	fmt.Println("Hello, World!")
+}
 `)
 	if err := os.WriteFile(filepath.Join(tmpDir, "main.go"), mainGoParams, 0644); err != nil {
 		t.Fatalf("failed to write main.go: %v", err)
@@ -85,7 +85,7 @@ func TestLoadPackages_SmartRecursion(t *testing.T) {
 	}
 
 	src := []byte(`package main
-func main() {} 
+func main() {}
 `)
 	if err := os.WriteFile(filepath.Join(subDir, "main.go"), src, 0644); err != nil {
 		t.Fatalf("failed to write sub/main.go: %v", err)
@@ -150,9 +150,9 @@ func TestLoadPackages_WithSyntaxError(t *testing.T) {
 
 	// Write a Go file with a syntax error (incomplete statement)
 	badSrc := []byte(`package main
-func main() { 
-  return 1 + 
-} 
+func main() {
+	return 1 +
+}
 `)
 	if err := os.WriteFile(filepath.Join(tmpDir, "bad.go"), badSrc, 0644); err != nil {
 		t.Fatalf("failed to write bad.go: %v", err)

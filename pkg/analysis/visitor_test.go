@@ -25,67 +25,67 @@ func TestDetect(t *testing.T) {
 	// source file with checked and unchecked errors
 	src := []byte(`package main
 
-import "fmt" 
+import "fmt"
 
-func canFail() error { 
-  return nil
-} 
+func canFail() error {
+	return nil
+}
 
-func multi() (int, string, error) { 
-  return 0, "", nil
-} 
+func multi() (int, string, error) {
+	return 0, "", nil
+}
 
 // Check Global Var Detection
-var _ = canFail() // Should be detected (GenDecl/ValueSpec) 
+var _ = canFail() // Should be detected (GenDecl/ValueSpec)
 
-type S struct { 
-  F error
-} 
+type S struct {
+	F error
+}
 
-func main() { 
-  // Ignored error (Expression Statement) 
-  canFail() 
+func main() {
+	// Ignored error (Expression Statement)
+	canFail()
 
-  // Ignored error (Blank Assignment) 
-  _ = canFail() 
+	// Ignored error (Blank Assignment)
+	_ = canFail()
 
-  // Checked error (Should NOT be detected) 
-  err := canFail() 
-  if err != nil { 
-    fmt.Println(err) 
-  } 
+	// Checked error (Should NOT be detected)
+	err := canFail()
+	if err != nil {
+		fmt.Println(err)
+	}
 
-  // Partially Ignored Multi-Return (Tuple) 
-  // (int, string, error) 
-  // Case A: Assignment
-  i, _, _ := multi() // Error is ignored (3rd arg) 
+	// Partially Ignored Multi-Return (Tuple)
+	// (int, string, error)
+	// Case A: Assignment
+	i, _, _ := multi() // Error is ignored (3rd arg)
 
-  // Case B: Definition
-  var x int
-  var s string
-  x, s, _ = multi() // Error is ignored
+	// Case B: Definition
+	var x int
+	var s string
+	x, s, _ = multi() // Error is ignored
 
-  // Ignored error from stdlib (filtered later) 
-  fmt.Println("hello") 
+	// Ignored error from stdlib (filtered later)
+	fmt.Println("hello")
 
-  // Ignored error in Defer
-  defer canFail() 
+	// Ignored error in Defer
+	defer canFail()
 
-  // Ignored error in Go statement
-  go canFail() 
+	// Ignored error in Go statement
+	go canFail()
 
-  // Composite Literal (Assignment) 
-  _ = S{ 
-    F: canFail(), 
-  } 
+	// Composite Literal (Assignment)
+	_ = S{
+		F: canFail(),
+	}
 
-    // Composite Literal (Return, implicitly via Wrapper) 
-    Wrapper() 
-} 
+    // Composite Literal (Return, implicitly via Wrapper)
+    Wrapper()
+}
 
-func Wrapper() *S { 
-    return &S{F: canFail()} 
-} 
+func Wrapper() *S {
+    return &S{F: canFail()}
+}
 `)
 	if err := os.WriteFile(filepath.Join(tmpDir, "main.go"), src, 0644); err != nil {
 		t.Fatalf("failed to write main.go: %v", err)
@@ -103,10 +103,10 @@ func Wrapper() *S {
 	// 3. Run Analysis with a filter excluding ignoredFunc and fmt.Println
 	// We specifically exclude fmt.Println
 	src2 := []byte(`package main
-func ignoredFunc() error { return nil } 
-func testIgnored() { 
-  ignoredFunc() // Should be ignored via filter
-} 
+func ignoredFunc() error { return nil }
+func testIgnored() {
+	ignoredFunc() // Should be ignored via filter
+}
 `)
 	if err := os.WriteFile(filepath.Join(tmpDir, "ignore.go"), src2, 0644); err != nil {
 		t.Fatalf("failed to write ignore.go: %v", err)
@@ -234,9 +234,9 @@ func testIgnored() {
 func TestDetect_Empty(t *testing.T) {
 	tmpDir := t.TempDir()
 	src := []byte(`package main
-func task() error { return nil } 
-func main() { 
-  if err := task(); err != nil { panic(err) } 
+func task() error { return nil }
+func main() {
+	if err := task(); err != nil { panic(err) }
 }`)
 	_ = os.WriteFile(filepath.Join(tmpDir, "go.mod"), []byte("module valid\ngo 1.22\n"), 0644)
 	_ = os.WriteFile(filepath.Join(tmpDir, "main.go"), src, 0644)
@@ -255,9 +255,9 @@ func main() {
 func TestDetect_FilterFile(t *testing.T) {
 	tmpDir := t.TempDir()
 	src := []byte(`package main
-func fail() error { return nil } 
-func main() { 
-  fail() 
+func fail() error { return nil }
+func main() {
+	fail()
 }`)
 	_ = os.WriteFile(filepath.Join(tmpDir, "go.mod"), []byte("module filefilter\ngo 1.22\n"), 0644)
 	_ = os.WriteFile(filepath.Join(tmpDir, "skip_me.go"), src, 0644)
@@ -282,11 +282,11 @@ func TestDetect_ResolvesSymbols(t *testing.T) {
 	// We want to ensure that method calls are also resolved.
 	tmpDir := t.TempDir()
 	src := []byte(`package main
-type S struct{} 
-func (s *S) Fail() error { return nil } 
-func main() { 
-  s := &S{} 
-  s.Fail() 
+type S struct{}
+func (s *S) Fail() error { return nil }
+func main() {
+	s := &S{}
+	s.Fail()
 }`)
 	_ = os.WriteFile(filepath.Join(tmpDir, "go.mod"), []byte("module methods\ngo 1.22\n"), 0644)
 	_ = os.WriteFile(filepath.Join(tmpDir, "main.go"), src, 0644)
@@ -323,13 +323,13 @@ func main() {
 func TestDetect_LocalFuncVariable(t *testing.T) {
 	tmpDir := t.TempDir()
 	src := []byte(`package main
-func main() { 
-  // Define a local function variable
-  localFail := func() error { return nil } 
-  
-  // Call it - usually returns error
-  localFail() 
-} 
+func main() {
+	// Define a local function variable
+	localFail := func() error { return nil }
+	
+	// Call it - usually returns error
+	localFail()
+}
 `)
 	_ = os.WriteFile(filepath.Join(tmpDir, "go.mod"), []byte("module localvar\ngo 1.22\n"), 0644)
 	_ = os.WriteFile(filepath.Join(tmpDir, "main.go"), src, 0644)
@@ -363,25 +363,25 @@ func main() {
 func TestDetect_Directives(t *testing.T) {
 	tmpDir := t.TempDir()
 	src := []byte(`package main
-func fail() error { return nil } 
-func main() { 
-  // Case 1: Expression statement with ignore
-  fail() // auto-err:ignore
+func fail() error { return nil }
+func main() {
+	// Case 1: Expression statement with ignore
+	fail() // auto-err:ignore
 
-  // Case 2: Assignment with ignore
-  _ = fail() // auto-err:ignore
+	// Case 2: Assignment with ignore
+	_ = fail() // auto-err:ignore
 
-  // Case 3: Defer with ignore (block comment placement usually binds to stmt) 
-  // auto-err:ignore
-  defer fail() 
+	// Case 3: Defer with ignore (block comment placement usually binds to stmt)
+	// auto-err:ignore
+	defer fail()
 
-  // Case 4: Go statement with ignore
-  // auto-err:ignore
-  go fail() 
+	// Case 4: Go statement with ignore
+	// auto-err:ignore
+	go fail()
 
-  // Case 5: Unhandled, should be detected
-  fail() 
-} 
+	// Case 5: Unhandled, should be detected
+	fail()
+}
 `)
 	_ = os.WriteFile(filepath.Join(tmpDir, "go.mod"), []byte("module directives\ngo 1.22\n"), 0644)
 	_ = os.WriteFile(filepath.Join(tmpDir, "main.go"), src, 0644)
