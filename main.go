@@ -65,6 +65,9 @@ func run(args []string, stdout io.Writer) error {
 		MainHandler:          cfg.MainHandler,
 		NonErrorFallback:     cfg.NonErrorFallback,
 		ErrorTemplate:        cfg.ErrorTemplate,
+		PanicToReturn:        cfg.PanicToReturn,
+		RetainPanics:         cfg.RetainPanics,
+		Recursive:            !cfg.NoRecursive, // Invert flag for runner options
 	}
 
 	// Log active modes.

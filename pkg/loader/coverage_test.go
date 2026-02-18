@@ -20,7 +20,7 @@ func TestLoadPackages_PackagesLoadError(t *testing.T) {
 		return nil, fmt.Errorf("boom")
 	}
 
-	if _, err := LoadPackages([]string{"."}, ""); err == nil {
+	if _, err := LoadPackages([]string{"."}, "", false); err == nil {
 		t.Fatal("expected error from packagesLoad")
 	}
 }
@@ -43,7 +43,7 @@ func TestLoadPackages_RecursiveError(t *testing.T) {
 		return nil, fmt.Errorf("retry failed")
 	}
 
-	if _, err := LoadPackages([]string{"."}, tmpDir); err == nil {
+	if _, err := LoadPackages([]string{"."}, tmpDir, false); err == nil {
 		t.Fatal("expected error from recursive load")
 	}
 }
@@ -63,7 +63,7 @@ func TestLoadPackages_WarnsOnPackageErrors(t *testing.T) {
 	log.SetOutput(&buf)
 	defer log.SetOutput(origOutput)
 
-	pkgs, err := LoadPackages([]string{"./..."}, "")
+	pkgs, err := LoadPackages([]string{"./..."}, "", false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -103,7 +103,7 @@ func TestLoadPackages_RecursiveSuccess(t *testing.T) {
 	log.SetOutput(&buf)
 	defer log.SetOutput(origOutput)
 
-	pkgs, err := LoadPackages([]string{".", "./pkg"}, tmpDir)
+	pkgs, err := LoadPackages([]string{".", "./pkg"}, tmpDir, false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -130,7 +130,7 @@ func TestLoadPackages_StripsCoverDir(t *testing.T) {
 		return []*packages.Package{{PkgPath: "example.com/p", GoFiles: []string{"p.go"}}}, nil
 	}
 
-	if _, err := LoadPackages([]string{"."}, ""); err != nil {
+	if _, err := LoadPackages([]string{"."}, "", false); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 

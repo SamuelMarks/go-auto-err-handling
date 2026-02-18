@@ -25,46 +25,88 @@ import (
 
 // Options configuration for the runner.
 type Options struct {
+	// EnablePreexistingErr enables fixes for functions that already return an error.
 	EnablePreexistingErr bool
+
+	// EnableNonExistingErr enables changing function signatures to add error returns.
 	EnableNonExistingErr bool
-	EnableThirdPartyErr  bool
-	EnableTestRefactor   bool
-	Check                bool
-	ExcludeGlob          []string
-	ExcludeSymbolGlob    []string
-	DryRun               bool
+
+	// EnableThirdPartyErr enables checking errors from third-party libraries.
+	EnableThirdPartyErr bool
+
+	// EnableTestRefactor allows modification of test function bodies.
+	EnableTestRefactor bool
+
+	// Check enables CI mode (exit 1 on issues).
+	Check bool
+
+	// ExcludeGlob is a list of file glob patterns to exclude.
+	ExcludeGlob []string
+
+	// ExcludeSymbolGlob is a list of symbol glob patterns to exclude.
+	ExcludeSymbolGlob []string
+
+	// DryRun enables preview mode.
+	DryRun bool
+
+	// UseDefaultExclusions applies the default list of ignored symbols.
 	UseDefaultExclusions bool
-	PanicToReturn        bool
-	RetainPanics         bool // New option
-	Paths                []string
-	MainHandler          string
-	NonErrorFallback     string
-	ErrorTemplate        string
-	Reporter             *report.Reporter
+
+	// PanicToReturn enables rewriting of explicit panic() calls.
+	PanicToReturn bool
+
+	// RetainPanics restricts panic replacement to only those wrapping errors.
+	RetainPanics bool
+
+	// Recursive enables recursive directory scanning.
+	Recursive bool
+
+	// Paths to analyze.
+	Paths []string
+
+	// MainHandler strategy for entry points.
+	MainHandler string
+
+	// NonErrorFallback strategy for functions that do not return error.
+	NonErrorFallback string
+
+	// ErrorTemplate template for return statements.
+	ErrorTemplate string
+
+	// Reporter collects statistics.
+	Reporter *report.Reporter
 }
 
 // Run executes analysis and rewrites based on the provided options.
+//
+// opts: The configuration options.
+//
+// Returns failure if analysis or rewriting fails.
 func Run(opts Options) error {
 	if opts.Check {
 		opts.DryRun = true
 	}
+
 	if opts.Reporter == nil {
 		opts.Reporter = report.New()
 	}
 
 	const maxIterations = 5
+
 	for i := 0; i < maxIterations; i++ {
 		prefix := fmt.Sprintf("[%d/%d]", i+1, maxIterations)
+
 		if opts.Check {
 			log.Printf("%s Analysis mode...", prefix)
 		} else {
 			log.Printf("%s Loading packages...", prefix)
 		}
 
-		pkgs, err := loadPackagesFn(opts.Paths, ".")
+		pkgs, err := loadPackagesFn(opts.Paths, ".", opts.Recursive)
 		if err != nil {
 			return fmt.Errorf("load failed: %w", err)
 		}
+
 		if len(pkgs) == 0 {
 			log.Println("No packages found.")
 			return nil
@@ -74,8 +116,8 @@ func Run(opts Options) error {
 		if opts.UseDefaultExclusions {
 			globs = append(globs, filter.GetDefaults()...)
 		}
-		flt := filter.New(opts.ExcludeGlob, globs)
 
+		flt := filter.New(opts.ExcludeGlob, globs)
 		registry := newInterfaceRegistryFn(pkgs)
 
 		points, err := detectFn(pkgs, flt, opts.DryRun)
@@ -126,6 +168,7 @@ func Run(opts Options) error {
 			}
 		}
 	}
+
 	return nil
 }
 
@@ -232,6 +275,8 @@ func applyRefactors(mgr *dstManager, points []analysis.InjectionPoint, opts Opti
 
 		dstFile, err := mgr.Get(p.Pkg, p.File)
 		if err != nil {
+			// If we can't get DST, we can't refactor this file.
+			// Propagate error to avoid silent failures in test mode.
 			return totalChanges, err
 		}
 
@@ -257,6 +302,7 @@ func applyRefactors(mgr *dstManager, points []analysis.InjectionPoint, opts Opti
 				if ctx.TestParam != "" {
 					injector.TestParam = ctx.TestParam
 				}
+
 				applied, err := rewriteFileFn(injector, dstFile, p.File, []analysis.InjectionPoint{p})
 				if err != nil {
 					return totalChanges, err
@@ -314,9 +360,15 @@ func applyRefactors(mgr *dstManager, points []analysis.InjectionPoint, opts Opti
 			changed, _ := addErrorToSignatureFn(p.Pkg.Fset, ctx.Decl)
 			if changed {
 				patchSignatureFn(p.Pkg.TypesInfo, ctx.Decl, fnObj.Pkg())
-				res, _ := findDstNodeFn(mgr.fset, dstFile, p.File, ctx.Decl)
-				if dstDecl, ok := res.Node.(*dst.FuncDecl); ok {
-					_, _ = addErrorToSignatureDSTFn(dstDecl)
+				res, err := findDstNodeFn(mgr.fset, dstFile, p.File, ctx.Decl)
+				if err == nil {
+					if dstDecl, ok := res.Node.(*dst.FuncDecl); ok {
+						_, _ = addErrorToSignatureDSTFn(dstDecl)
+					}
+				} else {
+					// Fallback if we can't update DST signature is tricky.
+					// If findDst fails, we likely can't rewrite body either.
+					continue
 				}
 
 				applied, err := rewriteFileFn(injector, dstFile, p.File, []analysis.InjectionPoint{p})
@@ -326,11 +378,11 @@ func applyRefactors(mgr *dstManager, points []analysis.InjectionPoint, opts Opti
 				if applied {
 					totalChanges++
 					mgr.MarkModified(p.File)
-
 					// Trigger recursive propagation
 					newObj := p.Pkg.TypesInfo.ObjectOf(ctx.Decl.Name)
 					propCount, err := propagateCallersFn([]*packages.Package{p.Pkg}, mgr, newObj, opts.MainHandler)
 					if err != nil {
+						// Return error to avoid silent failure on partial refactor.
 						return totalChanges, err
 					}
 					totalChanges += propCount
@@ -344,6 +396,7 @@ func applyRefactors(mgr *dstManager, points []analysis.InjectionPoint, opts Opti
 			_ = id
 			inj := rewrite.NewInjector(pkg, opts.ErrorTemplate, opts.MainHandler, opts.RetainPanics)
 			inj.NonErrorFallback = opts.NonErrorFallback
+
 			for _, f := range pkg.Syntax {
 				dstFile, err := mgr.Get(pkg, f)
 				if err != nil {
@@ -368,9 +421,9 @@ func isThirdParty(p analysis.InjectionPoint) bool {
 	if p.Pkg == nil || p.Pkg.TypesInfo == nil {
 		return false
 	}
-
 	info := p.Pkg.TypesInfo
 	var obj types.Object
+
 	switch fun := p.Call.Fun.(type) {
 	case *ast.Ident:
 		obj = info.ObjectOf(fun)

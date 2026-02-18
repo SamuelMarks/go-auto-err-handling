@@ -138,8 +138,8 @@ func TestRewriteDefersInDST_Skips(t *testing.T) {
 	src := `package main
 func Close() error { return nil }
 func Do() (err error) {
-	defer Close()
-	return nil
+  defer Close()
+  return nil
 }
 `
 	inj, astFile, dstFile := setupDstEnv(t, src, false)

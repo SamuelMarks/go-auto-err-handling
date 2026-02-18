@@ -35,6 +35,10 @@ type Config struct {
 	// String panics (often used for assertions/unreachable code) are preserved.
 	RetainPanics bool `name:"retain-panics" help:"If enabled, only rewrites panics that wrap errors. String panics are preserved." default:"false"`
 
+	// NoRecursive disables recursive analysis of subdirectories.
+	// By default, the tool recursively analyzes subdirectories (converting '.' to './...').
+	NoRecursive bool `name:"no-recursive" help:"Disable recursive analysis of subdirectories." default:"false"`
+
 	// Check enables CI/Linter mode.
 	// If true, the tool performs analysis and reports unhandled errors with a non-zero exit code,
 	// without modifying files. Implies --dry-run.

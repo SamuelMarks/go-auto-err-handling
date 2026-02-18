@@ -3,7 +3,7 @@ go-auto-err-handling
 
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache%202.0-blue)](https://opensource.org/license/apache-2-0)
 [![go test](https://github.com/SamuelMarks/go-auto-err-handling/actions/workflows/ci.yml/badge.svg)](https://github.com/SamuelMarks/go-auto-err-handling/actions/workflows/ci.yml)
-[![Test Coverage](https://img.shields.io/badge/test%20coverage-98.0%25-green)](https://github.com/SamuelMarks/go-auto-err-handling/actions/workflows/ci.yml)
+[![Test Coverage](https://img.shields.io/badge/test%20coverage-96.1%25-green)](https://github.com/SamuelMarks/go-auto-err-handling/actions/workflows/ci.yml)
 [![Doc Coverage](https://img.shields.io/badge/doc%20coverage-100.0%25-brightgreen)](https://github.com/SamuelMarks/go-auto-err-handling/actions/workflows/ci.yml)
 
 **go-auto-err-handling** is an advanced static analysis and refactoring tool designed to eliminate technical debt

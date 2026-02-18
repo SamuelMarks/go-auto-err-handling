@@ -17,6 +17,10 @@ import (
 // 4. Updates info.Defs to point to the new object.
 // 5. Updates info.Types map for the function type node.
 // 6. Updates info.Uses to point all existing references to the new object.
+//
+// info: The type info map to update.
+// decl: The modified function declaration AST node (must already have 'error' in results).
+// pkg: The package the function belongs to.
 func PatchSignature(info *types.Info, decl *ast.FuncDecl, pkg *types.Package) error {
 	if info == nil || decl == nil {
 		return fmt.Errorf("nil info or decl")
@@ -63,6 +67,11 @@ func PatchSignature(info *types.Info, decl *ast.FuncDecl, pkg *types.Package) er
 
 // PatchVarType manually updates the types.Info maps to reflect a change in a variable's type.
 // It constructs a new types.Var object with the updated signature and replaces references.
+//
+// info: The type info map to update.
+// ident: The identifier node of the variable.
+// newSig: The new signature to apply to the variable.
+//
 // Returns the new variable object.
 func PatchVarType(info *types.Info, ident *ast.Ident, newSig *types.Signature) (*types.Var, error) {
 	if info == nil || ident == nil {
@@ -101,6 +110,11 @@ func PatchVarType(info *types.Info, ident *ast.Ident, newSig *types.Signature) (
 }
 
 // ExtendSignatureWithError creates a new signature based on oldSig with an added 'error' return value.
+//
+// oldSig: The original signature.
+// pkg: The package context.
+//
+// Returns a new signature with extracted parameters and results, plus a trailing error return.
 func ExtendSignatureWithError(oldSig *types.Signature, pkg *types.Package) *types.Signature {
 	params := oldSig.Params()
 	oldResults := oldSig.Results()

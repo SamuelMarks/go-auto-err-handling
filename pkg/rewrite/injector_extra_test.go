@@ -10,7 +10,6 @@ import (
 
 	"github.com/SamuelMarks/go-auto-err-handling/pkg/analysis"
 	"github.com/dave/dst"
-	"github.com/dave/dst/decorator"
 	"golang.org/x/tools/go/packages"
 )
 
@@ -75,26 +74,27 @@ func TestAddImportDST(t *testing.T) {
 }
 
 func TestGenerateTerminalHandlerDST(t *testing.T) {
+	file := &dst.File{}
 	inj := &Injector{TestParam: "t"}
-	blk := inj.generateTerminalHandlerDST("err")
+	blk := inj.generateTerminalHandlerDST("err", file)
 	if len(blk.List) != 1 {
 		t.Fatal("expected one stmt for test handler")
 	}
 
 	inj = &Injector{MainHandlerStrategy: "panic"}
-	blk = inj.generateTerminalHandlerDST("err")
+	blk = inj.generateTerminalHandlerDST("err", file)
 	if len(blk.List) != 1 {
 		t.Fatal("expected panic handler")
 	}
 
 	inj = &Injector{MainHandlerStrategy: "os-exit"}
-	blk = inj.generateTerminalHandlerDST("err")
+	blk = inj.generateTerminalHandlerDST("err", file)
 	if len(blk.List) != 2 {
 		t.Fatal("expected os-exit handler with 2 stmts")
 	}
 
 	inj = &Injector{MainHandlerStrategy: "log-fatal"}
-	blk = inj.generateTerminalHandlerDST("err")
+	blk = inj.generateTerminalHandlerDST("err", file)
 	if len(blk.List) != 1 {
 		t.Fatal("expected log-fatal handler")
 	}
@@ -131,23 +131,23 @@ func TestIsCallEmbeddedInComposite(t *testing.T) {
 
 func TestGetScopeContextLoopAndSupport(t *testing.T) {
 	src := `package main
-func sub() error { return nil }
-func subLit() error { return nil }
-var _ = func() error { subLit(); return nil }
-func plain() { sub() }
-func run() error {
-	for {
-		sub()
-		break
-	}
-	return nil
-}
-func runRange() error {
-	for range []int{1} {
-		sub()
-	}
-	return nil
-}
+func sub() error { return nil } 
+func subLit() error { return nil } 
+var _ = func() error { subLit(); return nil } 
+func plain() { sub() } 
+func run() error { 
+  for { 
+    sub() 
+    break
+  } 
+  return nil
+} 
+func runRange() error { 
+  for range []int{1} { 
+    sub() 
+  } 
+  return nil
+} 
 `
 	inj, _, astFile := setupInjectorTest(t, src)
 	ptLoop := findPointCtx(t, astFile, "run", "sub")
@@ -205,12 +205,12 @@ func TestSignaturesMatch(t *testing.T) {
 	}
 
 	src := `package main
-func a() error { return nil }
-func b() (int, error) { return 0, nil }
-func c() int { return 0 }
-func g() error { return a() }
-func h() (int, error) { return b() }
-func k() int { return c() }
+func a() error { return nil } 
+func b() (int, error) { return 0, nil } 
+func c() int { return 0 } 
+func g() error { return a() } 
+func h() (int, error) { return b() } 
+func k() int { return c() } 
 `
 	inj, _, astFile := setupInjectorTest(t, src)
 	callA := findCallInNode(astFile, "a")
@@ -282,7 +282,7 @@ func TestGenerateZeroReturns(t *testing.T) {
 
 	// Scope-aware generation
 	src := `package main
-func f() error { return nil }
+func f() error { return nil } 
 `
 	inj2, _, astFile := setupInjectorTest(t, src)
 	pt := analysis.InjectionPoint{File: astFile, Pos: astFile.Decls[0].Pos()}
@@ -307,10 +307,10 @@ func TestGenerateAssignmentDST(t *testing.T) {
 	}
 
 	src := `package main
-func f() (int, error) { return 0, nil }
-func g() error { var err error; s := struct{ X int }{}; s.X, err = f(); _ = err; return nil }
-func g2() error { var x int; var err error; x, err = f(); _ = x; _ = err; return nil }
-func h() error { f(); return nil }
+func f() (int, error) { return 0, nil } 
+func g() error { var err error; s := struct{ X int }{}; s.X, err = f(); _ = err; return nil } 
+func g2() error { var x int; var err error; x, err = f(); _ = x; _ = err; return nil } 
+func h() error { f(); return nil } 
 `
 	inj, _, astFile := setupInjectorTest(t, src)
 
@@ -402,8 +402,8 @@ func h() error { f(); return nil }
 
 func TestGenerateNonErrorFallbackDST(t *testing.T) {
 	src := `package main
-func f() error { return nil }
-func g() { f() }
+func f() error { return nil } 
+func g() { f() } 
 `
 	inj, dstFile, astFile := setupInjectorTest(t, src)
 	pt := findPointCtx(t, astFile, "g", "f")
@@ -470,8 +470,8 @@ func g() { f() }
 
 func TestGenerateLogRewriteDST(t *testing.T) {
 	src := `package main
-func f() error { return nil }
-func g() { f() }
+func f() error { return nil } 
+func g() { f() } 
 `
 	inj, dstFile, astFile := setupInjectorTest(t, src)
 	pt := findPointCtx(t, astFile, "g", "f")
@@ -483,11 +483,11 @@ func g() { f() }
 
 func TestGenerateRewriteDST(t *testing.T) {
 	src := `package main
-func sub() error { return nil }
-func sub2() (int, error) { return 0, nil }
-func tail() error { sub(); return nil }
-func loop() error { for { sub(); break }; return nil }
-func noerr() { sub() }
+func sub() error { return nil } 
+func sub2() (int, error) { return 0, nil } 
+func tail() error { sub(); return nil } 
+func loop() error { for { sub(); break }; return nil } 
+func noerr() { sub() } 
 `
 	inj, dstFile, astFile := setupInjectorTest(t, src)
 	origAssign := generateAssignmentDSTFunc
@@ -498,21 +498,21 @@ func noerr() { sub() }
 	})
 
 	// Early return when signature doesn't support error
-	if stmts, err := inj.generateRewriteDST(analysis.InjectionPoint{}, &dst.ExprStmt{}, nil, nil, nil, true, true); err != nil || len(stmts) != 0 {
+	if stmts, err := inj.generateRewriteDST(analysis.InjectionPoint{}, &dst.ExprStmt{}, nil, nil, nil, true, true, nil); err != nil || len(stmts) != 0 {
 		t.Fatal("expected no rewrite for non-error signature")
 	}
 
 	// Error when no call in statement
 	ptTail := findPointCtx(t, astFile, "tail", "sub")
 	resStmt, _ := FindDstNode(inj.Fset, dstFile, astFile, ptTail.Stmt)
-	if _, err := inj.generateRewriteDST(ptTail, &dst.ReturnStmt{}, nil, types.NewSignatureType(nil, nil, nil, nil, types.NewTuple(types.NewVar(token.NoPos, nil, "", types.Universe.Lookup("error").Type())), false), nil, true, true); err == nil {
+	if _, err := inj.generateRewriteDST(ptTail, &dst.ReturnStmt{}, nil, types.NewSignatureType(nil, nil, nil, nil, types.NewTuple(types.NewVar(token.NoPos, nil, "", types.Universe.Lookup("error").Type())), false), nil, true, true, dstFile); err == nil {
 		t.Fatal("expected error for missing call")
 	}
 
 	// Tail optimization
 	resCall, _ := FindDstNode(inj.Fset, dstFile, astFile, ptTail.Call)
 	ctx := inj.getEnclosingContext(ptTail)
-	stmts, err := inj.generateRewriteDST(ptTail, resStmt.Node.(dst.Stmt), resCall.Node.(*dst.CallExpr), ctx.sig, ctx.decl, true, true)
+	stmts, err := inj.generateRewriteDST(ptTail, resStmt.Node.(dst.Stmt), resCall.Node.(*dst.CallExpr), ctx.sig, ctx.decl, true, true, dstFile)
 	if err != nil || len(stmts) != 1 {
 		t.Fatalf("expected tail optimization, err=%v", err)
 	}
@@ -525,7 +525,7 @@ func noerr() { sub() }
 	resStmt, _ = FindDstNode(inj.Fset, dstFile, astFile, ptLoop.Stmt)
 	resCall, _ = FindDstNode(inj.Fset, dstFile, astFile, ptLoop.Call)
 	ctx = inj.getEnclosingContext(ptLoop)
-	stmts, err = inj.generateRewriteDST(ptLoop, resStmt.Node.(dst.Stmt), resCall.Node.(*dst.CallExpr), ctx.sig, ctx.decl, true, true)
+	stmts, err = inj.generateRewriteDST(ptLoop, resStmt.Node.(dst.Stmt), resCall.Node.(*dst.CallExpr), ctx.sig, ctx.decl, true, true, dstFile)
 	if err != nil || len(stmts) == 0 {
 		t.Fatalf("expected rewrite in loop, err=%v", err)
 	}
@@ -535,15 +535,15 @@ func noerr() { sub() }
 
 	// TestParam path
 	inj.TestParam = "t"
-	stmts, err = inj.generateRewriteDST(ptTail, resStmt.Node.(dst.Stmt), resCall.Node.(*dst.CallExpr), ctx.sig, ctx.decl, false, false)
+	stmts, err = inj.generateRewriteDST(ptTail, resStmt.Node.(dst.Stmt), resCall.Node.(*dst.CallExpr), ctx.sig, ctx.decl, false, false, dstFile)
 	if err != nil || len(stmts) == 0 {
 		t.Fatal("expected rewrite with TestParam")
 	}
 	inj.TestParam = ""
 
 	// RenderTemplate error
-	inj.ErrorTemplate = "{return-zero}, )"
-	if _, err := inj.generateRewriteDST(ptTail, resStmt.Node.(dst.Stmt), resCall.Node.(*dst.CallExpr), ctx.sig, ctx.decl, true, false); err == nil {
+	inj.ErrorTemplate = "{{"
+	if _, err := inj.generateRewriteDST(ptTail, resStmt.Node.(dst.Stmt), resCall.Node.(*dst.CallExpr), ctx.sig, ctx.decl, true, false, dstFile); err == nil {
 		t.Fatal("expected template error")
 	}
 	inj.ErrorTemplate = ""
@@ -552,7 +552,7 @@ func noerr() { sub() }
 	resolveErrorVarFunc = func(_ *Injector, _ analysis.InjectionPoint, _ *types.Scope) (string, token.Token, *dst.DeclStmt) {
 		return "err", token.DEFINE, &dst.DeclStmt{Decl: &dst.GenDecl{Tok: token.VAR}}
 	}
-	stmts, err = inj.generateRewriteDST(ptTail, resStmt.Node.(dst.Stmt), resCall.Node.(*dst.CallExpr), ctx.sig, ctx.decl, false, false)
+	stmts, err = inj.generateRewriteDST(ptTail, resStmt.Node.(dst.Stmt), resCall.Node.(*dst.CallExpr), ctx.sig, ctx.decl, false, false, dstFile)
 	if err != nil || len(stmts) < 2 {
 		t.Fatal("expected declStmt in rewrite")
 	}
@@ -562,7 +562,7 @@ func noerr() { sub() }
 	generateAssignmentDSTFunc = func(_ *Injector, _ analysis.InjectionPoint, _ *dst.CallExpr, _ string, _ token.Token) (dst.Stmt, error) {
 		return &dst.ExprStmt{X: dst.NewIdent("noop")}, nil
 	}
-	stmts, err = inj.generateRewriteDST(ptTail, resStmt.Node.(dst.Stmt), resCall.Node.(*dst.CallExpr), ctx.sig, ctx.decl, true, false)
+	stmts, err = inj.generateRewriteDST(ptTail, resStmt.Node.(dst.Stmt), resCall.Node.(*dst.CallExpr), ctx.sig, ctx.decl, true, false, dstFile)
 	if err != nil || len(stmts) < 2 {
 		t.Fatal("expected non-assign path")
 	}
@@ -572,7 +572,7 @@ func noerr() { sub() }
 	generateAssignmentDSTFunc = func(_ *Injector, _ analysis.InjectionPoint, _ *dst.CallExpr, _ string, _ token.Token) (dst.Stmt, error) {
 		return nil, errors.New("boom")
 	}
-	if _, err := inj.generateRewriteDST(ptTail, resStmt.Node.(dst.Stmt), resCall.Node.(*dst.CallExpr), ctx.sig, ctx.decl, true, false); err == nil {
+	if _, err := inj.generateRewriteDST(ptTail, resStmt.Node.(dst.Stmt), resCall.Node.(*dst.CallExpr), ctx.sig, ctx.decl, true, false, dstFile); err == nil {
 		t.Fatal("expected assignment error")
 	}
 	generateAssignmentDSTFunc = origAssign
@@ -582,26 +582,36 @@ func noerr() { sub() }
 		types.NewVar(token.NoPos, nil, "", types.NewTuple(types.NewVar(token.NoPos, nil, "", types.Typ[types.Int]))),
 		types.NewVar(token.NoPos, nil, "", types.Universe.Lookup("error").Type()),
 	), false)
-	if _, err := inj.generateRewriteDST(ptTail, resStmt.Node.(dst.Stmt), resCall.Node.(*dst.CallExpr), badSig, nil, true, false); err == nil {
+	if _, err := inj.generateRewriteDST(ptTail, resStmt.Node.(dst.Stmt), resCall.Node.(*dst.CallExpr), badSig, nil, true, false, dstFile); err == nil {
 		t.Fatal("expected generateZeroReturns error")
 	}
 }
 
 func TestGenerateGoRewriteDST(t *testing.T) {
 	src := `package main
-func task() error { return nil }
-func main() { go task() }
+func task() error { return nil } 
+func main() { go task() } 
 `
 	inj, dstFile, astFile := setupInjectorTest(t, src)
 	pt := findPointCtx(t, astFile, "main", "task")
 	resStmt, _ := FindDstNode(inj.Fset, dstFile, astFile, pt.Stmt)
 	goStmt := resStmt.Node.(*dst.GoStmt)
 
-	if _, err := inj.generateGoRewriteDST(pt, goStmt, nil); err != nil {
+	// IMPORTANT: Resolve the call node before generating the rewrite.
+	// generateGoRewriteDST uses addImportDST internally which mutates dstFile.Decls,
+	// potentially invalidating AST-based index lookups used by FindDstNode if done afterwards.
+	resCall, err := FindDstNode(inj.Fset, dstFile, astFile, pt.Call)
+	if err != nil {
+		t.Fatalf("findDstNode error: %v", err)
+	}
+	if resCall.Node == nil {
+		t.Fatalf("findDstNode failed to return node result")
+	}
+
+	if _, err := inj.generateGoRewriteDST(pt, goStmt, nil, dstFile); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	resCall, _ := FindDstNode(inj.Fset, dstFile, astFile, pt.Call)
-	if _, err := inj.generateGoRewriteDST(pt, goStmt, resCall.Node.(*dst.CallExpr)); err != nil {
+	if _, err := inj.generateGoRewriteDST(pt, goStmt, resCall.Node.(*dst.CallExpr), dstFile); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
@@ -610,24 +620,24 @@ func main() { go task() }
 	generateAssignmentDSTFunc = func(_ *Injector, _ analysis.InjectionPoint, _ *dst.CallExpr, _ string, _ token.Token) (dst.Stmt, error) {
 		return nil, errors.New("boom")
 	}
-	if _, err := inj.generateGoRewriteDST(pt, goStmt, resCall.Node.(*dst.CallExpr)); err == nil {
+	if _, err := inj.generateGoRewriteDST(pt, goStmt, resCall.Node.(*dst.CallExpr), dstFile); err == nil {
 		t.Fatal("expected assignment error")
 	}
 }
 
 func TestTryLiftControls(t *testing.T) {
 	src := `package main
-func fail() error { return nil }
-func initCall() error { return nil }
-func iface() interface{} { return nil }
-func runIf() error { if x := fail(); x != nil { return nil }; return nil }
-func runIfCond() error { if fail() != nil { return nil }; return nil }
-func runSwitch() error { switch x := fail(); x { default: }; return nil }
-func runSwitchTag() error { switch fail() { default: }; return nil }
-func runType() error { switch v := iface().(type) { default: _ = v }; return nil }
-func runTypeExpr() error { switch iface().(type) { default: }; return nil }
-func runTypeInit() error { switch initCall(); v := iface().(type) { default: _ = v }; return nil }
-func runTypeInitAssign() error { switch v := initCall(); x := iface().(type) { default: _ = v; _ = x }; return nil }
+func fail() error { return nil } 
+func initCall() error { return nil } 
+func iface() interface{} { return nil } 
+func runIf() error { if x := fail(); x != nil { return nil }; return nil } 
+func runIfCond() error { if fail() != nil { return nil }; return nil } 
+func runSwitch() error { switch x := fail(); x { default: }; return nil } 
+func runSwitchTag() error { switch fail() { default: }; return nil } 
+func runType() error { switch v := iface().(type) { default: _ = v }; return nil } 
+func runTypeExpr() error { switch iface().(type) { default: }; return nil } 
+func runTypeInit() error { switch initCall(); v := iface().(type) { default: _ = v }; return nil } 
+func runTypeInitAssign() error { switch v := initCall(); x := iface().(type) { default: _ = v; _ = x }; return nil } 
 `
 	inj, dstFile, astFile := setupInjectorTest(t, src)
 
@@ -636,7 +646,7 @@ func runTypeInitAssign() error { switch v := initCall(); x := iface().(type) { d
 	resStmt, _ := FindDstNode(inj.Fset, dstFile, astFile, pt.Stmt)
 	resCall, _ := FindDstNode(inj.Fset, dstFile, astFile, pt.Call)
 	entry := targetEntry{point: pt, dstStmt: resStmt.Node.(dst.Stmt), dstCall: resCall.Node.(*dst.CallExpr)}
-	if handled, _, err := inj.tryLiftIf(resStmt.Node.(*dst.IfStmt), entry, astFile); err != nil || !handled {
+	if handled, _, err := inj.tryLiftIf(resStmt.Node.(*dst.IfStmt), entry, astFile, dstFile); err != nil || !handled {
 		t.Fatal("expected if init lift")
 	}
 
@@ -645,7 +655,7 @@ func runTypeInitAssign() error { switch v := initCall(); x := iface().(type) { d
 	resStmt, _ = FindDstNode(inj.Fset, dstFile, astFile, pt.Stmt)
 	resCall, _ = FindDstNode(inj.Fset, dstFile, astFile, pt.Call)
 	entry = targetEntry{point: pt, dstStmt: resStmt.Node.(dst.Stmt), dstCall: resCall.Node.(*dst.CallExpr)}
-	if handled, _, err := inj.tryLiftIf(resStmt.Node.(*dst.IfStmt), entry, astFile); err != nil || !handled {
+	if handled, _, err := inj.tryLiftIf(resStmt.Node.(*dst.IfStmt), entry, astFile, dstFile); err != nil || !handled {
 		t.Fatal("expected if cond lift")
 	}
 
@@ -654,7 +664,7 @@ func runTypeInitAssign() error { switch v := initCall(); x := iface().(type) { d
 	resStmt, _ = FindDstNode(inj.Fset, dstFile, astFile, pt.Stmt)
 	resCall, _ = FindDstNode(inj.Fset, dstFile, astFile, pt.Call)
 	entry = targetEntry{point: pt, dstStmt: resStmt.Node.(dst.Stmt), dstCall: resCall.Node.(*dst.CallExpr)}
-	if handled, _, err := inj.tryLiftSwitch(resStmt.Node.(*dst.SwitchStmt), entry, astFile); err != nil || !handled {
+	if handled, _, err := inj.tryLiftSwitch(resStmt.Node.(*dst.SwitchStmt), entry, astFile, dstFile); err != nil || !handled {
 		t.Fatal("expected switch init lift")
 	}
 
@@ -663,7 +673,7 @@ func runTypeInitAssign() error { switch v := initCall(); x := iface().(type) { d
 	resStmt, _ = FindDstNode(inj.Fset, dstFile, astFile, pt.Stmt)
 	resCall, _ = FindDstNode(inj.Fset, dstFile, astFile, pt.Call)
 	entry = targetEntry{point: pt, dstStmt: resStmt.Node.(dst.Stmt), dstCall: resCall.Node.(*dst.CallExpr)}
-	if handled, _, err := inj.tryLiftSwitch(resStmt.Node.(*dst.SwitchStmt), entry, astFile); err != nil || !handled {
+	if handled, _, err := inj.tryLiftSwitch(resStmt.Node.(*dst.SwitchStmt), entry, astFile, dstFile); err != nil || !handled {
 		t.Fatal("expected switch tag lift")
 	}
 
@@ -672,7 +682,7 @@ func runTypeInitAssign() error { switch v := initCall(); x := iface().(type) { d
 	resStmt, _ = FindDstNode(inj.Fset, dstFile, astFile, pt.Stmt)
 	resCall, _ = FindDstNode(inj.Fset, dstFile, astFile, pt.Call)
 	entry = targetEntry{point: pt, dstStmt: resStmt.Node.(dst.Stmt), dstCall: resCall.Node.(*dst.CallExpr)}
-	if handled, _, err := inj.tryLiftTypeSwitch(resStmt.Node.(*dst.TypeSwitchStmt), entry, astFile); err != nil || !handled {
+	if handled, _, err := inj.tryLiftTypeSwitch(resStmt.Node.(*dst.TypeSwitchStmt), entry, astFile, dstFile); err != nil || !handled {
 		t.Fatal("expected type switch assign lift")
 	}
 
@@ -681,7 +691,7 @@ func runTypeInitAssign() error { switch v := initCall(); x := iface().(type) { d
 	resStmt, _ = FindDstNode(inj.Fset, dstFile, astFile, pt.Stmt)
 	resCall, _ = FindDstNode(inj.Fset, dstFile, astFile, pt.Call)
 	entry = targetEntry{point: pt, dstStmt: resStmt.Node.(dst.Stmt), dstCall: resCall.Node.(*dst.CallExpr)}
-	if handled, _, err := inj.tryLiftTypeSwitch(resStmt.Node.(*dst.TypeSwitchStmt), entry, astFile); err != nil || !handled {
+	if handled, _, err := inj.tryLiftTypeSwitch(resStmt.Node.(*dst.TypeSwitchStmt), entry, astFile, dstFile); err != nil || !handled {
 		t.Fatal("expected type switch expr lift")
 	}
 
@@ -690,7 +700,7 @@ func runTypeInitAssign() error { switch v := initCall(); x := iface().(type) { d
 	resStmt, _ = FindDstNode(inj.Fset, dstFile, astFile, pt.Stmt)
 	resCall, _ = FindDstNode(inj.Fset, dstFile, astFile, pt.Call)
 	entry = targetEntry{point: pt, dstStmt: resStmt.Node.(dst.Stmt), dstCall: resCall.Node.(*dst.CallExpr)}
-	if handled, _, err := inj.tryLiftTypeSwitch(resStmt.Node.(*dst.TypeSwitchStmt), entry, astFile); err != nil || !handled {
+	if handled, _, err := inj.tryLiftTypeSwitch(resStmt.Node.(*dst.TypeSwitchStmt), entry, astFile, dstFile); err != nil || !handled {
 		t.Fatal("expected type switch init lift")
 	}
 
@@ -699,25 +709,25 @@ func runTypeInitAssign() error { switch v := initCall(); x := iface().(type) { d
 	resStmt, _ = FindDstNode(inj.Fset, dstFile, astFile, pt.Stmt)
 	resCall, _ = FindDstNode(inj.Fset, dstFile, astFile, pt.Call)
 	entry = targetEntry{point: pt, dstStmt: resStmt.Node.(dst.Stmt), dstCall: resCall.Node.(*dst.CallExpr)}
-	if handled, _, err := inj.tryLiftTypeSwitch(resStmt.Node.(*dst.TypeSwitchStmt), entry, astFile); err != nil || !handled {
+	if handled, _, err := inj.tryLiftTypeSwitch(resStmt.Node.(*dst.TypeSwitchStmt), entry, astFile, dstFile); err != nil || !handled {
 		t.Fatal("expected type switch init assign lift")
 	}
 
 	// Early returns
-	if handled, _, err := inj.tryLiftIf(&dst.IfStmt{}, targetEntry{}, astFile); err != nil || handled {
+	if handled, _, err := inj.tryLiftIf(&dst.IfStmt{}, targetEntry{}, astFile, dstFile); err != nil || handled {
 		t.Fatal("expected no lift for empty if entry")
 	}
-	if handled, _, err := inj.tryLiftSwitch(&dst.SwitchStmt{}, targetEntry{}, astFile); err != nil || handled {
+	if handled, _, err := inj.tryLiftSwitch(&dst.SwitchStmt{}, targetEntry{}, astFile, dstFile); err != nil || handled {
 		t.Fatal("expected no lift for empty switch entry")
 	}
-	if handled, _, err := inj.tryLiftTypeSwitch(&dst.TypeSwitchStmt{}, targetEntry{}, astFile); err != nil || handled {
+	if handled, _, err := inj.tryLiftTypeSwitch(&dst.TypeSwitchStmt{}, targetEntry{}, astFile, dstFile); err != nil || handled {
 		t.Fatal("expected no lift for empty type switch entry")
 	}
 }
 
 func TestLiftTypeSwitchAssign_Errors(t *testing.T) {
 	inj := &Injector{}
-	if _, err := inj.liftTypeSwitchAssign(&dst.TypeSwitchStmt{}, targetEntry{}, nil); err == nil {
+	if _, err := inj.liftTypeSwitchAssign(&dst.TypeSwitchStmt{}, targetEntry{}, nil, nil); err == nil {
 		t.Fatal("expected error for nil dstCall")
 	}
 	// Force fallback inspect path (assign not a type assert)
@@ -729,14 +739,14 @@ func TestLiftTypeSwitchAssign_Errors(t *testing.T) {
 	inj.Pkg = &packages.Package{TypesInfo: &types.Info{Types: map[ast.Expr]types.TypeAndValue{}, Defs: map[*ast.Ident]types.Object{}, Uses: map[*ast.Ident]types.Object{}, Scopes: map[ast.Node]*types.Scope{}}}
 	entry := targetEntry{point: analysis.InjectionPoint{File: astFile, Pos: astFile.Pos()}, dstCall: &dst.CallExpr{Fun: dst.NewIdent("iface")}}
 	ts := &dst.TypeSwitchStmt{Assign: &dst.ExprStmt{X: dst.NewIdent("x")}}
-	if _, err := inj.liftTypeSwitchAssign(ts, entry, astFile); err != nil {
+	if _, err := inj.liftTypeSwitchAssign(ts, entry, astFile, nil); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
 
 func TestLiftControlInitAndExpr_Errors(t *testing.T) {
 	inj := &Injector{}
-	if _, err := inj.liftControlInit(&dst.IfStmt{}, &dst.AssignStmt{}, targetEntry{}, nil); err == nil {
+	if _, err := inj.liftControlInit(&dst.IfStmt{}, &dst.AssignStmt{}, targetEntry{}, nil, nil); err == nil {
 		t.Fatal("expected error for nil dstCall")
 	}
 
@@ -747,15 +757,15 @@ func TestLiftControlInitAndExpr_Errors(t *testing.T) {
 	}
 	inj.Pkg = &packages.Package{TypesInfo: &types.Info{Types: map[ast.Expr]types.TypeAndValue{}, Defs: map[*ast.Ident]types.Object{}, Uses: map[*ast.Ident]types.Object{}, Scopes: map[ast.Node]*types.Scope{}}}
 	entry := targetEntry{point: analysis.InjectionPoint{File: astFile, Pos: astFile.Pos()}}
-	if _, err := inj.liftControlExpr(&dst.IfStmt{}, dst.NewIdent("x"), entry, "cond", astFile, func(dst.Node, dst.Expr) {}); err == nil {
+	if _, err := inj.liftControlExpr(&dst.IfStmt{}, dst.NewIdent("x"), entry, "cond", astFile, nil, func(dst.Node, dst.Expr) {}); err == nil {
 		t.Fatal("expected error for nil dstCall in cond")
 	}
 }
 
 func TestLiftControlExpr_Tuple(t *testing.T) {
 	src := `package main
-func val() (int, error) { return 0, nil }
-func run() { _, _ = val() }
+func val() (int, error) { return 0, nil } 
+func run() { _, _ = val() } 
 `
 	inj, dstFile, astFile := setupInjectorTest(t, src)
 	pt := findPointCtx(t, astFile, "run", "val")
@@ -763,7 +773,7 @@ func run() { _, _ = val() }
 	entry := targetEntry{point: pt, dstCall: resCall.Node.(*dst.CallExpr)}
 	ctrl := &dst.IfStmt{Cond: dst.NewIdent("cond"), Body: &dst.BlockStmt{}}
 	inj.TestParam = "t"
-	if _, err := inj.liftControlExpr(ctrl, ctrl.Cond, entry, "val", astFile, func(n dst.Node, e dst.Expr) {
+	if _, err := inj.liftControlExpr(ctrl, ctrl.Cond, entry, "val", astFile, dstFile, func(n dst.Node, e dst.Expr) {
 		n.(*dst.IfStmt).Cond = e
 	}); err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -773,9 +783,9 @@ func run() { _, _ = val() }
 
 func TestLiftCompositeLit_ErrorsAndAssign(t *testing.T) {
 	src := `package main
-func fail() error { return nil }
-type S struct { F error }
-func run() error { x := S{ F: fail() }; _ = x; return nil }
+func fail() error { return nil } 
+type S struct { F error } 
+func run() error { x := S{ F: fail() }; _ = x; return nil } 
 `
 	build := func() (*Injector, dst.Stmt, targetEntry, *ast.File) {
 		inj, dstFile, astFile := setupInjectorTest(t, src)
@@ -805,18 +815,18 @@ func run() error { x := S{ F: fail() }; _ = x; return nil }
 
 	// normal path with TestParam
 	inj.TestParam = "t"
-	if _, err := inj.liftCompositeLit(assignStmt, entry, astFile); err != nil {
+	if _, err := inj.liftCompositeLit(assignStmt, entry, astFile, &dst.File{}); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	inj.TestParam = ""
 
 	// nil dstCall
-	if _, err := inj.liftCompositeLit(assignStmt, targetEntry{}, astFile); err == nil {
+	if _, err := inj.liftCompositeLit(assignStmt, targetEntry{}, astFile, nil); err == nil {
 		t.Fatal("expected error for nil dstCall")
 	}
 
 	// call not in composite -> error
-	if _, err := inj.liftCompositeLit(&dst.ExprStmt{X: dst.NewIdent("x")}, entry, astFile); err == nil {
+	if _, err := inj.liftCompositeLit(&dst.ExprStmt{X: dst.NewIdent("x")}, entry, astFile, nil); err == nil {
 		t.Fatal("expected error for missing call in composite")
 	}
 
@@ -827,7 +837,7 @@ func run() error { x := S{ F: fail() }; _ = x; return nil }
 	resolveErrorVarFunc = func(_ *Injector, _ analysis.InjectionPoint, _ *types.Scope) (string, token.Token, *dst.DeclStmt) {
 		return "err", token.ASSIGN, nil
 	}
-	if _, err := inj2.liftCompositeLit(assignStmt2, entry2, astFile2); err != nil {
+	if _, err := inj2.liftCompositeLit(assignStmt2, entry2, astFile2, &dst.File{}); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	resolveErrorVarFunc = origResolve
@@ -837,417 +847,27 @@ func run() error { x := S{ F: fail() }; _ = x; return nil }
 	resolveErrorVarFunc = func(_ *Injector, _ analysis.InjectionPoint, _ *types.Scope) (string, token.Token, *dst.DeclStmt) {
 		return "err", token.DEFINE, &dst.DeclStmt{Decl: &dst.GenDecl{Tok: token.VAR}}
 	}
-	if _, err := inj3.liftCompositeLit(assignStmt3, entry3, astFile3); err != nil {
+	if _, err := inj3.liftCompositeLit(assignStmt3, entry3, astFile3, &dst.File{}); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	resolveErrorVarFunc = origResolve
 }
 
-func TestResolveErrorVar_Branches(t *testing.T) {
-	inj := &Injector{}
-	assign := &ast.AssignStmt{Lhs: []ast.Expr{ast.NewIdent("x"), ast.NewIdent("custom")}, Tok: token.DEFINE}
-	name, tok, _ := inj.resolveErrorVar(analysis.InjectionPoint{Assign: assign}, nil)
-	if name != "custom" || tok != token.DEFINE {
-		t.Fatal("expected assign name return")
-	}
-
-	// scope nil
-	name, tok, _ = inj.resolveErrorVar(analysis.InjectionPoint{}, nil)
-	if name != "err" || tok != token.DEFINE {
-		t.Fatal("expected default err define")
-	}
-
-	// obj nil
-	scope := types.NewScope(nil, token.NoPos, token.NoPos, "")
-	name, tok, _ = inj.resolveErrorVar(analysis.InjectionPoint{Pos: token.Pos(10)}, scope)
-	if name != "err" || tok != token.DEFINE {
-		t.Fatal("expected define for missing obj")
-	}
-
-	// global
-	pkgTypes := types.NewPackage("p", "p")
-	gobj := types.NewVar(token.NoPos, pkgTypes, "err", types.Typ[types.Int])
-	pkgTypes.Scope().Insert(gobj)
-	inj.Pkg = &packages.Package{Types: pkgTypes}
-	name, tok, _ = inj.resolveErrorVar(analysis.InjectionPoint{Pos: token.Pos(10)}, pkgTypes.Scope())
-	if tok != token.DEFINE {
-		t.Fatal("expected define for global")
-	}
-
-	// global via Universe parent with no package
-	uniParent := types.NewScope(types.Universe, token.NoPos, token.NoPos, "")
-	uobj := types.NewVar(token.NoPos, nil, "err", types.Typ[types.Int])
-	uniParent.Insert(uobj)
-	inj.Pkg = nil
-	name, tok, _ = inj.resolveErrorVar(analysis.InjectionPoint{Pos: token.Pos(10)}, uniParent)
-	if tok != token.DEFINE {
-		t.Fatal("expected define for universe global")
-	}
-
-	// in-scope
-	inj.Pkg = nil
-	localScope := types.NewScope(nil, token.NoPos, token.NoPos, "")
-	lobj := types.NewVar(token.NoPos, nil, "err", types.Typ[types.Int])
-	localScope.Insert(lobj)
-	name, tok, _ = inj.resolveErrorVar(analysis.InjectionPoint{Pos: token.Pos(10)}, localScope)
-	if tok != token.ASSIGN {
-		t.Fatal("expected assign for in-scope")
-	}
-
-	// used after
-	parent := types.NewScope(nil, token.NoPos, token.NoPos, "")
-	pobj := types.NewVar(token.NoPos, nil, "err", types.Typ[types.Int])
-	parent.Insert(pobj)
-	child := types.NewScope(parent, token.NoPos, token.NoPos, "")
-	info := &types.Info{Uses: map[*ast.Ident]types.Object{}}
-	id := ast.NewIdent("err")
-	id.NamePos = token.Pos(20)
-	info.Uses[id] = pobj
-	inj.Pkg = &packages.Package{TypesInfo: info}
-	name, tok, _ = inj.resolveErrorVar(analysis.InjectionPoint{Pos: token.Pos(10)}, child)
-	if tok != token.ASSIGN {
-		t.Fatal("expected assign for used-after")
-	}
-
-	// default define when not used after
-	info2 := &types.Info{Uses: map[*ast.Ident]types.Object{}}
-	inj.Pkg = &packages.Package{TypesInfo: info2}
-	name, tok, _ = inj.resolveErrorVar(analysis.InjectionPoint{Pos: token.Pos(10)}, child)
-	if tok != token.DEFINE {
-		t.Fatal("expected define for default case")
-	}
-
-	inj.Pkg = nil
-	if inj.isVarUsedAfter(pobj, token.Pos(10)) {
-		t.Fatal("expected false when package info missing")
-	}
-}
-
-func TestRewriteFile_EdgeBranches(t *testing.T) {
-	src := `package main
-func fail() error { return nil }
-func f() { fail() }
-`
-	inj, dstFile, astFile := setupInjectorTest(t, src)
-
-	// nil stmt point -> targetMap empty
-	changed, err := inj.RewriteFile(dstFile, astFile, []analysis.InjectionPoint{{}})
-	if err != nil || changed {
-		t.Fatal("expected no change for empty point")
-	}
-
-	// defer point skipped
-	pt := analysis.InjectionPoint{Stmt: &ast.DeferStmt{Call: &ast.CallExpr{Fun: ast.NewIdent("fail")}}, File: astFile}
-	changed, err = inj.RewriteFile(dstFile, astFile, []analysis.InjectionPoint{pt})
-	if err != nil || changed {
-		t.Fatal("expected no change for defer point")
-	}
-
-	// FindDstNode error path
-	ptBad := analysis.InjectionPoint{Stmt: &ast.ExprStmt{X: &ast.BasicLit{Kind: token.INT, Value: "1"}}, File: &ast.File{}}
-	changed, err = inj.RewriteFile(dstFile, astFile, []analysis.InjectionPoint{ptBad})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	_ = changed
-}
-
-func TestRewriteFile_ErrorBranches(t *testing.T) {
-	t.Run("deferErr", func(t *testing.T) {
-		src := `package main
-func f() error { return nil }
-func g() { f() }
-`
-		inj, dstFile, _ := setupInjectorTest(t, src)
-		if _, err := inj.RewriteFile(dstFile, nil, nil); err == nil {
-			t.Fatal("expected RewriteDefers error")
-		}
-	})
-
-	t.Run("dstStmtNotOk", func(t *testing.T) {
-		src := `package main
-func f() error { return nil }
-func g() { f() }
-`
-		inj, dstFile, astFile := setupInjectorTest(t, src)
-		pt := findPointCtx(t, astFile, "g", "f")
-		origFind := findDstNodeFunc
-		t.Cleanup(func() { findDstNodeFunc = origFind })
-		findDstNodeFunc = func(_ *token.FileSet, _ *dst.File, _ *ast.File, _ ast.Node) (DstMapResult, error) {
-			return DstMapResult{Node: dst.NewIdent("x")}, nil
-		}
-		changed, err := inj.RewriteFile(dstFile, astFile, []analysis.InjectionPoint{pt})
-		if err != nil || changed {
-			t.Fatal("expected no change for non-stmt mapping")
-		}
-	})
-
-	t.Run("genErr", func(t *testing.T) {
-		src := `package main
-func f() error { return nil }
-func g() error { f(); f(); return nil }
-`
-		inj, dstFile, astFile := setupInjectorTest(t, src)
-		pt := findPointCtx(t, astFile, "g", "f")
-		origAssign := generateAssignmentDSTFunc
-		t.Cleanup(func() { generateAssignmentDSTFunc = origAssign })
-		generateAssignmentDSTFunc = func(_ *Injector, _ analysis.InjectionPoint, _ *dst.CallExpr, _ string, _ token.Token) (dst.Stmt, error) {
-			return nil, errors.New("boom")
-		}
-		if _, err := inj.RewriteFile(dstFile, astFile, []analysis.InjectionPoint{pt}); err == nil {
-			t.Fatal("expected generateRewriteDST error")
-		}
-	})
-
-	t.Run("liftErrIf", func(t *testing.T) {
-		src := `package main
-func f() error { return nil }
-func g() error { if x := f(); x != nil { return nil }; return nil }
-`
-		inj, dstFile, astFile := setupInjectorTest(t, src)
-		pt := findPointCtx(t, astFile, "g", "f")
-		origFind := findDstNodeFunc
-		t.Cleanup(func() { findDstNodeFunc = origFind })
-		findDstNodeFunc = func(fset *token.FileSet, df *dst.File, af *ast.File, node ast.Node) (DstMapResult, error) {
-			if node == pt.Call {
-				return DstMapResult{}, errors.New("boom")
-			}
-			return origFind(fset, df, af, node)
-		}
-		if _, err := inj.RewriteFile(dstFile, astFile, []analysis.InjectionPoint{pt}); err == nil {
-			t.Fatal("expected lift error from if init")
-		}
-	})
-
-	t.Run("liftErrSwitch", func(t *testing.T) {
-		src := `package main
-func f() error { return nil }
-func g() error { switch x := f(); x { default: }; return nil }
-`
-		inj, dstFile, astFile := setupInjectorTest(t, src)
-		pt := findPointCtx(t, astFile, "g", "f")
-		origFind := findDstNodeFunc
-		t.Cleanup(func() { findDstNodeFunc = origFind })
-		findDstNodeFunc = func(fset *token.FileSet, df *dst.File, af *ast.File, node ast.Node) (DstMapResult, error) {
-			if node == pt.Call {
-				return DstMapResult{}, errors.New("boom")
-			}
-			return origFind(fset, df, af, node)
-		}
-		if _, err := inj.RewriteFile(dstFile, astFile, []analysis.InjectionPoint{pt}); err == nil {
-			t.Fatal("expected lift error from switch init")
-		}
-	})
-
-	t.Run("liftErrTypeSwitch", func(t *testing.T) {
-		src := `package main
-func iface() interface{} { return nil }
-func g() error { switch v := iface().(type) { default: _ = v }; return nil }
-`
-		inj, dstFile, astFile := setupInjectorTest(t, src)
-		pt := findPointCtx(t, astFile, "g", "iface")
-		origFind := findDstNodeFunc
-		t.Cleanup(func() { findDstNodeFunc = origFind })
-		findDstNodeFunc = func(fset *token.FileSet, df *dst.File, af *ast.File, node ast.Node) (DstMapResult, error) {
-			if node == pt.Call {
-				return DstMapResult{}, errors.New("boom")
-			}
-			return origFind(fset, df, af, node)
-		}
-		if _, err := inj.RewriteFile(dstFile, astFile, []analysis.InjectionPoint{pt}); err == nil {
-			t.Fatal("expected lift error from type switch")
-		}
-	})
-
-	t.Run("typeSwitchHandled", func(t *testing.T) {
-		src := `package main
-func iface() interface{} { return nil }
-func g() error { switch v := iface().(type) { default: _ = v }; return nil }
-`
-		inj, dstFile, astFile := setupInjectorTest(t, src)
-		pt := findPointCtx(t, astFile, "g", "iface")
-		changed, err := inj.RewriteFile(dstFile, astFile, []analysis.InjectionPoint{pt})
-		if err != nil || !changed {
-			t.Fatal("expected type switch rewrite")
-		}
-	})
-
-	t.Run("liftCompositeErr", func(t *testing.T) {
-		src := `package main
-func fail() error { return nil }
-type S struct { F error }
-func run() error { x := S{ F: fail() }; _ = x; return nil }
-`
-		inj, dstFile, astFile := setupInjectorTest(t, src)
-		pt := findPointCtx(t, astFile, "run", "fail")
-		origLift := liftCompositeLitFunc
-		t.Cleanup(func() { liftCompositeLitFunc = origLift })
-		liftCompositeLitFunc = func(_ *Injector, _ dst.Stmt, _ targetEntry, _ *ast.File) ([]dst.Stmt, error) {
-			return nil, errors.New("boom")
-		}
-		if _, err := inj.RewriteFile(dstFile, astFile, []analysis.InjectionPoint{pt}); err == nil {
-			t.Fatal("expected liftCompositeLit error")
-		}
-	})
-}
-
-func TestLogFallback_Errors(t *testing.T) {
-	inj := &Injector{}
-	if changed, err := inj.LogFallback(&dst.File{}, &ast.File{}, analysis.InjectionPoint{}); err != nil || changed {
-		t.Fatal("expected no change for nil point")
-	}
-
-	// FindDstNode error
-	fset := token.NewFileSet()
-	astFile, err := parser.ParseFile(fset, "main.go", "package main", 0)
-	if err != nil {
-		t.Fatalf("parse: %v", err)
-	}
-	ptBad := analysis.InjectionPoint{Stmt: &ast.ExprStmt{X: &ast.BasicLit{Kind: token.INT, Value: "1"}}, File: astFile}
-	if _, err := inj.LogFallback(&dst.File{}, astFile, ptBad); err == nil {
-		t.Fatal("expected mapping error")
-	}
-
-	// generateNonErrorFallbackDST error via hook
-	src := `package main
-func f() error { return nil }
-func g() { f() }
-`
-	inj2, dstFile, astFile := setupInjectorTest(t, src)
-	pt := findPointCtx(t, astFile, "g", "f")
-	origAssign := generateAssignmentDSTFunc
-	t.Cleanup(func() { generateAssignmentDSTFunc = origAssign })
-	generateAssignmentDSTFunc = func(_ *Injector, _ analysis.InjectionPoint, _ *dst.CallExpr, _ string, _ token.Token) (dst.Stmt, error) {
-		return nil, errors.New("boom")
-	}
-	if _, err := inj2.LogFallback(dstFile, astFile, pt); err == nil {
-		t.Fatal("expected fallback error")
-	}
-	generateAssignmentDSTFunc = origAssign
-}
-
-func TestLogFallback_MultiStmtInsert(t *testing.T) {
-	src := `package main
-func f() error { return nil }
-func g() { f() }
-`
-	inj, dstFile, astFile := setupInjectorTest(t, src)
-	pt := findPointCtx(t, astFile, "g", "f")
-
-	origAssign := generateAssignmentDSTFunc
-	origFind := findDstNodeFunc
-	t.Cleanup(func() {
-		generateAssignmentDSTFunc = origAssign
-		findDstNodeFunc = origFind
-	})
-
-	// Force non-Assign stmt to get multiple statements inserted.
-	generateAssignmentDSTFunc = func(_ *Injector, _ analysis.InjectionPoint, _ *dst.CallExpr, _ string, _ token.Token) (dst.Stmt, error) {
-		return &dst.ExprStmt{X: dst.NewIdent("noop")}, nil
-	}
-	changed, err := inj.LogFallback(dstFile, astFile, pt)
-	if err != nil || !changed {
-		t.Fatal("expected multi-stmt fallback")
-	}
-
-	// Force dstStmt not ok branch
-	findDstNodeFunc = func(_ *token.FileSet, _ *dst.File, _ *ast.File, _ ast.Node) (DstMapResult, error) {
-		return DstMapResult{Node: dst.NewIdent("x")}, nil
-	}
-	if changed, err := inj.LogFallback(dstFile, astFile, pt); err != nil || changed {
-		t.Fatal("expected no change for non-stmt mapping")
-	}
-}
-
-func TestDecorateFile_Helper(t *testing.T) {
-	fset := token.NewFileSet()
-	f, err := parser.ParseFile(fset, "main.go", "package main\nfunc main() {}\n", 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := decorator.NewDecorator(fset).DecorateFile(f); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func TestTryLiftControls_NoMatch(t *testing.T) {
-	src := `package main
-func fail() error { return nil }
-func iface() interface{} { return nil }
-func run() {
-	if true { fail() }
-	switch 1 { default: fail() }
-	switch v := iface().(type) { default: _ = v; fail() }
-}
-`
-	inj, dstFile, astFile := setupInjectorTest(t, src)
-
-	var ifStmt *ast.IfStmt
-	var ifCall *ast.CallExpr
-	var swStmt *ast.SwitchStmt
-	var swCall *ast.CallExpr
-	var tsStmt *ast.TypeSwitchStmt
-	var tsCall *ast.CallExpr
-
-	ast.Inspect(astFile, func(n ast.Node) bool {
-		switch s := n.(type) {
-		case *ast.IfStmt:
-			if ifStmt == nil {
-				ifStmt = s
-				ifCall = findCallInNode(s.Body, "fail")
-			}
-		case *ast.SwitchStmt:
-			if swStmt == nil {
-				swStmt = s
-				swCall = findCallInNode(s.Body, "fail")
-			}
-		case *ast.TypeSwitchStmt:
-			if tsStmt == nil {
-				tsStmt = s
-				tsCall = findCallInNode(s.Body, "fail")
-			}
-		}
-		return true
-	})
-
-	if ifStmt == nil || ifCall == nil || swStmt == nil || swCall == nil || tsStmt == nil || tsCall == nil {
-		t.Fatal("expected control statements and calls")
-	}
-
-	ptIf := analysis.InjectionPoint{Stmt: ifStmt, Call: ifCall, File: astFile, Pos: ifStmt.Pos()}
-	resIfStmt, _ := FindDstNode(inj.Fset, dstFile, astFile, ifStmt)
-	resIfCall, _ := FindDstNode(inj.Fset, dstFile, astFile, ifCall)
-	entry := targetEntry{point: ptIf, dstStmt: resIfStmt.Node.(dst.Stmt), dstCall: resIfCall.Node.(*dst.CallExpr)}
-	if handled, _, err := inj.tryLiftIf(resIfStmt.Node.(*dst.IfStmt), entry, astFile); err != nil || handled {
-		t.Fatal("expected no lift for if body call")
-	}
-
-	ptSw := analysis.InjectionPoint{Stmt: swStmt, Call: swCall, File: astFile, Pos: swStmt.Pos()}
-	resSwStmt, _ := FindDstNode(inj.Fset, dstFile, astFile, swStmt)
-	resSwCall, _ := FindDstNode(inj.Fset, dstFile, astFile, swCall)
-	entry = targetEntry{point: ptSw, dstStmt: resSwStmt.Node.(dst.Stmt), dstCall: resSwCall.Node.(*dst.CallExpr)}
-	if handled, _, err := inj.tryLiftSwitch(resSwStmt.Node.(*dst.SwitchStmt), entry, astFile); err != nil || handled {
-		t.Fatal("expected no lift for switch body call")
-	}
-
-	ptTs := analysis.InjectionPoint{Stmt: tsStmt, Call: tsCall, File: astFile, Pos: tsStmt.Pos()}
-	resTsStmt, _ := FindDstNode(inj.Fset, dstFile, astFile, tsStmt)
-	resTsCall, _ := FindDstNode(inj.Fset, dstFile, astFile, tsCall)
-	entry = targetEntry{point: ptTs, dstStmt: resTsStmt.Node.(dst.Stmt), dstCall: resTsCall.Node.(*dst.CallExpr)}
-	if handled, _, err := inj.tryLiftTypeSwitch(resTsStmt.Node.(*dst.TypeSwitchStmt), entry, astFile); err != nil || handled {
-		t.Fatal("expected no lift for type switch body call")
-	}
-}
-
 func TestLiftControlInit_GenerateRewriteError(t *testing.T) {
 	src := `package main
-func f() error { return nil }
-func run() error { if f(); true { return nil }; return nil }
+func f() error { return nil } 
+func run() error { if f(); true { return nil }; return nil } 
 `
 	inj, dstFile, astFile := setupInjectorTest(t, src)
 	pt := findPointCtx(t, astFile, "run", "f")
 	resStmt, _ := FindDstNode(inj.Fset, dstFile, astFile, pt.Stmt)
+	if resStmt.Node == nil {
+		t.Fatal("failed to find if stmt")
+	}
 	resCall, _ := FindDstNode(inj.Fset, dstFile, astFile, pt.Call)
+	if resCall.Node == nil {
+		t.Fatal("failed to find call")
+	}
 	entry := targetEntry{point: pt, dstCall: resCall.Node.(*dst.CallExpr)}
 
 	origAssign := generateAssignmentDSTFunc
@@ -1255,18 +875,18 @@ func run() error { if f(); true { return nil }; return nil }
 	generateAssignmentDSTFunc = func(_ *Injector, _ analysis.InjectionPoint, _ *dst.CallExpr, _ string, _ token.Token) (dst.Stmt, error) {
 		return nil, errors.New("boom")
 	}
-	if _, err := inj.liftControlInit(resStmt.Node.(dst.Stmt), resStmt.Node.(*dst.IfStmt).Init.(dst.Stmt), entry, astFile); err == nil {
+	if _, err := inj.liftControlInit(resStmt.Node.(dst.Stmt), resStmt.Node.(*dst.IfStmt).Init.(dst.Stmt), entry, astFile, dstFile); err == nil {
 		t.Fatal("expected liftControlInit error")
 	}
 }
 
 func TestLiftControlExpr_GenerateZeroReturnsError(t *testing.T) {
 	src := `package main
-func cond() bool { return true }
-func run() (int, error) {
-	if cond() { return 0, nil }
-	return 0, nil
-}
+func cond() bool { return true } 
+func run() (int, error) { 
+  if cond() { return 0, nil } 
+  return 0, nil
+} 
 `
 	inj, dstFile, astFile := setupInjectorTest(t, src)
 	var runDecl *ast.FuncDecl
@@ -1291,7 +911,7 @@ func run() (int, error) {
 	resCall, _ := FindDstNode(inj.Fset, dstFile, astFile, pt.Call)
 	entry := targetEntry{point: pt, dstCall: resCall.Node.(*dst.CallExpr)}
 	ctrl := resStmt.Node.(*dst.IfStmt)
-	if _, err := inj.liftControlExpr(ctrl, ctrl.Cond, entry, "cond", astFile, func(n dst.Node, e dst.Expr) {
+	if _, err := inj.liftControlExpr(ctrl, ctrl.Cond, entry, "cond", astFile, dstFile, func(n dst.Node, e dst.Expr) {
 		n.(*dst.IfStmt).Cond = e
 	}); err == nil {
 		t.Fatal("expected generateZeroReturns error")
@@ -1300,11 +920,11 @@ func run() (int, error) {
 
 func TestLiftControlExpr_RenderTemplateError(t *testing.T) {
 	src := `package main
-func cond() bool { return true }
-func run() (int, error) {
-	if cond() { return 0, nil }
-	return 0, nil
-}
+func cond() bool { return true } 
+func run() (int, error) { 
+  if cond() { return 0, nil } 
+  return 0, nil
+} 
 `
 	inj, dstFile, astFile := setupInjectorTest(t, src)
 	inj.ErrorTemplate = "{{"
@@ -1313,7 +933,7 @@ func run() (int, error) {
 	resCall, _ := FindDstNode(inj.Fset, dstFile, astFile, pt.Call)
 	entry := targetEntry{point: pt, dstCall: resCall.Node.(*dst.CallExpr)}
 	ctrl := resStmt.Node.(*dst.IfStmt)
-	if _, err := inj.liftControlExpr(ctrl, ctrl.Cond, entry, "cond", astFile, func(n dst.Node, e dst.Expr) {
+	if _, err := inj.liftControlExpr(ctrl, ctrl.Cond, entry, "cond", astFile, dstFile, func(n dst.Node, e dst.Expr) {
 		n.(*dst.IfStmt).Cond = e
 	}); err == nil {
 		t.Fatal("expected template error")
@@ -1322,9 +942,9 @@ func run() (int, error) {
 
 func TestLiftCompositeLit_NonKeyed(t *testing.T) {
 	src := `package main
-func fail() error { return nil }
-type S struct { F error }
-func run() error { x := S{ fail() }; _ = x; return nil }
+func fail() error { return nil } 
+type S struct { F error } 
+func run() error { x := S{ fail() }; _ = x; return nil } 
 `
 	inj, dstFile, astFile := setupInjectorTest(t, src)
 	pt := findPointCtx(t, astFile, "run", "fail")
@@ -1346,83 +966,7 @@ func run() error { x := S{ fail() }; _ = x; return nil }
 	if entry.dstCall == nil {
 		t.Fatal("expected dst call in composite")
 	}
-	if _, err := inj.liftCompositeLit(assignStmt, entry, astFile); err != nil {
+	if _, err := inj.liftCompositeLit(assignStmt, entry, astFile, dstFile); err != nil {
 		t.Fatalf("unexpected error: %v", err)
-	}
-}
-
-func TestLiftTypeSwitchAssign_TestParamInspect(t *testing.T) {
-	fset := token.NewFileSet()
-	astFile, err := parser.ParseFile(fset, "main.go", "package main", 0)
-	if err != nil {
-		t.Fatalf("parse: %v", err)
-	}
-	inj := &Injector{TestParam: "t", Pkg: &packages.Package{Fset: fset, TypesInfo: &types.Info{}}}
-	entry := targetEntry{point: analysis.InjectionPoint{File: astFile, Pos: astFile.Pos()}, dstCall: &dst.CallExpr{Fun: dst.NewIdent("iface")}}
-	ts := &dst.TypeSwitchStmt{
-		Assign: &dst.BlockStmt{List: []dst.Stmt{
-			&dst.ExprStmt{X: &dst.TypeAssertExpr{X: dst.NewIdent("iface")}},
-			&dst.EmptyStmt{},
-		}},
-		Body: &dst.BlockStmt{},
-	}
-	if _, err := inj.liftTypeSwitchAssign(ts, entry, astFile); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-}
-
-func TestGenerateZeroReturns_NameSafety(t *testing.T) {
-	obj := types.NewTypeName(token.NoPos, nil, "Shadow", nil)
-	named := types.NewNamed(obj, types.NewStruct(nil, nil), nil)
-	sig := types.NewSignatureType(nil, nil, nil, nil, types.NewTuple(
-		types.NewVar(token.NoPos, nil, "", named),
-		types.NewVar(token.NoPos, nil, "", types.Universe.Lookup("error").Type()),
-	), false)
-
-	inj := &Injector{Pkg: &packages.Package{}}
-	if _, err := inj.generateZeroReturns(analysis.InjectionPoint{}, sig, nil); err != nil {
-		t.Fatalf("unexpected scope-nil error: %v", err)
-	}
-
-	fset := token.NewFileSet()
-	astFile, err := parser.ParseFile(fset, "main.go", "package main\nfunc f() {}\n", 0)
-	if err != nil {
-		t.Fatalf("parse: %v", err)
-	}
-	fn := astFile.Decls[0].(*ast.FuncDecl)
-	point := analysis.InjectionPoint{File: astFile, Pos: fn.Pos()}
-
-	scopeNil := types.NewScope(nil, token.NoPos, token.NoPos, "")
-	info := &types.Info{Scopes: map[ast.Node]*types.Scope{fn: scopeNil}}
-	inj2 := &Injector{Pkg: &packages.Package{Fset: fset, TypesInfo: info}}
-	if _, err := inj2.generateZeroReturns(point, sig, nil); err != nil {
-		t.Fatalf("unexpected scope-miss error: %v", err)
-	}
-
-	scopeShadow := types.NewScope(nil, token.NoPos, token.NoPos, "")
-	scopeShadow.Insert(types.NewVar(token.NoPos, nil, "Shadow", types.Typ[types.Int]))
-	info2 := &types.Info{Scopes: map[ast.Node]*types.Scope{fn: scopeShadow}}
-	inj3 := &Injector{Pkg: &packages.Package{Fset: fset, TypesInfo: info2}}
-	if _, err := inj3.generateZeroReturns(point, sig, nil); err == nil {
-		t.Fatal("expected shadowed name error")
-	}
-
-	scopeExact := types.NewScope(nil, token.NoPos, token.NoPos, "")
-	scopeExact.Insert(obj)
-	info3 := &types.Info{Scopes: map[ast.Node]*types.Scope{fn: scopeExact}}
-	inj4 := &Injector{Pkg: &packages.Package{Fset: fset, TypesInfo: info3}}
-	if _, err := inj4.generateZeroReturns(point, sig, nil); err != nil {
-		t.Fatalf("unexpected exact-name error: %v", err)
-	}
-}
-
-func TestIsInsideLoop_TopLevel(t *testing.T) {
-	src := `package main
-var x = 1
-`
-	inj, _, astFile := setupInjectorTest(t, src)
-	point := analysis.InjectionPoint{File: astFile, Pos: astFile.Decls[0].Pos()}
-	if inj.isInsideLoop(point) {
-		t.Fatal("expected top-level point outside loop")
 	}
 }

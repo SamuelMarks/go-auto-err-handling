@@ -25,6 +25,13 @@ var restorerFprint = func(r *decorator.Restorer, w io.Writer, f *dst.File) error
 }
 
 // RenderTemplate transforms a template into a list of AST expressions (Legacy).
+//
+// tmpl: The template string (e.g. "{return-zero}, err").
+// zeroExprs: The zero value expressions to replace "{return-zero}".
+// errName: The error variable name to use.
+// funcName: The function name for logging templates.
+//
+// Returns the parsed expressions, necessary imports, or an error.
 func RenderTemplate(tmpl string, zeroExprs []ast.Expr, errName string, funcName string) ([]ast.Expr, []string, error) {
 	// Reusing logic via temporary source string is easiest but we have existing logic.
 	// For compilation checks of existing dependent code, we restore original logic.
@@ -78,6 +85,13 @@ func RenderTemplate(tmpl string, zeroExprs []ast.Expr, errName string, funcName 
 }
 
 // RenderTemplateDST transforms a template into a list of DST expressions (New).
+//
+// tmpl: The template string.
+// zeroExprs: The list of zero value expressions.
+// errName: The error variable name.
+// funcName: The function context name.
+//
+// Returns the resolved expressions, required imports, or an error.
 func RenderTemplateDST(tmpl string, zeroExprs []dst.Expr, errName string, funcName string) ([]dst.Expr, []string, error) {
 	if tmpl == "" {
 		tmpl = "{return-zero}, err"

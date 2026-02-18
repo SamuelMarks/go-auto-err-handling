@@ -303,7 +303,7 @@ func TestConvertPanicArgToErrorDST(t *testing.T) {
 	argErr := ast.NewIdent("errVar")
 	infoErr := &types.Info{Types: map[ast.Expr]types.TypeAndValue{argErr: {Type: types.Universe.Lookup("error").Type()}}}
 	injErr := &Injector{Pkg: &packages.Package{TypesInfo: infoErr}}
-	res := injErr.convertPanicArgToErrorDST(dst.NewIdent("errVar"), argErr)
+	res := injErr.convertPanicArgToErrorDST(dst.NewIdent("errVar"), argErr, &dst.File{})
 	if _, ok := res.(*dst.Ident); !ok {
 		t.Fatal("expected ident for error arg")
 	}
@@ -312,7 +312,7 @@ func TestConvertPanicArgToErrorDST(t *testing.T) {
 	argStr := ast.NewIdent("s")
 	infoStr := &types.Info{Types: map[ast.Expr]types.TypeAndValue{argStr: {Type: types.Typ[types.String]}}}
 	injStr := &Injector{Pkg: &packages.Package{TypesInfo: infoStr}}
-	res = injStr.convertPanicArgToErrorDST(dst.NewIdent("s"), argStr)
+	res = injStr.convertPanicArgToErrorDST(dst.NewIdent("s"), argStr, &dst.File{})
 	if call, ok := res.(*dst.CallExpr); !ok || call.Args[0].(*dst.BasicLit).Value != `"%s"` {
 		t.Fatalf("expected %%s format for string, got %#v", res)
 	}
@@ -321,14 +321,14 @@ func TestConvertPanicArgToErrorDST(t *testing.T) {
 	argInt := ast.NewIdent("i")
 	infoInt := &types.Info{Types: map[ast.Expr]types.TypeAndValue{argInt: {Type: types.Typ[types.Int]}}}
 	injInt := &Injector{Pkg: &packages.Package{TypesInfo: infoInt}}
-	res = injInt.convertPanicArgToErrorDST(dst.NewIdent("i"), argInt)
+	res = injInt.convertPanicArgToErrorDST(dst.NewIdent("i"), argInt, &dst.File{})
 	if call, ok := res.(*dst.CallExpr); !ok || call.Args[0].(*dst.BasicLit).Value != `"%v"` {
 		t.Fatalf("expected %%v format for non-string, got %#v", res)
 	}
 
 	// string literal without types info
 	injNil := &Injector{}
-	res = injNil.convertPanicArgToErrorDST(&dst.BasicLit{Kind: token.STRING, Value: `"hi"`}, &ast.BasicLit{Kind: token.STRING, Value: `"hi"`})
+	res = injNil.convertPanicArgToErrorDST(&dst.BasicLit{Kind: token.STRING, Value: `"hi"`}, &ast.BasicLit{Kind: token.STRING, Value: `"hi"`}, &dst.File{})
 	if call, ok := res.(*dst.CallExpr); !ok || call.Args[0].(*dst.BasicLit).Value != `"%s"` {
 		t.Fatalf("expected %%s format for string literal, got %#v", res)
 	}
@@ -437,7 +437,7 @@ func TestGenerateReturnFromPanicDST_EmptyResults(t *testing.T) {
 	fn := &dst.FuncDecl{Type: &dst.FuncType{Results: nil}}
 	panicCall := &dst.CallExpr{Args: []dst.Expr{dst.NewIdent("err")}}
 	astPanic := &ast.CallExpr{Args: []ast.Expr{ast.NewIdent("err")}}
-	ret, err := inj.generateReturnFromPanicDST(fn, panicCall, astPanic)
+	ret, err := inj.generateReturnFromPanicDST(fn, panicCall, astPanic, &dst.File{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

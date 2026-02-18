@@ -198,14 +198,14 @@ func render(t *testing.T, f *dst.File) string {
 func TestRewriteFile_Comments(t *testing.T) {
 	src := `package main
 
-func fail() error { return nil } 
+func fail() error { return nil }
 
-func run() error { 
+func run() error {
   // Pre-comment
   fail() // Inline-comment
   // Post-comment
   return nil
-} 
+}
 `
 	injector, dstFile, astFile := setupInjectorTest(t, src)
 	pt := findPoint(t, astFile, "fail", false)
@@ -237,10 +237,10 @@ func run() error {
 
 func TestRewriteFile_GoStmt(t *testing.T) {
 	src := `package main
-func task() error { return nil } 
-func main() { 
-  go task() 
-} 
+func task() error { return nil }
+func main() {
+  go task()
+}
 `
 	injector, dstFile, astFile := setupInjectorTest(t, src)
 	pt := findPoint(t, astFile, "task", false)
@@ -264,13 +264,13 @@ func main() {
 
 func TestRewriteFile_IfInitLift(t *testing.T) {
 	src := `package main
-func fail() error { return nil } 
-func run() error { 
- if x := fail(); x != nil { 
+func fail() error { return nil }
+func run() error {
+ if x := fail(); x != nil {
    return nil
- } 
+ }
  return nil
-} 
+}
 `
 	injector, dstFile, astFile := setupInjectorTest(t, src)
 	pt := findPoint(t, astFile, "fail", false)
@@ -294,13 +294,13 @@ func run() error {
 
 func TestRewriteFile_IfCondLift(t *testing.T) {
 	src := `package main
-func fail() error { return nil } 
-func run() error { 
- if fail() != nil { 
+func fail() error { return nil }
+func run() error {
+ if fail() != nil {
    return nil
- } 
+ }
  return nil
-} 
+}
 `
 	injector, dstFile, astFile := setupInjectorTest(t, src)
 	pt := findPoint(t, astFile, "fail", true)
@@ -324,13 +324,13 @@ func run() error {
 
 func TestRewriteFile_SwitchInitLift(t *testing.T) {
 	src := `package main
-func fail() error { return nil } 
-func run() error { 
- switch x := fail(); x { 
- default: 
- } 
+func fail() error { return nil }
+func run() error {
+ switch x := fail(); x {
+ default:
+ }
  return nil
-} 
+}
 `
 	injector, dstFile, astFile := setupInjectorTest(t, src)
 	pt := findPoint(t, astFile, "fail", false)
@@ -354,10 +354,10 @@ func run() error {
 
 func TestLogFallback(t *testing.T) {
 	src := `package main
-func task() error { return nil } 
-func main() { 
-  task() 
-} 
+func task() error { return nil }
+func main() {
+  task()
+}
 `
 	injector, dstFile, astFile := setupInjectorTest(t, src)
 	pt := findPoint(t, astFile, "task", false)
@@ -381,21 +381,21 @@ func main() {
 
 func TestRewriteFile_Passthrough_Unique(t *testing.T) {
 	src := `package main
-func sub() error { return nil } 
+func sub() error { return nil }
 
-func shouldOptimize() { 
-  sub() 
-} 
+func shouldOptimize() {
+  sub()
+}
 
-func noOptimizeMismatch() (int, error) { 
-  sub() 
+func noOptimizeMismatch() (int, error) {
+  sub()
   return 0, nil
-} 
+}
 
-func noOptimizeNotTail() { 
-  sub() 
+func noOptimizeNotTail() {
+  sub()
   _ = 1
-} 
+}
 `
 	injector, dstFile, astFile := setupInjectorTest(t, src)
 
@@ -436,36 +436,36 @@ func noOptimizeNotTail() {
 // and := when it is not (shadowing).
 func TestInject_ScopeAware(t *testing.T) {
 	src := `package main
-func task() error { return nil } 
+func task() error { return nil }
 
 // Case 1: Outer err used later -> Must use =
-func useLater() error { 
+func useLater() error {
   var err error
-  for { 
+  for {
     task() // Point 1
-  } 
+  }
   return err // Used here
-} 
+}
 
 // Case 2: Outer err NOT used later -> Can use :=
 // Note: Return type needed so that injector allows return rewrite
-func shadowSafe() error { 
+func shadowSafe() error {
   var err error
   _ = err
-  for { 
+  for {
     task() // Point 2
-  } 
+  }
   // err not used after loop
   return nil
-} 
+}
 
 // Case 3: Defined in same scope -> Must use =
-func sameScope() error { 
+func sameScope() error {
   var err error
   task() // Point 3, implicitly sets err
   _ = err
   return nil
-} 
+}
 `
 	injector, dstFile, astFile := setupInjectorTest(t, src)
 
@@ -508,19 +508,19 @@ func sameScope() error {
 func TestRewriteFile_CompositeLit(t *testing.T) {
 	src := `package main
 
-func fail() error { return nil } 
+func fail() error { return nil }
 
-type S struct { 
+type S struct {
   F error
-} 
+}
 
-func liftMe() error { 
-  x := S{ 
-    F: fail(), 
-  } 
+func liftMe() error {
+  x := S{
+    F: fail(),
+  }
   _ = x
   return nil
-} 
+}
 `
 	injector, dstFile, astFile := setupInjectorTest(t, src)
 	pts := findPoints(t, astFile, "fail")
@@ -561,14 +561,14 @@ func liftMe() error {
 
 func TestRewriteFile_ReturnComposite(t *testing.T) {
 	src := `package main
-  func fail() error { return nil } 
-  type S struct { F error } 
-  func liftReturn() *S { 
-    return &S{ 
-      F: fail(), 
-    } 
-  } 
-  `
+	func fail() error { return nil }
+	type S struct { F error }
+	func liftReturn() *S {
+		return &S{
+			F: fail(),
+		}
+	}
+	`
 	injector, dstFile, astFile := setupInjectorTest(t, src)
 	pts := findPoints(t, astFile, "fail")
 	var targetPts []analysis.InjectionPoint

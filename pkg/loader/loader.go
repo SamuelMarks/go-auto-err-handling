@@ -21,11 +21,15 @@ var packagesLoad = packages.Load
 // contains no Go files (common in repo roots with only sub-packages), but a go.mod file exists,
 // it automatically retries with a recursive pattern ("./...").
 //
+// If recursive is true, patterns matching "." are explicitly expanded to "./..." upfront, forcing
+// recursive loading regardless of whether the root module has Go files.
+//
 // patterns: A list of package patterns to load (e.g., ".", "./...", "github.com/pkg/errors").
 // dir: The working directory from which to run the go list command. If empty, defaults to current working directory.
+// recursive: If set, forces expansion of "." to "./...".
 //
 // Returns a slice of loaded packages or an error if the loader tool itself fails.
-func LoadPackages(patterns []string, dir string) ([]*packages.Package, error) {
+func LoadPackages(patterns []string, dir string, recursive bool) ([]*packages.Package, error) {
 	// Mode determines what information is loaded.
 	// We need Name, Files, and Imports for basic structure.
 	// We need Types and TypesInfo for type checking (essential for identifying error interfaces).
@@ -43,6 +47,17 @@ func LoadPackages(patterns []string, dir string) ([]*packages.Package, error) {
 	_ = os.MkdirAll(cacheDir, 0o755)
 	env = append(env, "GOCACHE="+cacheDir)
 
+	// Expand patterns if recursive mode is strongly requested
+	finalPatterns := make([]string, len(patterns))
+	copy(finalPatterns, patterns)
+	if recursive {
+		for i, p := range finalPatterns {
+			if p == "." {
+				finalPatterns[i] = "./..."
+			}
+		}
+	}
+
 	cfg := &packages.Config{
 		Mode:  mode,
 		Dir:   dir,
@@ -50,7 +65,7 @@ func LoadPackages(patterns []string, dir string) ([]*packages.Package, error) {
 		Env:   env,
 	}
 
-	pkgs, err := packagesLoad(cfg, patterns...)
+	pkgs, err := packagesLoad(cfg, finalPatterns...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to call packages.Load: %w", err)
 	}
@@ -58,7 +73,7 @@ func LoadPackages(patterns []string, dir string) ([]*packages.Package, error) {
 	// Check if we need to apply Smart Module Recursion.
 	// This happens if the user likely targeted a repo root (e.g., ".") that has no Go files itself,
 	// but contains a module definition and sub-packages.
-	if shouldRetryRecursive(pkgs, patterns, dir) {
+	if !recursive && shouldRetryRecursive(pkgs, patterns, dir) {
 		log.Println("[INFO] Module root detected with no source files. Switching to recursive mode ('./...').")
 
 		// Adjust patterns to be recursive.

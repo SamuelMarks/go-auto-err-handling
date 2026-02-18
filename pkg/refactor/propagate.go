@@ -30,7 +30,13 @@ const (
 
 // DstProvider abstracts the management of DST files.
 type DstProvider interface {
+	// Get retrieves the DST file corresponding to the given AST file.
+	// pkg: The package containing the file.
+	// file: The AST file map key.
 	Get(pkg *packages.Package, file *ast.File) (*dst.File, error)
+
+	// MarkModified marks a file as modified to ensure it is saved back to disk.
+	// file: The AST file associated with the modified DST.
 	MarkModified(file *ast.File)
 }
 
@@ -43,6 +49,13 @@ var (
 )
 
 // PropagateCallers updates all call sites (and value assignments) of a modified object.
+//
+// pkgs: The list of loaded packages to search for usages.
+// provider: The provider for retrieving DST files.
+// initialTarget: The object (function or variable) whose signature changed.
+// strategy: The strategy to use for terminal functions (e.g. main) if encountered.
+//
+// Returns the number of call sites updated.
 func PropagateCallers(pkgs []*packages.Package, provider DstProvider, initialTarget types.Object, strategy string) (int, error) {
 	if initialTarget == nil {
 		return 0, fmt.Errorf("target object is nil")
@@ -65,9 +78,6 @@ func PropagateCallers(pkgs []*packages.Package, provider DstProvider, initialTar
 					uses = append(uses, id)
 				}
 			}
-
-			// Sort? Order usually doesn't matter for independent AST nodes, but stable is nice.
-			// Iteration order of map is random. Given complexity, we process as is.
 
 			for _, id := range uses {
 				file := findFile(pkg, id.Pos())
@@ -96,9 +106,10 @@ func PropagateCallers(pkgs []*packages.Package, provider DstProvider, initialTar
 
 				var nextObj types.Object
 				var updated int
+				var procErr error
 
 				if isCall {
-					updated, nextObj, err = processCallSiteDST(pkg, file, dstFile, id, target, strategy)
+					updated, nextObj, procErr = processCallSiteDST(pkg, file, dstFile, id, target, strategy)
 					// Manually patch Types Info for call if updated so subsequent checks on this call see the tuple return
 					if updated > 0 && callExpr != nil {
 						if sig := getSignature(target); sig != nil {
@@ -106,11 +117,11 @@ func PropagateCallers(pkgs []*packages.Package, provider DstProvider, initialTar
 						}
 					}
 				} else {
-					updated, nextObj, err = processVarPropagationDST(pkg, provider, file, dstFile, id, target)
+					updated, nextObj, procErr = processVarPropagationDST(pkg, provider, file, dstFile, id, target)
 				}
 
-				if err != nil {
-					return totalUpdates, err
+				if procErr != nil {
+					return totalUpdates, fmt.Errorf("failed to process propagation at %s: %w", pkg.Fset.Position(id.Pos()), procErr)
 				}
 
 				if updated > 0 {
@@ -127,20 +138,17 @@ func PropagateCallers(pkgs []*packages.Package, provider DstProvider, initialTar
 			}
 		}
 	}
-
 	return totalUpdates, nil
 }
 
 func processVarPropagationDST(pkg *packages.Package, provider DstProvider, astFile *ast.File, dstFile *dst.File, id *ast.Ident, target types.Object) (int, types.Object, error) {
 	path, _ := astutil.PathEnclosingInterval(astFile, id.Pos(), id.Pos())
-
 	var definedVar types.Object
 	var definingIdent *ast.Ident
 	var explicitTypeNode ast.Node
 
 	// Check if this use maps to an assignment/definition of another variable
 	// e.g. "var f = target" (ValueSpec) or "f := target" (AssignStmt)
-
 	for _, node := range path {
 		if vs, ok := node.(*ast.ValueSpec); ok {
 			for i, val := range vs.Values {
@@ -201,7 +209,10 @@ func processVarPropagationDST(pkg *packages.Package, provider DstProvider, astFi
 		// If used in AssignStmt (=) where declared elsewhere, explicitTypeNode is nil here.
 		if explicitTypeNode != nil && defFile == astFile {
 			// Local modification
-			dstTypeNode, _ := mapAstToDst(astFile, dstFile, explicitTypeNode)
+			dstTypeNode, _, err := mapAstToDst(astFile, dstFile, explicitTypeNode)
+			if err != nil {
+				return 0, nil, err
+			}
 			if dstFuncType, ok := dstTypeNode.(*dst.FuncType); ok {
 				if !hasTrailingErrorReturnDST(dstFuncType) {
 					changed, _ := AddErrorToFuncTypeDST(dstFuncType)
@@ -220,7 +231,10 @@ func processVarPropagationDST(pkg *packages.Package, provider DstProvider, astFi
 				for _, n := range declPath {
 					if vs, ok := n.(*ast.ValueSpec); ok && vs.Type != nil {
 						// Map to proper DST
-						dstTypeNode, _ := mapAstToDst(defFile, defDstFile, vs.Type)
+						dstTypeNode, _, err := mapAstToDst(defFile, defDstFile, vs.Type)
+						if err != nil {
+							return 0, nil, err
+						}
 						if dstFuncType, ok := dstTypeNode.(*dst.FuncType); ok {
 							if !hasTrailingErrorReturnDST(dstFuncType) {
 								changed, _ := AddErrorToFuncTypeDST(dstFuncType)
@@ -258,7 +272,6 @@ func processVarPropagationDST(pkg *packages.Package, provider DstProvider, astFi
 				return 0, nil, err
 			}
 		}
-
 		if newObj != nil {
 			return 1, newObj, nil
 		}
@@ -315,26 +328,32 @@ func processCallSiteDST(pkg *packages.Package, astFile *ast.File, dstFile *dst.F
 		return 0, nil, nil
 	}
 
-	dstStmt, dstParent := mapAstToDst(astFile, dstFile, enclosingStmt)
+	dstStmt, dstParent, err := mapAstToDst(astFile, dstFile, enclosingStmt)
+	if err != nil {
+		return 0, nil, fmt.Errorf("failed to map stmt: %w", err)
+	}
 	if dstStmt == nil {
-		return 0, nil, fmt.Errorf("failed to map stmt")
+		return 0, nil, fmt.Errorf("failed to map stmt: nil result")
 	}
 
 	// Also map the call, needed for precise replacement in complex statements (e.g. if/switch)
-	dstCallNode, _ := mapAstToDst(astFile, dstFile, call)
+	dstCallNode, _, err := mapAstToDst(astFile, dstFile, call)
+	if err != nil {
+		return 0, nil, fmt.Errorf("failed to map call: %w", err)
+	}
 	var dstCall *dst.CallExpr
 	if c, ok := dstCallNode.(*dst.CallExpr); ok {
 		dstCall = c
 	}
 
 	sig, funcObj, decl := findEnclosingFuncDetails(path, pkg.TypesInfo)
-
 	isTerminal := false
 	testParam := ""
 
 	if funcObj != nil {
 		isTerminal = IsEntryPoint(funcObj)
 	}
+
 	if !isTerminal && decl != nil {
 		if filter.IsTestHandler(decl) {
 			testParam = filter.GetTestingParamName(decl)
@@ -351,7 +370,7 @@ func processCallSiteDST(pkg *packages.Package, astFile *ast.File, dstFile *dst.F
 
 	// if this function isn't terminal and returns void, update its signature
 	if decl != nil {
-		res, _ := mapAstToDst(astFile, dstFile, decl)
+		res, _, _ := mapAstToDst(astFile, dstFile, decl)
 		if f, ok := res.(*dst.FuncDecl); ok {
 			dstDecl = f
 		}
@@ -383,7 +402,6 @@ func processCallSiteDST(pkg *packages.Package, astFile *ast.File, dstFile *dst.F
 	}
 
 	targetSig := getSignature(target)
-
 	context := rewriteContext{
 		dstFile:        dstFile,
 		stmt:           dstStmt,
@@ -406,17 +424,32 @@ func processCallSiteDST(pkg *packages.Package, astFile *ast.File, dstFile *dst.F
 	return 1, nextTarget, nil
 }
 
-// HandleEntryPoint handles main/init errors.
+// HandleEntryPoint handles errors in entry points like main() or init().
+// It injects a terminal handler (log.Fatal/panic/os.Exit) instead of returning the error.
+//
+// pkg: The package info.
+// dstFile: The DST file.
+// call: The AST call expression (used to locate the call DST node via mapping).
+// stmt: The AST statement enclosing the call.
+// strategy: The terminal handling strategy ("log-fatal", "panic", "os-exit").
 func HandleEntryPoint(pkg *packages.Package, dstFile *dst.File, call *ast.CallExpr, stmt ast.Stmt, strategy string) error {
 	astFile := findFile(pkg, stmt.Pos())
 	if astFile == nil {
 		return fmt.Errorf("could not locate AST file")
 	}
-	dstStmt, dstParent := mapAstToDst(astFile, dstFile, stmt)
+
+	dstStmt, dstParent, err := mapAstToDst(astFile, dstFile, stmt)
+	if err != nil {
+		return fmt.Errorf("failed to map stmt: %w", err)
+	}
 	if dstStmt == nil {
 		return fmt.Errorf("failed to map stmt")
 	}
-	dstCallNode, _ := mapAstToDst(astFile, dstFile, call)
+
+	dstCallNode, _, err := mapAstToDst(astFile, dstFile, call)
+	if err != nil {
+		return fmt.Errorf("failed to map call: %w", err)
+	}
 	var dstCall *dst.CallExpr
 	if c, ok := dstCallNode.(*dst.CallExpr); ok {
 		dstCall = c
@@ -432,20 +465,36 @@ func HandleEntryPoint(pkg *packages.Package, dstFile *dst.File, call *ast.CallEx
 		scope:      getScope(pkg, stmt),
 		pos:        stmt.Pos(),
 	}
+
 	return refactorCallSiteDST(ctx)
 }
 
-// HandleTestError handles errors in tests.
+// HandleTestError handles errors within testing functions (TestXxx).
+// It injects `t.Fatal(err)` calls.
+//
+// pkg: The package info.
+// dstFile: The DST file.
+// call: The AST call expression.
+// stmt: The AST statement enclosing the call.
+// testParamName: The name of the testing parameter (e.g., "t", "b").
 func HandleTestError(pkg *packages.Package, dstFile *dst.File, call *ast.CallExpr, stmt ast.Stmt, testParamName string) error {
 	astFile := findFile(pkg, stmt.Pos())
 	if astFile == nil {
 		return fmt.Errorf("could not locate AST file")
 	}
-	dstStmt, dstParent := mapAstToDst(astFile, dstFile, stmt)
+
+	dstStmt, dstParent, err := mapAstToDst(astFile, dstFile, stmt)
+	if err != nil {
+		return fmt.Errorf("failed to map stmt: %w", err)
+	}
 	if dstStmt == nil {
 		return fmt.Errorf("failed to map stmt")
 	}
-	dstCallNode, _ := mapAstToDst(astFile, dstFile, call)
+
+	dstCallNode, _, err := mapAstToDst(astFile, dstFile, call)
+	if err != nil {
+		return fmt.Errorf("failed to map call: %w", err)
+	}
 	var dstCall *dst.CallExpr
 	if c, ok := dstCallNode.(*dst.CallExpr); ok {
 		dstCall = c
@@ -461,6 +510,7 @@ func HandleTestError(pkg *packages.Package, dstFile *dst.File, call *ast.CallExp
 		scope:      getScope(pkg, stmt),
 		pos:        stmt.Pos(),
 	}
+
 	return refactorCallSiteDST(ctx)
 }
 
@@ -483,19 +533,15 @@ func (r *rewriteContext) enclosing() *types.Signature { return r.enclosingSig }
 
 func refactorCallSiteDST(ctx rewriteContext) error {
 	stmt := ctx.stmt.(dst.Stmt)
-	// If the call wasn't resolved but we need it for extraction (e.g. IfStmt), we fail early.
-	// For basic stmts like ExprStmt/AssignStmt we might extract from stmt if ctx.call is nil.
 
 	switch s := stmt.(type) {
 	case *dst.ExprStmt:
 		call := s.X
-		// Override if resolved call is available (though ExprStmt.X is usually it)
 		if ctx.call != nil {
 			call = ctx.call
 		}
 
 		// PASSTHROUGH OPTIMIZATION
-		// If usage is tail call and signatures match, just return
 		isTail := false
 		if block, ok := ctx.parent.(*dst.BlockStmt); ok {
 			for i, st := range block.List {
@@ -507,9 +553,9 @@ func refactorCallSiteDST(ctx rewriteContext) error {
 				}
 			}
 		}
+
 		if isTail && !ctx.isTerminal && ctx.enclosingSig != nil && ctx.targetSig != nil {
 			if types.Identical(ctx.enclosingSig.Results(), ctx.targetSig.Results()) {
-				// We can return directly
 				ret := &dst.ReturnStmt{
 					Results: []dst.Expr{dst.Clone(call).(dst.Expr)},
 				}
@@ -520,26 +566,34 @@ func refactorCallSiteDST(ctx rewriteContext) error {
 
 		block := generateCheckBlock(call, ctx)
 		replaceInParent(ctx.parent, stmt, block)
+
 	case *dst.AssignStmt:
-		// RHS call returns error now. Append err to LHS.
 		s.Lhs = append(s.Lhs, dst.NewIdent("err"))
 		check := generateBasicCheck(ctx)
 		insertAfterInParent(ctx.parent, stmt, check)
+
 	case *dst.GoStmt:
 		return refactorGoStmt(ctx, s)
+
 	case *dst.DeferStmt:
 		return refactorDeferStmt(ctx, s)
+
 	case *dst.ReturnStmt:
 		return refactorReturnStmt(ctx, s)
+
 	case *dst.IfStmt:
 		return refactorIfStmt(ctx, s)
+
 	case *dst.SwitchStmt:
 		return refactorSwitchStmt(ctx, s)
+
 	case *dst.TypeSwitchStmt:
 		return refactorTypeSwitchStmt(ctx, s)
+
 	default:
 		return fmt.Errorf("unsupported stmt type for refactor: %T", stmt)
 	}
+
 	return nil
 }
 
@@ -569,11 +623,13 @@ func refactorGoStmt(ctx rewriteContext, gs *dst.GoStmt) error {
 			List: []dst.Stmt{checkStmt},
 		},
 	}
+
 	newGo := &dst.GoStmt{
 		Call: &dst.CallExpr{
 			Fun: fnLit,
 		},
 	}
+
 	replaceInParent(ctx.parent, gs, newGo)
 	return nil
 }
@@ -581,7 +637,6 @@ func refactorGoStmt(ctx rewriteContext, gs *dst.GoStmt) error {
 func refactorDeferStmt(ctx rewriteContext, ds *dst.DeferStmt) error {
 	call := dst.Clone(ds.Call).(*dst.CallExpr)
 	parentCanReturnErr := canReturnError(ctx.enclosing())
-
 	var body *dst.BlockStmt
 
 	// If parent returns error, we can try to join
@@ -623,6 +678,7 @@ func refactorDeferStmt(ctx rewriteContext, ds *dst.DeferStmt) error {
 		Type: &dst.FuncType{Params: &dst.FieldList{}},
 		Body: body,
 	}
+
 	newDefer := &dst.DeferStmt{Call: &dst.CallExpr{Fun: fnLit}}
 	replaceInParent(ctx.parent, ds, newDefer)
 	return nil
@@ -636,11 +692,13 @@ func refactorDeferLogFallback(ctx rewriteContext, call *dst.CallExpr, ds *dst.De
 		Tok: token.DEFINE,
 		Rhs: []dst.Expr{call},
 	}
+
 	cond := &dst.BinaryExpr{
 		X:  dst.NewIdent("err"),
 		Op: token.NEQ,
 		Y:  dst.NewIdent("nil"),
 	}
+
 	logCall := &dst.CallExpr{
 		Fun: &dst.SelectorExpr{X: dst.NewIdent("log"), Sel: dst.NewIdent("Printf")},
 		Args: []dst.Expr{
@@ -648,61 +706,47 @@ func refactorDeferLogFallback(ctx rewriteContext, call *dst.CallExpr, ds *dst.De
 			dst.NewIdent("err"),
 		},
 	}
+
 	ifStmt := &dst.IfStmt{
 		Init: assign,
 		Cond: cond,
 		Body: &dst.BlockStmt{List: []dst.Stmt{&dst.ExprStmt{X: logCall}}},
 	}
+
 	fnLit := &dst.FuncLit{
 		Type: &dst.FuncType{Params: &dst.FieldList{}},
 		Body: &dst.BlockStmt{List: []dst.Stmt{ifStmt}},
 	}
+
 	newDefer := &dst.DeferStmt{Call: &dst.CallExpr{Fun: fnLit}}
 	replaceInParent(ctx.parent, ds, newDefer)
 	return nil
 }
 
 func refactorReturnStmt(ctx rewriteContext, ret *dst.ReturnStmt) error {
-	// return call() -> call now returns (val, err).
-	// If enclosing function signatures match, we just update the call (done implicitly by replacement logic if needed,
-	// but mostly we assume call node in DST is updated via AST map if we were doing in-place, but we are rewriting).
-	// Since mapping is precise, we can just replace the return.
-	// Actually, if signatures match, `return call()` is valid.
 	if !ctx.isTerminal && ctx.enclosingSig != nil && ctx.targetSig != nil {
 		if types.Identical(ctx.enclosingSig.Results(), ctx.targetSig.Results()) {
-			// No change needed logically, but we should make sure the AST/DST is clean.
-			// Just ensure we return the call.
 			return nil
 		}
 	}
 
-	// Signature mismatch: we must extract, check, and return.
-	// e.g. return val, call() where call() added error? That's complex tuple unpacking.
-	// Assuming `return call()` for now.
 	if ctx.call == nil {
-		// Try to find call in results
 		if len(ret.Results) == 1 {
 			if c, ok := ret.Results[0].(*dst.CallExpr); ok {
 				ctx.call = c
 			}
 		}
 	}
+
 	if ctx.call == nil {
 		return fmt.Errorf("could not locate call in return stmt")
 	}
 
-	// Extract
-	// val, err := call()
-	// if err != nil { return ..., err }
-	// return val
 	stmts, err := liftCallAndCheck(ctx, ctx.call, true)
 	if err != nil {
 		return err
 	}
 
-	// The `val` from assignment needs to be returned.
-	// We need variable names.
-	// See liftCallAndCheck definition below. It creates `assign` and `check`.
 	assign := stmts[0].(*dst.AssignStmt)
 	var newResults []dst.Expr
 	for _, lhs := range assign.Lhs {
@@ -713,10 +757,8 @@ func refactorReturnStmt(ctx rewriteContext, ret *dst.ReturnStmt) error {
 		}
 	}
 
-	// append nil/error success value if signature requires it
 	if ctx.enclosingSig != nil {
 		res := ctx.enclosingSig.Results()
-		// If last param is error type, we must append a success-path 'nil'
 		if res.Len() > 0 {
 			last := res.At(res.Len() - 1)
 			if last.Type().String() == "error" || last.Type().String() == "builtin.error" {
@@ -731,7 +773,6 @@ func refactorReturnStmt(ctx rewriteContext, ret *dst.ReturnStmt) error {
 }
 
 func refactorIfStmt(ctx rewriteContext, s *dst.IfStmt) error {
-	// Lift from Init or Cond
 	var target dst.Node
 	if s.Init != nil && containsDstNode(s.Init, ctx.call) {
 		target = s.Init
@@ -746,36 +787,25 @@ func refactorIfStmt(ctx rewriteContext, s *dst.IfStmt) error {
 		return err
 	}
 
-	// Update condition/init to use temp var
 	if target == s.Cond {
-		// Cond was `call()`, now `val`.
-		// Assign is `val, err := call()`.
 		assign := stmts[0].(*dst.AssignStmt)
 		var valVar dst.Expr
 		if len(assign.Lhs) > 1 {
-			valVar = assign.Lhs[0] // Assume value is first
+			valVar = assign.Lhs[0]
 		} else {
-			// Weird Boolean? If call returns (bool, error), then yes.
 			valVar = assign.Lhs[0]
 		}
 		s.Cond = dst.Clone(valVar).(dst.Expr)
 	} else {
-		// Init was `x := call()`. Now `x, err := call()`.
-		// We lift checking BEFORE the if.
-		// Wait, `if x := call(); x { ... }`
-		// becomes `x, err := call(); if err != nil ...; if x { ... }`
-		s.Init = nil // Moved out
+		s.Init = nil
 	}
 
-	// Insert block containing [Assign, Check, IfStmt]
-	// preserve decorations
 	block := &dst.BlockStmt{List: append(stmts, s)}
 	replaceInParent(ctx.parent, s, block)
 	return nil
 }
 
 func refactorSwitchStmt(ctx rewriteContext, s *dst.SwitchStmt) error {
-	// Lift from Init or Tag
 	var target dst.Node
 	if s.Init != nil && containsDstNode(s.Init, ctx.call) {
 		target = s.Init
@@ -804,7 +834,6 @@ func refactorSwitchStmt(ctx rewriteContext, s *dst.SwitchStmt) error {
 }
 
 func refactorTypeSwitchStmt(ctx rewriteContext, s *dst.TypeSwitchStmt) error {
-	// Lift from Init or Assign
 	var target dst.Node
 	if s.Init != nil && containsDstNode(s.Init, ctx.call) {
 		target = s.Init
@@ -820,11 +849,8 @@ func refactorTypeSwitchStmt(ctx rewriteContext, s *dst.TypeSwitchStmt) error {
 	}
 
 	if target == s.Assign {
-		// switch v := call().(type) -> val, err := call(); check; switch v := val.(type)
 		assign := stmts[0].(*dst.AssignStmt)
 		valVar := assign.Lhs[0]
-
-		// Update assign stmt in switch
 		if as, ok := s.Assign.(*dst.AssignStmt); ok {
 			if ta, ok := as.Rhs[0].(*dst.TypeAssertExpr); ok {
 				ta.X = dst.Clone(valVar).(dst.Expr)
@@ -843,8 +869,6 @@ func refactorTypeSwitchStmt(ctx rewriteContext, s *dst.TypeSwitchStmt) error {
 	return nil
 }
 
-// liftCallAndCheck generates `val, err := call()` and `if err != nil { ... }`.
-// It handles unique naming for `val` and `err`.
 func liftCallAndCheck(ctx rewriteContext, call dst.Expr, useExistingVars bool) ([]dst.Stmt, error) {
 	if call == nil {
 		return nil, fmt.Errorf("nil call")
@@ -852,7 +876,6 @@ func liftCallAndCheck(ctx rewriteContext, call dst.Expr, useExistingVars bool) (
 	callClone := dst.Clone(call).(dst.Expr)
 	astgen.ClearDecorations(callClone)
 
-	// Determine variable names
 	errName := "err"
 	valName := "val"
 	if ctx.scope != nil {
@@ -860,11 +883,6 @@ func liftCallAndCheck(ctx rewriteContext, call dst.Expr, useExistingVars bool) (
 		valName = analysis.GenerateUniqueName(ctx.scope, "val")
 	}
 
-	// Assume targetSig is available to determine if we need `val` or tuple decomposition
-	// For simplicity, we create `val, err := call()`. If it was void, `err := call()`.
-	// Since propagation means signature changed to add error, it definitely returns error now.
-	// If it was void before, it returns just expected error?
-	// We check `targetSig`.
 	isTuple := false
 	if ctx.targetSig != nil && ctx.targetSig.Results().Len() > 1 {
 		isTuple = true
@@ -882,8 +900,6 @@ func liftCallAndCheck(ctx rewriteContext, call dst.Expr, useExistingVars bool) (
 		Rhs: []dst.Expr{callClone},
 	}
 
-	// Generate check block
-	// `if err != nil { ... }`
 	cond := &dst.BinaryExpr{
 		X:  dst.NewIdent(errName),
 		Op: token.NEQ,
@@ -892,7 +908,7 @@ func liftCallAndCheck(ctx rewriteContext, call dst.Expr, useExistingVars bool) (
 
 	var body *dst.BlockStmt
 	if ctx.isTerminal {
-		body = generateDstTerminalBody(ctx.strategy, ctx.testParam)
+		body = generateDstTerminalBody(ctx.strategy, ctx.testParam, ctx.dstFile)
 	} else {
 		zeroCtx := astgen.ZeroCtx{
 			IsNameSafe: func(name string, expected types.Object) bool {
@@ -906,7 +922,7 @@ func liftCallAndCheck(ctx rewriteContext, call dst.Expr, useExistingVars bool) (
 				return obj == expected
 			},
 		}
-		body = generateDstReturnBody(ctx.enclosingSig, zeroCtx)
+		body = generateDstReturnBody(ctx.enclosingSig, zeroCtx, ctx.dstFile)
 	}
 
 	check := &dst.IfStmt{
@@ -919,17 +935,13 @@ func liftCallAndCheck(ctx rewriteContext, call dst.Expr, useExistingVars bool) (
 
 func replaceInParent(parent, oldNode, newNode dst.Node) {
 	if b, ok := parent.(*dst.BlockStmt); ok {
-		// Standard sequential replacement
 		for i, stmt := range b.List {
 			if stmt == oldNode {
-				// If substitution is a BlockStmt, verify content.
-				// Actually dst.BlockStmt is a Stmt, so we can put it in List directly.
 				b.List[i] = newNode.(dst.Stmt)
 				return
 			}
 		}
 	}
-	// Case statements
 	if cc, ok := parent.(*dst.CaseClause); ok {
 		for i, stmt := range cc.Body {
 			if stmt == oldNode {
@@ -938,7 +950,6 @@ func replaceInParent(parent, oldNode, newNode dst.Node) {
 			}
 		}
 	}
-	// Note: Switch/If/etc parents handling omitted for brevity, logic usually inside Blocks
 }
 
 func insertAfterInParent(parent, target, toInsert dst.Node) {
@@ -960,13 +971,13 @@ func generateBasicCheck(ctx rewriteContext) *dst.IfStmt {
 		Op: token.NEQ,
 		Y:  dst.NewIdent("nil"),
 	}
+
 	var body *dst.BlockStmt
 	if ctx.isTerminal {
-		body = generateDstTerminalBody(ctx.strategy, ctx.testParam)
+		body = generateDstTerminalBody(ctx.strategy, ctx.testParam, ctx.dstFile)
 	} else {
 		zeroCtx := astgen.ZeroCtx{
 			IsNameSafe: func(name string, expected types.Object) bool {
-				// Shadowing check
 				if ctx.scope == nil {
 					return true
 				}
@@ -977,8 +988,9 @@ func generateBasicCheck(ctx rewriteContext) *dst.IfStmt {
 				return obj == expected
 			},
 		}
-		body = generateDstReturnBody(ctx.enclosingSig, zeroCtx)
+		body = generateDstReturnBody(ctx.enclosingSig, zeroCtx, ctx.dstFile)
 	}
+
 	return &dst.IfStmt{Cond: cond, Body: body}
 }
 
@@ -993,7 +1005,7 @@ func generateCheckBlock(callExpr dst.Expr, ctx rewriteContext) *dst.IfStmt {
 	return ifStmt
 }
 
-func generateDstTerminalBody(strategy MainHandlerStrategy, testParam string) *dst.BlockStmt {
+func generateDstTerminalBody(strategy MainHandlerStrategy, testParam string, dstFile *dst.File) *dst.BlockStmt {
 	var stmts []dst.Stmt
 	arg := dst.NewIdent("err")
 
@@ -1012,22 +1024,24 @@ func generateDstTerminalBody(strategy MainHandlerStrategy, testParam string) *ds
 		case HandlerPanic:
 			stmts = []dst.Stmt{&dst.ExprStmt{X: &dst.CallExpr{Fun: dst.NewIdent("panic"), Args: []dst.Expr{arg}}}}
 		case HandlerOsExit:
+			ensureImportDST(dstFile, "fmt")
+			ensureImportDST(dstFile, "os")
 			stmts = []dst.Stmt{
 				&dst.ExprStmt{X: &dst.CallExpr{Fun: &dst.SelectorExpr{X: dst.NewIdent("fmt"), Sel: dst.NewIdent("Println")}, Args: []dst.Expr{arg}}},
 				&dst.ExprStmt{X: &dst.CallExpr{Fun: &dst.SelectorExpr{X: dst.NewIdent("os"), Sel: dst.NewIdent("Exit")}, Args: []dst.Expr{&dst.BasicLit{Kind: token.INT, Value: "1"}}}},
 			}
 		default:
+			ensureImportDST(dstFile, "log")
 			stmts = []dst.Stmt{&dst.ExprStmt{X: &dst.CallExpr{Fun: &dst.SelectorExpr{X: dst.NewIdent("log"), Sel: dst.NewIdent("Fatal")}, Args: []dst.Expr{arg}}}}
 		}
 	}
 	return &dst.BlockStmt{List: stmts}
 }
 
-func generateDstReturnBody(sig *types.Signature, zeroCtx astgen.ZeroCtx) *dst.BlockStmt {
+func generateDstReturnBody(sig *types.Signature, zeroCtx astgen.ZeroCtx, dstFile *dst.File) *dst.BlockStmt {
 	var results []dst.Expr
 	if sig != nil {
 		limit := sig.Results().Len()
-		// If last is error, don't zero it, use "err"
 		limit--
 		for i := 0; i < limit; i++ {
 			t := sig.Results().At(i).Type()
@@ -1042,13 +1056,15 @@ func generateDstReturnBody(sig *types.Signature, zeroCtx astgen.ZeroCtx) *dst.Bl
 	return &dst.BlockStmt{List: []dst.Stmt{&dst.ReturnStmt{Results: results}}}
 }
 
-func mapAstToDst(astFile *ast.File, dstFile *dst.File, targetNode ast.Node) (dst.Node, dst.Node) {
+func mapAstToDst(astFile *ast.File, dstFile *dst.File, targetNode ast.Node) (dst.Node, dst.Node, error) {
 	start := targetNode.Pos()
 	end := targetNode.End()
 	path, _ := astutil.PathEnclosingInterval(astFile, start, end)
+
 	if len(path) == 0 || path[len(path)-1] != astFile || start < astFile.Pos() || end > astFile.End() {
-		return nil, nil
+		return nil, nil, fmt.Errorf("node not found in file path")
 	}
+
 	startIndex := -1
 	for i, n := range path {
 		if n == targetNode {
@@ -1056,8 +1072,9 @@ func mapAstToDst(astFile *ast.File, dstFile *dst.File, targetNode ast.Node) (dst
 			break
 		}
 	}
+
 	if startIndex == -1 {
-		return nil, nil
+		return nil, nil, fmt.Errorf("target node not found in enclosing path")
 	}
 
 	var currentDst dst.Node = dstFile
@@ -1066,16 +1083,17 @@ func mapAstToDst(astFile *ast.File, dstFile *dst.File, targetNode ast.Node) (dst
 	for i := len(path) - 2; i >= startIndex; i-- {
 		step, err := determineTraversalStepFn(path[i+1], path[i])
 		if err != nil {
-			return nil, nil
+			return nil, nil, err
 		}
 		nextDst, err := applyTraversalStep(currentDst, step)
 		if err != nil {
-			return nil, nil
+			return nil, nil, err
 		}
 		parentDst = currentDst
 		currentDst = nextDst
 	}
-	return currentDst, parentDst
+
+	return currentDst, parentDst, nil
 }
 
 type tStep struct {
@@ -1088,6 +1106,7 @@ func determineTraversalStep(parent, child ast.Node) (tStep, error) {
 	if val.Kind() == reflect.Ptr {
 		val = val.Elem()
 	}
+
 	for i := 0; i < val.NumField(); i++ {
 		fieldVal := val.Field(i)
 		fieldType := val.Type().Field(i)
@@ -1095,6 +1114,7 @@ func determineTraversalStep(parent, child ast.Node) (tStep, error) {
 		if fieldType.PkgPath != "" {
 			continue
 		}
+
 		if fieldVal.Kind() == reflect.Slice {
 			for idx := 0; idx < fieldVal.Len(); idx++ {
 				if fieldVal.Index(idx).Interface() == child {
@@ -1102,6 +1122,7 @@ func determineTraversalStep(parent, child ast.Node) (tStep, error) {
 				}
 			}
 		}
+
 		if fieldVal.Kind() == reflect.Ptr || fieldVal.Kind() == reflect.Interface {
 			if !fieldVal.IsNil() && fieldVal.Interface() == child {
 				return tStep{FieldName: name, Index: -1}, nil
@@ -1116,10 +1137,12 @@ func applyTraversalStep(node dst.Node, step tStep) (dst.Node, error) {
 	if val.Kind() == reflect.Ptr {
 		val = val.Elem()
 	}
+
 	fieldVal := val.FieldByName(step.FieldName)
 	if !fieldVal.IsValid() {
-		return nil, fmt.Errorf("invalid field %s", step.FieldName)
+		return nil, fmt.Errorf("invalid field %s on type %T", step.FieldName, node)
 	}
+
 	if step.Index >= 0 {
 		if fieldVal.Kind() != reflect.Slice || step.Index >= fieldVal.Len() {
 			return nil, fmt.Errorf("dst slice index out of bounds")
@@ -1132,6 +1155,7 @@ func applyTraversalStep(node dst.Node, step tStep) (dst.Node, error) {
 			return res, nil
 		}
 	}
+
 	return nil, fmt.Errorf("failed to extract node")
 }
 

@@ -46,6 +46,7 @@ func (m *mapProvider) MarkModified(file *ast.File) {
 
 func setupMultiFileEnv(t *testing.T, files map[string]string) (*packages.Package, []*ast.File, map[*ast.File]*dst.File) {
 	t.Helper()
+
 	tmpDir := t.TempDir()
 	fset := token.NewFileSet()
 	var astFiles []*ast.File
@@ -76,11 +77,13 @@ func setupMultiFileEnv(t *testing.T, files map[string]string) (*packages.Package
 		Defs:  make(map[*ast.Ident]types.Object),
 		Uses:  make(map[*ast.Ident]types.Object),
 	}
+
 	conf := types.Config{Importer: importer.Default()}
 	pkgTypes, err := conf.Check("main", fset, astFiles, info)
 	if err != nil {
 		t.Fatalf("type check failed: %v", err)
 	}
+
 	pkg := &packages.Package{
 		Fset:      fset,
 		Syntax:    astFiles,
@@ -88,6 +91,7 @@ func setupMultiFileEnv(t *testing.T, files map[string]string) (*packages.Package
 		TypesInfo: info,
 		GoFiles:   goFiles,
 	}
+
 	return pkg, astFiles, dstFiles
 }
 
@@ -124,8 +128,8 @@ func TestPropagateCallers_NilTarget(t *testing.T) {
 
 func TestPropagateCallers_GetError(t *testing.T) {
 	src := `package main
-func Target() {} 
-func main() { Target() } 
+func Target() {}
+func main() { Target() }
 `
 	pkg, _, _ := setupPropagateEnv(t, src)
 	targetFunc := findDecl(t, pkg, "Target")
@@ -163,7 +167,7 @@ func TestProcessCallSite_NilArgs(t *testing.T) {
 
 func TestProcessCallSite_NoCallOrStmt(t *testing.T) {
 	src := `package main
-func Target() {} 
+func Target() {}
 `
 	pkg, astFile, dstFile := setupPropagateEnv(t, src)
 	var decl *ast.FuncDecl
@@ -195,8 +199,8 @@ func TestHandleEntryPoint_NoFile(t *testing.T) {
 
 func TestHandleEntryPoint_Success(t *testing.T) {
 	src := `package main
-func Target() {} 
-func main() { Target() } 
+func Target() {}
+func main() { Target() }
 `
 	pkg, astFile, dstFile := setupPropagateEnv(t, src)
 	call, stmt := findCallStmt(t, astFile, "Target")
@@ -211,9 +215,9 @@ func main() { Target() }
 
 func TestHandleTestError_Success(t *testing.T) {
 	src := `package main
-import "testing" 
-func Target() {} 
-func TestFoo(t *testing.T) { Target() } 
+import "testing"
+func Target() {}
+func TestFoo(t *testing.T) { Target() }
 `
 	pkg, astFile, dstFile := setupPropagateEnv(t, src)
 	call, stmt := findCallStmt(t, astFile, "Target")
@@ -267,7 +271,7 @@ func TestHasTrailingErrorReturnDST(t *testing.T) {
 }
 
 func TestGenerateDstTerminalBody_OsExit(t *testing.T) {
-	body := generateDstTerminalBody(HandlerOsExit, "")
+	body := generateDstTerminalBody(HandlerOsExit, "", &dst.File{})
 	if len(body.List) != 2 {
 		t.Fatalf("expected 2 statements, got %d", len(body.List))
 	}
@@ -284,7 +288,7 @@ func TestGenerateDstTerminalBody_OsExit(t *testing.T) {
 }
 
 func TestGenerateDstReturnBody_NilSig(t *testing.T) {
-	body := generateDstReturnBody(nil, astgen.ZeroCtx{})
+	body := generateDstReturnBody(nil, astgen.ZeroCtx{}, &dst.File{})
 	if len(body.List) != 1 {
 		t.Fatal("expected single return")
 	}
@@ -312,6 +316,7 @@ func TestGenerateBasicCheck_Terminal(t *testing.T) {
 	ctx := rewriteContext{
 		isTerminal: true,
 		strategy:   HandlerPanic,
+		dstFile:    &dst.File{},
 	}
 	ifStmt := generateBasicCheck(ctx)
 	out := renderDST(t, &dst.File{Name: dst.NewIdent("p"), Decls: []dst.Decl{
@@ -329,6 +334,7 @@ func TestGenerateBasicCheck_ScopeNil(t *testing.T) {
 		enclosingSig: sig,
 		scope:        nil,
 		pos:          token.Pos(1),
+		dstFile:      &dst.File{},
 	}
 	ifStmt := generateBasicCheck(ctx)
 	ret := ifStmt.Body.List[0].(*dst.ReturnStmt)
@@ -345,6 +351,7 @@ func TestGenerateBasicCheck_ScopeLookupNil(t *testing.T) {
 		enclosingSig: sig,
 		scope:        scope,
 		pos:          token.Pos(50),
+		dstFile:      &dst.File{},
 	}
 	ifStmt := generateBasicCheck(ctx)
 	ret := ifStmt.Body.List[0].(*dst.ReturnStmt)
@@ -363,6 +370,7 @@ func TestGenerateBasicCheck_ScopeShadowed(t *testing.T) {
 		enclosingSig: sig,
 		scope:        scope,
 		pos:          token.Pos(50),
+		dstFile:      &dst.File{},
 	}
 	ifStmt := generateBasicCheck(ctx)
 	ret := ifStmt.Body.List[0].(*dst.ReturnStmt)
@@ -385,7 +393,7 @@ func TestMapAstToDst_NotInFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if node, _ := mapAstToDst(f1, dst1, f2.Name); node != nil {
+	if node, _, _ := mapAstToDst(f1, dst1, f2.Name); node != nil {
 		t.Error("expected nil mapping for node not in file")
 	}
 }
@@ -401,7 +409,7 @@ func TestMapAstToDst_StartIndexMissing(t *testing.T) {
 		t.Fatal(err)
 	}
 	fake := &ast.Ident{Name: "X", NamePos: f.Pos() + 1}
-	if node, _ := mapAstToDst(f, dstFile, fake); node != nil {
+	if node, _, _ := mapAstToDst(f, dstFile, fake); node != nil {
 		t.Error("expected nil mapping for missing target in path")
 	}
 }
@@ -424,7 +432,7 @@ func TestMapAstToDst_ApplyTraversalError(t *testing.T) {
 	if call == nil {
 		t.Fatal("call not found")
 	}
-	if node, _ := mapAstToDst(f, dstFile, call); node != nil {
+	if node, _, _ := mapAstToDst(f, dstFile, call); node != nil {
 		t.Error("expected nil mapping when dst traversal fails")
 	}
 }
@@ -455,7 +463,7 @@ func TestMapAstToDst_DetermineStepError(t *testing.T) {
 		return tStep{}, errors.New("boom")
 	}
 	t.Cleanup(func() { determineTraversalStepFn = orig })
-	if node, _ := mapAstToDst(f, dstFile, call); node != nil {
+	if node, _, _ := mapAstToDst(f, dstFile, call); node != nil {
 		t.Error("expected nil mapping on determineTraversalStep error")
 	}
 }
@@ -471,15 +479,15 @@ func TestMapAstToDst_PathEmpty(t *testing.T) {
 		t.Fatal(err)
 	}
 	fake := &ast.Ident{Name: "X", NamePos: f.End() + 10}
-	if node, _ := mapAstToDst(f, dstFile, fake); node != nil {
+	if node, _, _ := mapAstToDst(f, dstFile, fake); node != nil {
 		t.Error("expected nil mapping for out-of-file position")
 	}
 }
 
 func TestProcessCallSite_MapError(t *testing.T) {
 	src := `package main
-func Target() {} 
-func main() { Target() } 
+func Target() {}
+func main() { Target() }
 `
 	pkg, astFile, _ := setupPropagateEnv(t, src)
 	targetFunc := findDecl(t, pkg, "Target")
@@ -492,12 +500,12 @@ func main() { Target() }
 
 func TestProcessCallSite_TestHelper(t *testing.T) {
 	src := `package main
-import "testing" 
-func Target() {} 
-func helper(t *testing.T) { 
-  t.Helper() 
-  Target() 
-} 
+import "testing"
+func Target() {}
+func helper(t *testing.T) {
+  t.Helper()
+  Target()
+}
 `
 	pkg, astFile, dstFile := setupPropagateEnv(t, src)
 	target := findDecl(t, pkg, "Target")
@@ -517,8 +525,8 @@ func helper(t *testing.T) {
 
 func TestProcessCallSite_AddErrorToSignatureError(t *testing.T) {
 	src := `package main
-func Target() {} 
-func Caller() { Target() } 
+func Target() {}
+func Caller() { Target() }
 `
 	pkg, astFile, dstFile := setupPropagateEnv(t, src)
 	target := findDecl(t, pkg, "Target")
@@ -535,8 +543,8 @@ func Caller() { Target() }
 
 func TestProcessCallSite_PatchSignatureError(t *testing.T) {
 	src := `package main
-func Target() {} 
-func Caller() { Target() } 
+func Target() {}
+func Caller() { Target() }
 `
 	pkg, astFile, dstFile := setupPropagateEnv(t, src)
 	target := findDecl(t, pkg, "Target")
@@ -560,11 +568,11 @@ func Caller() { Target() }
 
 func TestProcessCallSite_UnsupportedStmtError(t *testing.T) {
 	src := `package main
-func Target() bool { return true } 
-func Caller() { 
-  for Target() { 
-  } 
-} 
+func Target() bool { return true }
+func Caller() {
+  for Target() {
+  }
+}
 `
 	// Note: IfStmt is now supported, so changed test case to ForStmt which is still unsupported in this context
 	pkg, astFile, dstFile := setupPropagateEnv(t, src)
@@ -582,16 +590,19 @@ func TestDetermineTraversalStep(t *testing.T) {
 	if err != nil || step.FieldName != "List" || step.Index != 0 {
 		t.Fatalf("unexpected step: %+v err=%v", step, err)
 	}
+
 	ifStmt := &ast.IfStmt{Cond: &ast.Ident{Name: "x"}, Body: &ast.BlockStmt{}}
 	step, err = determineTraversalStep(ifStmt, ifStmt.Cond)
 	if err != nil || step.FieldName != "Cond" || step.Index != -1 {
 		t.Fatalf("unexpected step for pointer field: %+v err=%v", step, err)
 	}
+
 	exprStmt := &ast.ExprStmt{X: &ast.Ident{Name: "x"}}
 	step, err = determineTraversalStep(exprStmt, exprStmt.X)
 	if err != nil || step.FieldName != "X" || step.Index != -1 {
 		t.Fatalf("unexpected step for interface field: %+v err=%v", step, err)
 	}
+
 	if _, err := determineTraversalStep(block, &ast.ReturnStmt{}); err == nil {
 		t.Error("expected error when child not found")
 	}
@@ -626,15 +637,19 @@ func TestApplyTraversalStep(t *testing.T) {
 	if _, err := applyTraversalStep(&dst.BlockStmt{}, tStep{FieldName: "Nope", Index: -1}); err == nil {
 		t.Error("expected error for invalid field")
 	}
+
 	if _, err := applyTraversalStep(&fakeNode{Child: 1}, tStep{FieldName: "Child", Index: 0}); err == nil {
 		t.Error("expected error for non-slice indexed field")
 	}
+
 	if _, err := applyTraversalStep(&fakeNode{Items: []int{1}}, tStep{FieldName: "Items", Index: 0}); err == nil {
 		t.Error("expected error for non-node slice element")
 	}
+
 	if _, err := applyTraversalStep(&dst.BlockStmt{List: []dst.Stmt{&dst.EmptyStmt{}}}, tStep{FieldName: "List", Index: 0}); err != nil {
 		t.Fatalf("unexpected error for slice element: %v", err)
 	}
+
 	if _, err := applyTraversalStep(&dst.ExprStmt{X: dst.NewIdent("x")}, tStep{FieldName: "X", Index: -1}); err != nil {
 		t.Fatalf("unexpected error for non-slice node: %v", err)
 	}
@@ -766,6 +781,7 @@ func TestGetErrorReturnNameAndWrapper(t *testing.T) {
 	if got := getErrorReturnNameDST(ft4); got != "" {
 		t.Errorf("expected empty name for non-error result, got %q", got)
 	}
+
 	if !isErrorDstExprWrapper(dst.NewIdent("error")) {
 		t.Error("expected error wrapper true")
 	}
@@ -797,10 +813,10 @@ func TestEnsureImportDST(t *testing.T) {
 
 func TestGetScope(t *testing.T) {
 	src := `package main
-func main() { 
+func main() {
   var x int
   _ = x
-} 
+}
 `
 	fset := token.NewFileSet()
 	astFile, err := parser.ParseFile(fset, "main.go", src, 0)
@@ -821,6 +837,7 @@ func main() {
 	if block == nil || ident == nil {
 		t.Fatal("nodes not found")
 	}
+
 	scopeBlock := types.NewScope(nil, 1, 100, "block")
 	scopeFile := types.NewScope(nil, 1, 100, "file")
 	info := &types.Info{Scopes: map[ast.Node]*types.Scope{block: scopeBlock, astFile: scopeFile}}
@@ -830,6 +847,7 @@ func main() {
 		Types:     types.NewPackage("main", "main"),
 		TypesInfo: info,
 	}
+
 	if scope := getScope(pkg, block); scope != scopeBlock {
 		t.Error("expected direct scope lookup")
 	}
@@ -846,6 +864,7 @@ func main() {
 	if scope := getScope(pkgNoScopes, ident); scope != pkg.Types.Scope() {
 		t.Error("expected fallback to package scope")
 	}
+
 	pkgNilInfo := &packages.Package{Types: pkg.Types}
 	if getScope(pkgNilInfo, ident) != nil {
 		t.Error("expected nil for missing types info")
@@ -865,6 +884,7 @@ func TestGetSignatureAndEquivalence(t *testing.T) {
 	fn := types.NewFunc(token.NoPos, nil, "f", sigA)
 	v := types.NewVar(token.NoPos, nil, "v", sigA)
 	vOther := types.NewVar(token.NoPos, nil, "v2", types.Typ[types.Int])
+
 	if getSignature(fn) != sigA {
 		t.Error("expected signature for func")
 	}
@@ -894,8 +914,8 @@ func TestGetSignatureAndEquivalence(t *testing.T) {
 
 func TestHandleEntryPoint_MapError(t *testing.T) {
 	src := `package main
-func Target() {} 
-func main() { Target() } 
+func Target() {}
+func main() { Target() }
 `
 	pkg, astFile, _ := setupPropagateEnv(t, src)
 	call, stmt := findCallStmt(t, astFile, "Target")
@@ -906,9 +926,9 @@ func main() { Target() }
 
 func TestHandleTestError_MapError(t *testing.T) {
 	src := `package main
-import "testing" 
-func Target() {} 
-func TestFoo(t *testing.T) { Target() } 
+import "testing"
+func Target() {}
+func TestFoo(t *testing.T) { Target() }
 `
 	pkg, astFile, _ := setupPropagateEnv(t, src)
 	call, stmt := findCallStmt(t, astFile, "Target")
@@ -953,8 +973,8 @@ func TestFindIdentForObj(t *testing.T) {
 
 func TestProcessVarPropagation_NoDefinition(t *testing.T) {
 	src := `package main
-func Target() {} 
-func main() { Target() } 
+func Target() {}
+func main() { Target() }
 `
 	pkg, astFile, dstFile := setupPropagateEnv(t, src)
 	targetFunc := findDecl(t, pkg, "Target")
@@ -970,7 +990,7 @@ func main() { Target() }
 
 func TestProcessVarPropagation_TargetSigMissing(t *testing.T) {
 	src := `package main
-func Target() {} 
+func Target() {}
 var f = Target
 `
 	pkg, astFile, dstFile := setupPropagateEnv(t, src)
@@ -994,11 +1014,11 @@ var f = Target
 func TestProcessVarPropagation_DefinitionOtherFile(t *testing.T) {
 	files := map[string]string{
 		"a.go": `package main
-var f func() 
-func Target() {} 
+var f func()
+func Target() {}
 `,
 		"b.go": `package main
-func assign() { f = Target } 
+func assign() { f = Target }
 `,
 	}
 	pkg, astFiles, dstFiles := setupMultiFileEnv(t, files)
@@ -1047,7 +1067,7 @@ func assign() { f = Target }
 
 func TestProcessVarPropagation_AlreadyHasError(t *testing.T) {
 	src := `package main
-func Target() error { return nil } 
+func Target() error { return nil }
 var f func() error = Target
 `
 	pkg, astFile, dstFile := setupPropagateEnv(t, src)
@@ -1074,7 +1094,7 @@ var f func() error = Target
 
 func TestProcessVarPropagation_DefinitionGetError(t *testing.T) {
 	src := `package main
-func Target() {} 
+func Target() {}
 var f = Target
 `
 	pkg, astFile, dstFile := setupPropagateEnv(t, src)
@@ -1097,9 +1117,9 @@ var f = Target
 
 func TestProcessVarPropagation_PatchVarTypeError_DefiningIdent(t *testing.T) {
 	src := `package main
-func Target() {} 
-var f func() 
-func main() { f = Target } 
+func Target() {}
+var f func()
+func main() { f = Target }
 `
 	pkg, astFile, dstFile := setupPropagateEnv(t, src)
 	var targetID *ast.Ident
@@ -1129,11 +1149,11 @@ func main() { f = Target }
 func TestProcessVarPropagation_PatchVarTypeError_DefFile(t *testing.T) {
 	files := map[string]string{
 		"a.go": `package main
-var f func() 
-func Target() {} 
+var f func()
+func Target() {}
 `,
 		"b.go": `package main
-func assign() { f = Target } 
+func assign() { f = Target }
 `,
 	}
 	pkg, astFiles, dstFiles := setupMultiFileEnv(t, files)
@@ -1172,7 +1192,7 @@ func assign() { f = Target }
 
 func TestPropagateCallers_ProcessVarPropagationError(t *testing.T) {
 	src := `package main
-func Target() {} 
+func Target() {}
 var f = Target
 `
 	pkg, astFile, dstFile := setupPropagateEnv(t, src)
@@ -1186,9 +1206,7 @@ var f = Target
 		t.Fatal("Target decl not found")
 	}
 	AddErrorToSignature(pkg.Fset, targetDecl)
-	if err := PatchSignature(pkg.TypesInfo, targetDecl, pkg.Types); err != nil {
-		t.Fatalf("PatchSignature failed: %v", err)
-	}
+	PatchSignature(pkg.TypesInfo, targetDecl, pkg.Types)
 	targetFunc := pkg.TypesInfo.ObjectOf(targetDecl.Name)
 	orig := patchVarTypeFn
 	patchVarTypeFn = func(*types.Info, *ast.Ident, *types.Signature) (*types.Var, error) {
@@ -1196,7 +1214,7 @@ var f = Target
 	}
 	t.Cleanup(func() { patchVarTypeFn = orig })
 	if _, err := PropagateCallers([]*packages.Package{pkg}, &mockProvider{f: dstFile}, targetFunc, "log-fatal"); err == nil {
-		t.Error("expected error from processVarPropagationDST")
+		t.Error("expected error return if processVarPropagationDST fails")
 	}
 }
 
@@ -1208,6 +1226,7 @@ func TestRefactorCallSite_TailOptimization(t *testing.T) {
 	sig := types.NewSignature(nil, nil, types.NewTuple(types.NewVar(token.NoPos, nil, "", errType)), false)
 	ctx := rewriteContext{
 		stmt:         exprStmt,
+		call:         call,
 		parent:       block,
 		enclosingSig: sig,
 		targetSig:    sig,
@@ -1359,7 +1378,6 @@ func TestRefactorSwitchStmt_Init(t *testing.T) {
 		Body: &dst.BlockStmt{},
 	}
 	_ = stmt
-	// Handled via E2E logic in propagate_test.go usually, checking helper logic here if needed
 }
 
 type dstSwitchStmt = dst.SwitchStmt

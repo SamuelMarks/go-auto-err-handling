@@ -17,12 +17,18 @@ import (
 
 // Injector handles the rewriting of ASTs/DSTs to inject error handling logic.
 type Injector struct {
-	Fset                *token.FileSet
-	Pkg                 *packages.Package
-	ErrorTemplate       string
+	// Fset is the token file set.
+	Fset *token.FileSet
+	// Pkg is the package information containing type info.
+	Pkg *packages.Package
+	// ErrorTemplate is the string template for generating return statements.
+	ErrorTemplate string
+	// MainHandlerStrategy defines how to handle errors in entry points (main/init).
 	MainHandlerStrategy string
-	NonErrorFallback    string
-	RetainPanics        bool
+	// NonErrorFallback defines how to handle errors when signature cannot be changed.
+	NonErrorFallback string
+	// RetainPanics indicates if panic calls should be kept in specific scenarios.
+	RetainPanics bool
 	// TestParam is the name of the testing parameter (e.g. "t") for the current injection context.
 	// If set, errors are handled via t.Fatal(err) instead of being returned or logged.
 	TestParam string
@@ -39,14 +45,17 @@ var generateAssignmentDSTFunc = func(i *Injector, point analysis.InjectionPoint,
 }
 
 // liftCompositeLitFunc is a test hook for overriding liftCompositeLit behavior.
-var liftCompositeLitFunc = func(i *Injector, stmt dst.Stmt, entry targetEntry, astFile *ast.File) ([]dst.Stmt, error) {
-	return i.liftCompositeLit(stmt, entry, astFile)
+var liftCompositeLitFunc = func(i *Injector, stmt dst.Stmt, entry targetEntry, astFile *ast.File, dstFile *dst.File) ([]dst.Stmt, error) {
+	return i.liftCompositeLit(stmt, entry, astFile, dstFile)
 }
 
 // targetEntry holds pre-resolved DST nodes for an injection point.
 type targetEntry struct {
-	point   analysis.InjectionPoint
+	// point is the original analysis injection point.
+	point analysis.InjectionPoint
+	// dstStmt is the resolved DST statement.
 	dstStmt dst.Stmt
+	// dstCall is the resolved DST call expression (can be nil).
 	dstCall *dst.CallExpr // Can be nil if call resolution failed or not needed
 }
 
@@ -69,9 +78,14 @@ func NewInjector(pkg *packages.Package, errorTemplate, mainHandler string, retai
 }
 
 // RewriteFile applies specific injection points to a single file using DST transformations.
+//
+// dstFile: The DST file to rewrite.
+// astFile: The AST file corresponding to the DST file.
+// points: The list of injection points to handle.
+//
+// Returns true if any changes were applied.
 func (i *Injector) RewriteFile(dstFile *dst.File, astFile *ast.File, points []analysis.InjectionPoint) (bool, error) {
 	// 0. Pre-resolve AST -> DST mappings BEFORE any mutation.
-	// This prevents index desync issues if RewriteDefers adds statements.
 	targetMap := make(map[dst.Stmt][]targetEntry)
 	for _, p := range points {
 		if p.Stmt == nil {
@@ -141,8 +155,7 @@ func (i *Injector) RewriteFile(dstFile *dst.File, astFile *ast.File, points []an
 			entry := entries[0]
 			// Case: IfStmt
 			if ifStmt, ok := stmt.(*dst.IfStmt); ok {
-				// Check recursively if Init or Cond are targeted
-				handled, replacements, liftErr := i.tryLiftIf(ifStmt, entry, astFile)
+				handled, replacements, liftErr := i.tryLiftIf(ifStmt, entry, astFile, dstFile)
 				if liftErr != nil {
 					err = liftErr
 					return false
@@ -156,7 +169,7 @@ func (i *Injector) RewriteFile(dstFile *dst.File, astFile *ast.File, points []an
 
 			// Case: SwitchStmt
 			if swStmt, ok := stmt.(*dst.SwitchStmt); ok {
-				handled, replacements, liftErr := i.tryLiftSwitch(swStmt, entry, astFile)
+				handled, replacements, liftErr := i.tryLiftSwitch(swStmt, entry, astFile, dstFile)
 				if liftErr != nil {
 					err = liftErr
 					return false
@@ -170,7 +183,7 @@ func (i *Injector) RewriteFile(dstFile *dst.File, astFile *ast.File, points []an
 
 			// Case: TypeSwitchStmt (switch x := y.(type))
 			if typeSw, ok := stmt.(*dst.TypeSwitchStmt); ok {
-				handled, replacements, liftErr := i.tryLiftTypeSwitch(typeSw, entry, astFile)
+				handled, replacements, liftErr := i.tryLiftTypeSwitch(typeSw, entry, astFile, dstFile)
 				if liftErr != nil {
 					err = liftErr
 					return false
@@ -201,7 +214,7 @@ func (i *Injector) RewriteFile(dstFile *dst.File, astFile *ast.File, points []an
 				isEmbedded := i.isCallEmbeddedInComposite(stmt, entry.dstCall)
 				if isEmbedded {
 					// Lift: Generates preamble statements and mutates stmt IN-PLACE
-					lifts, liftErr := liftCompositeLitFunc(i, stmt, *entry, astFile)
+					lifts, liftErr := liftCompositeLitFunc(i, stmt, *entry, astFile, dstFile)
 					if liftErr != nil {
 						err = liftErr
 						return false
@@ -212,18 +225,13 @@ func (i *Injector) RewriteFile(dstFile *dst.File, astFile *ast.File, points []an
 				}
 			}
 
-			// If not embedded, it's a candidate for standard statement rewrite.
-			// Use the last one encountered if multiple (conflicts handled by overwrite).
 			standardRewriteEntry = entry
 		}
 
 		if standardRewriteEntry != nil {
 			entry := *standardRewriteEntry
-			// Standard Simple Rewrite
-			// Detect Tail Position for Optimization
 			isTail := false
 			if block, ok := c.Parent().(*dst.BlockStmt); ok {
-				// Check if this is the last statement in the list
 				if c.Index() == len(block.List)-1 {
 					isTail = true
 				}
@@ -235,7 +243,7 @@ func (i *Injector) RewriteFile(dstFile *dst.File, astFile *ast.File, points []an
 			switch s := stmt.(type) {
 			case *dst.GoStmt:
 				var converted *dst.GoStmt
-				converted, genErr = i.generateGoRewriteDST(entry.point, s, entry.dstCall)
+				converted, genErr = i.generateGoRewriteDST(entry.point, s, entry.dstCall, dstFile)
 				if converted != nil {
 					newNodes = []dst.Stmt{converted}
 				}
@@ -244,7 +252,7 @@ func (i *Injector) RewriteFile(dstFile *dst.File, astFile *ast.File, points []an
 				astCtx := i.getEnclosingContext(entry.point)
 				supportsErrReturn := i.supportsErrorReturn(astCtx.sig, astCtx.decl)
 				// Pass collapsed=true for standard statements and isTail check
-				newNodes, genErr = i.generateRewriteDST(entry.point, stmt, entry.dstCall, astCtx.sig, astCtx.decl, true, isTail)
+				newNodes, genErr = i.generateRewriteDST(entry.point, stmt, entry.dstCall, astCtx.sig, astCtx.decl, true, isTail, dstFile)
 				if genErr == nil && len(newNodes) == 0 && i.TestParam == "" && !supportsErrReturn {
 					var needsLogImport bool
 					newNodes, needsLogImport, genErr = i.generateNonErrorFallbackDST(entry.point, stmt, i.NonErrorFallback)
@@ -261,13 +269,11 @@ func (i *Injector) RewriteFile(dstFile *dst.File, astFile *ast.File, points []an
 
 			if len(newNodes) > 0 {
 				i.transferTrivia(stmt, newNodes)
-				// combine preambles + newNodes (replacing stmt)
 				combined := append(preambles, newNodes...)
 				i.replaceCursor(c, stmt, combined)
 				applied = true
 			}
 		} else if len(preambles) > 0 {
-			// Only lifts occurred. The original statement remains (mutated), preceded by preambles.
 			i.transferTrivia(stmt, preambles)
 			combined := append(preambles, stmt)
 			i.replaceCursor(c, stmt, combined)
@@ -285,15 +291,11 @@ func (i *Injector) isCallEmbeddedInComposite(stmt dst.Stmt, dstCall *dst.CallExp
 	if dstCall == nil {
 		return false
 	}
-	// We need to find the parent of dstCall.
-	// Since dst nodes don't have Parent pointers, we must search within stmt.
 	found := false
-
 	dst.Inspect(stmt, func(n dst.Node) bool {
 		if found {
 			return false
 		}
-		// We check children directly to identify the call.
 		if lit, ok := n.(*dst.CompositeLit); ok {
 			for _, elt := range lit.Elts {
 				if elt == dstCall {
@@ -310,13 +312,18 @@ func (i *Injector) isCallEmbeddedInComposite(stmt dst.Stmt, dstCall *dst.CallExp
 		}
 		return true
 	})
-
 	return found
 }
 
 // liftCompositeLit extracts deeply nested calls from composite literals into temporary variables.
-// It mutates stmt in-place and returns the preamble statements needed.
-func (i *Injector) liftCompositeLit(stmt dst.Stmt, entry targetEntry, astFile *ast.File) ([]dst.Stmt, error) {
+//
+// stmt: The statement containing the literal.
+// entry: The target entry with resolved DST nodes.
+// astFile: The AST file context.
+// dstFile: The DST file context.
+//
+// Returns a slice of preamble statements.
+func (i *Injector) liftCompositeLit(stmt dst.Stmt, entry targetEntry, astFile *ast.File, dstFile *dst.File) ([]dst.Stmt, error) {
 	dstCall := entry.dstCall
 	point := entry.point
 
@@ -327,9 +334,7 @@ func (i *Injector) liftCompositeLit(stmt dst.Stmt, entry targetEntry, astFile *a
 	astCtx := i.getEnclosingContext(point)
 	scope := i.getScope(point.Pos, point.File)
 
-	// Create Temp Var Name
 	baseName := "val"
-	// Try to find context for name (e.g. Field Name)
 	dst.Inspect(stmt, func(n dst.Node) bool {
 		if kv, ok := n.(*dst.KeyValueExpr); ok {
 			if kv.Value == dstCall {
@@ -345,7 +350,6 @@ func (i *Injector) liftCompositeLit(stmt dst.Stmt, entry targetEntry, astFile *a
 	tempVarName := analysis.GenerateUniqueName(scope, baseName)
 	replacementIdent := dst.NewIdent(tempVarName)
 
-	// Mutate Parent In-Place to swap call with temp var
 	replaced := false
 	dst.Inspect(stmt, func(n dst.Node) bool {
 		if replaced {
@@ -374,11 +378,9 @@ func (i *Injector) liftCompositeLit(stmt dst.Stmt, entry targetEntry, astFile *a
 		return nil, fmt.Errorf("failed to swap call in composite literal")
 	}
 
-	// Generate Preamble
 	errName, tok, declStmt := resolveErrorVarFunc(i, point, scope)
 	funcName := i.resolveFuncName(point)
 
-	// Create Assignment
 	dstCallClone := dst.Clone(dstCall).(*dst.CallExpr)
 	astgen.ClearDecorations(dstCallClone)
 
@@ -388,20 +390,20 @@ func (i *Injector) liftCompositeLit(stmt dst.Stmt, entry targetEntry, astFile *a
 		Rhs: []dst.Expr{dstCallClone},
 	}
 
-	// Handle case where scoping forces ASSIGN but we need temp var defined (:=).
-	// We force DEFINE because mixed assignment (new var, old var) matches := in Go.
 	if tok == token.ASSIGN {
 		assign.Tok = token.DEFINE
 	}
 
-	// Check Block
 	var handlerBlock *dst.BlockStmt
 	if i.TestParam != "" {
-		handlerBlock = i.generateTerminalHandlerDST(errName)
+		handlerBlock = i.generateTerminalHandlerDST(errName, dstFile)
 	} else {
 		zeroExprs, _ := i.generateZeroReturns(point, astCtx.sig, astCtx.decl)
-		retExprs, _, _ := RenderTemplateDST(i.ErrorTemplate, zeroExprs, errName, funcName)
+		retExprs, imports, _ := RenderTemplateDST(i.ErrorTemplate, zeroExprs, errName, funcName)
 		handlerBlock = &dst.BlockStmt{List: []dst.Stmt{&dst.ReturnStmt{Results: retExprs}}}
+		for _, imp := range imports {
+			i.addImportDST(dstFile, imp)
+		}
 	}
 
 	check := &dst.IfStmt{
@@ -421,26 +423,22 @@ func (i *Injector) liftCompositeLit(stmt dst.Stmt, entry targetEntry, astFile *a
 	return result, nil
 }
 
-// tryLiftIf checks if the IfStmt contains embedded calls that need lifting.
-func (i *Injector) tryLiftIf(ifStmt *dst.IfStmt, entry targetEntry, astFile *ast.File) (bool, []dst.Stmt, error) {
+func (i *Injector) tryLiftIf(ifStmt *dst.IfStmt, entry targetEntry, astFile *ast.File, dstFile *dst.File) (bool, []dst.Stmt, error) {
 	astIf, ok := entry.point.Stmt.(*ast.IfStmt)
 	if !ok || entry.point.Call == nil {
 		return false, nil, nil
 	}
 
-	// A: Init (call is inside the init statement)
 	if astIf.Init != nil && astNodeContainsCall(astIf.Init, entry.point.Call) {
 		if assign, ok := astIf.Init.(*ast.AssignStmt); ok {
-			// Preserve original init LHS for error variable naming.
 			entry.point.Assign = assign
 		}
-		res, err := i.liftControlInit(ifStmt, ifStmt.Init.(dst.Stmt), entry, astFile)
+		res, err := i.liftControlInit(ifStmt, ifStmt.Init.(dst.Stmt), entry, astFile, dstFile)
 		return true, res, err
 	}
 
-	// B: Cond (call is inside the condition)
 	if astIf.Cond != nil && astNodeContainsCall(astIf.Cond, entry.point.Call) {
-		res, err := i.liftControlExpr(ifStmt, ifStmt.Cond, entry, "cond", astFile, func(n dst.Node, e dst.Expr) {
+		res, err := i.liftControlExpr(ifStmt, ifStmt.Cond, entry, "cond", astFile, dstFile, func(n dst.Node, e dst.Expr) {
 			n.(*dst.IfStmt).Cond = e
 		})
 		return true, res, err
@@ -449,24 +447,22 @@ func (i *Injector) tryLiftIf(ifStmt *dst.IfStmt, entry targetEntry, astFile *ast
 	return false, nil, nil
 }
 
-func (i *Injector) tryLiftSwitch(swStmt *dst.SwitchStmt, entry targetEntry, astFile *ast.File) (bool, []dst.Stmt, error) {
+func (i *Injector) tryLiftSwitch(swStmt *dst.SwitchStmt, entry targetEntry, astFile *ast.File, dstFile *dst.File) (bool, []dst.Stmt, error) {
 	astSw, ok := entry.point.Stmt.(*ast.SwitchStmt)
 	if !ok || entry.point.Call == nil {
 		return false, nil, nil
 	}
 
-	// A: Init (call is inside the init statement)
 	if astSw.Init != nil && astNodeContainsCall(astSw.Init, entry.point.Call) {
 		if assign, ok := astSw.Init.(*ast.AssignStmt); ok {
 			entry.point.Assign = assign
 		}
-		res, err := i.liftControlInit(swStmt, swStmt.Init.(dst.Stmt), entry, astFile)
+		res, err := i.liftControlInit(swStmt, swStmt.Init.(dst.Stmt), entry, astFile, dstFile)
 		return true, res, err
 	}
 
-	// B: Tag (call is inside the tag expression)
 	if astSw.Tag != nil && astNodeContainsCall(astSw.Tag, entry.point.Call) {
-		res, err := i.liftControlExpr(swStmt, swStmt.Tag, entry, "tag", astFile, func(n dst.Node, e dst.Expr) {
+		res, err := i.liftControlExpr(swStmt, swStmt.Tag, entry, "tag", astFile, dstFile, func(n dst.Node, e dst.Expr) {
 			n.(*dst.SwitchStmt).Tag = e
 		})
 		return true, res, err
@@ -475,31 +471,35 @@ func (i *Injector) tryLiftSwitch(swStmt *dst.SwitchStmt, entry targetEntry, astF
 	return false, nil, nil
 }
 
-func (i *Injector) tryLiftTypeSwitch(ts *dst.TypeSwitchStmt, entry targetEntry, astFile *ast.File) (bool, []dst.Stmt, error) {
+func (i *Injector) tryLiftTypeSwitch(ts *dst.TypeSwitchStmt, entry targetEntry, astFile *ast.File, dstFile *dst.File) (bool, []dst.Stmt, error) {
 	astTs, ok := entry.point.Stmt.(*ast.TypeSwitchStmt)
 	if !ok || entry.point.Call == nil {
 		return false, nil, nil
 	}
 
-	// A: Init (call is inside the init statement)
 	if astTs.Init != nil && astNodeContainsCall(astTs.Init, entry.point.Call) {
 		if assign, ok := astTs.Init.(*ast.AssignStmt); ok {
 			entry.point.Assign = assign
 		}
-		res, err := i.liftControlInit(ts, ts.Init.(dst.Stmt), entry, astFile)
+		res, err := i.liftControlInit(ts, ts.Init.(dst.Stmt), entry, astFile, dstFile)
 		return true, res, err
 	}
 
-	// B: Assign (call is inside the type switch assign)
 	if astTs.Assign != nil && astNodeContainsCall(astTs.Assign, entry.point.Call) {
-		res, err := i.liftTypeSwitchAssign(ts, entry, astFile)
+		res, err := i.liftTypeSwitchAssign(ts, entry, astFile, dstFile)
 		return true, res, err
 	}
 
 	return false, nil, nil
 }
 
-// LogFallback applies non-error fallback handling for a single injection point.
+// LogFallback applies a fallback logging statement for unhandled errors.
+//
+// dstFile: The DST file.
+// astFile: The AST file.
+// point: The specific injection point.
+//
+// Returns true if changes were applied.
 func (i *Injector) LogFallback(dstFile *dst.File, astFile *ast.File, point analysis.InjectionPoint) (bool, error) {
 	if point.Stmt == nil {
 		return false, nil
@@ -545,15 +545,14 @@ func (i *Injector) LogFallback(dstFile *dst.File, astFile *ast.File, point analy
 	return applied, genErr
 }
 
-func (i *Injector) liftControlInit(controlStmt dst.Node, initStmt dst.Stmt, entry targetEntry, astFile *ast.File) ([]dst.Stmt, error) {
+func (i *Injector) liftControlInit(controlStmt dst.Node, initStmt dst.Stmt, entry targetEntry, astFile *ast.File, dstFile *dst.File) ([]dst.Stmt, error) {
 	dstCall := entry.dstCall
 	if dstCall == nil {
 		return nil, fmt.Errorf("failed to map call in init")
 	}
 
 	astCtx := i.getEnclosingContext(entry.point)
-	// Pass collapsed=false to ensure assignment remains separate from check
-	preamble, err := i.generateRewriteDST(entry.point, initStmt, dstCall, astCtx.sig, astCtx.decl, false, false)
+	preamble, err := i.generateRewriteDST(entry.point, initStmt, dstCall, astCtx.sig, astCtx.decl, false, false, dstFile)
 	if err != nil {
 		return nil, err
 	}
@@ -581,7 +580,7 @@ func (i *Injector) liftControlInit(controlStmt dst.Node, initStmt dst.Stmt, entr
 	return []dst.Stmt{block}, nil
 }
 
-func (i *Injector) liftControlExpr(controlStmt dst.Node, expr dst.Expr, entry targetEntry, varNameHint string, astFile *ast.File, setter func(dst.Node, dst.Expr)) ([]dst.Stmt, error) {
+func (i *Injector) liftControlExpr(controlStmt dst.Node, expr dst.Expr, entry targetEntry, varNameHint string, astFile *ast.File, dstFile *dst.File, setter func(dst.Node, dst.Expr)) ([]dst.Stmt, error) {
 	astCtx := i.getEnclosingContext(entry.point)
 	scope := i.getScope(entry.point.Pos, entry.point.File)
 	errName, _, _ := resolveErrorVarFunc(i, entry.point, scope)
@@ -626,20 +625,23 @@ func (i *Injector) liftControlExpr(controlStmt dst.Node, expr dst.Expr, entry ta
 	if i.TestParam != "" {
 		checkStmt = &dst.IfStmt{
 			Cond: &dst.BinaryExpr{X: dst.NewIdent(errName), Op: token.NEQ, Y: dst.NewIdent("nil")},
-			Body: i.generateTerminalHandlerDST(errName),
+			Body: i.generateTerminalHandlerDST(errName, dstFile),
 		}
 	} else {
 		zeroExprs, err := i.generateZeroReturns(entry.point, astCtx.sig, astCtx.decl)
 		if err != nil {
 			return nil, err
 		}
-		retExprs, _, err := RenderTemplateDST(i.ErrorTemplate, zeroExprs, errName, i.resolveFuncName(entry.point))
+		retExprs, imports, err := RenderTemplateDST(i.ErrorTemplate, zeroExprs, errName, i.resolveFuncName(entry.point))
 		if err != nil {
 			return nil, err
 		}
 		checkStmt = &dst.IfStmt{
 			Cond: &dst.BinaryExpr{X: dst.NewIdent(errName), Op: token.NEQ, Y: dst.NewIdent("nil")},
 			Body: &dst.BlockStmt{List: []dst.Stmt{&dst.ReturnStmt{Results: retExprs}}},
+		}
+		for _, imp := range imports {
+			i.addImportDST(dstFile, imp)
 		}
 	}
 
@@ -658,7 +660,7 @@ func (i *Injector) liftControlExpr(controlStmt dst.Node, expr dst.Expr, entry ta
 	return []dst.Stmt{block}, nil
 }
 
-func (i *Injector) liftTypeSwitchAssign(ts *dst.TypeSwitchStmt, entry targetEntry, astFile *ast.File) ([]dst.Stmt, error) {
+func (i *Injector) liftTypeSwitchAssign(ts *dst.TypeSwitchStmt, entry targetEntry, astFile *ast.File, dstFile *dst.File) ([]dst.Stmt, error) {
 	dstCall := entry.dstCall
 	if dstCall == nil {
 		return nil, fmt.Errorf("failed to map call in type switch")
@@ -680,20 +682,22 @@ func (i *Injector) liftTypeSwitchAssign(ts *dst.TypeSwitchStmt, entry targetEntr
 	if i.TestParam != "" {
 		checkStmt = &dst.IfStmt{
 			Cond: &dst.BinaryExpr{X: dst.NewIdent(errName), Op: token.NEQ, Y: dst.NewIdent("nil")},
-			Body: i.generateTerminalHandlerDST(errName),
+			Body: i.generateTerminalHandlerDST(errName, dstFile),
 		}
 	} else {
 		zeroExprs, _ := i.generateZeroReturns(entry.point, astCtx.sig, astCtx.decl)
-		retExprs, _, _ := RenderTemplateDST(i.ErrorTemplate, zeroExprs, errName, i.resolveFuncName(entry.point))
+		retExprs, imports, _ := RenderTemplateDST(i.ErrorTemplate, zeroExprs, errName, i.resolveFuncName(entry.point))
 		checkStmt = &dst.IfStmt{
 			Cond: &dst.BinaryExpr{X: dst.NewIdent(errName), Op: token.NEQ, Y: dst.NewIdent("nil")},
 			Body: &dst.BlockStmt{List: []dst.Stmt{&dst.ReturnStmt{Results: retExprs}}},
+		}
+		for _, imp := range imports {
+			i.addImportDST(dstFile, imp)
 		}
 	}
 
 	clonedTs := dst.Clone(ts).(*dst.TypeSwitchStmt)
 
-	// Update cloned switch
 	replaced := false
 	if assignStmt, ok := clonedTs.Assign.(*dst.AssignStmt); ok {
 		if ta, ok := assignStmt.Rhs[0].(*dst.TypeAssertExpr); ok {
@@ -735,8 +739,6 @@ func (i *Injector) replaceCursor(c *dstutil.Cursor, oldNode dst.Stmt, newNodes [
 	}
 }
 
-// transferTrivia copies decorations from the source statement to the beginning and end
-// of the replacement list to preserve comments and spacing.
 func (i *Injector) transferTrivia(src dst.Stmt, newStmts []dst.Stmt) {
 	if len(newStmts) == 0 {
 		return
@@ -755,15 +757,13 @@ func (i *Injector) transferTrivia(src dst.Stmt, newStmts []dst.Stmt) {
 	}
 }
 
-// generateRewriteDST creates the DST nodes for assignment and error checking.
-func (i *Injector) generateRewriteDST(point analysis.InjectionPoint, dstStmt dst.Stmt, dstCall *dst.CallExpr, sig *types.Signature, decl *ast.FuncDecl, collapsed bool, isTail bool) ([]dst.Stmt, error) {
+func (i *Injector) generateRewriteDST(point analysis.InjectionPoint, dstStmt dst.Stmt, dstCall *dst.CallExpr, sig *types.Signature, decl *ast.FuncDecl, collapsed bool, isTail bool, dstFile *dst.File) ([]dst.Stmt, error) {
 	useSig := i.supportsErrorReturn(sig, decl)
 
 	if !useSig && i.TestParam == "" {
-		return nil, nil // Cannot inject return if signature doesn't support error AND not in test
+		return nil, nil
 	}
 
-	// Extract DST Call from DST Stmt if not provided
 	if dstCall == nil {
 		dstCall = i.extractDstCall(dstStmt)
 	}
@@ -773,50 +773,45 @@ func (i *Injector) generateRewriteDST(point analysis.InjectionPoint, dstStmt dst
 	dstCallClone := dst.Clone(dstCall).(*dst.CallExpr)
 	astgen.ClearDecorations(dstCallClone)
 
-	// --- PASSTHROUGH OPTIMIZATION ---
-	// If this is a tail call and signatures match exactly, we inject 'return call()'
-	// Note: Passthrough optimization only valid if NOT in test context (where we want t.Fatal)
-	// AND NOT inside a loop (where return would break iteration semantics)
 	if isTail && i.TestParam == "" && sig != nil && point.Call != nil && i.signaturesMatch(sig, point.Call) {
 		if !i.isInsideLoop(point) {
 			return []dst.Stmt{
 				&dst.ReturnStmt{
-					Results: []dst.Expr{dstCallClone}, // CallExpr implements Expr
+					Results: []dst.Expr{dstCallClone},
 				},
 			}, nil
 		}
 	}
-	// -------------------------------
 
 	scope := i.getScope(point.Pos, point.File)
 	errName, tok, declStmt := resolveErrorVarFunc(i, point, scope)
 	funcName := i.resolveFuncName(point)
 
-	// Generate Assignment
 	assignStmt, err := generateAssignmentDSTFunc(i, point, dstCallClone, errName, tok)
 	if err != nil {
 		return nil, err
 	}
 
-	// Check Block
 	var handlerBlock *dst.BlockStmt
 
 	if i.TestParam != "" {
-		handlerBlock = i.generateTerminalHandlerDST(errName)
+		handlerBlock = i.generateTerminalHandlerDST(errName, dstFile)
 	} else {
-		// Generate Returns
 		zeroExprs, err := i.generateZeroReturns(point, sig, decl)
 		if err != nil {
 			return nil, err
 		}
 
-		retExprs, _, err := RenderTemplateDST(i.ErrorTemplate, zeroExprs, errName, funcName)
+		retExprs, imports, err := RenderTemplateDST(i.ErrorTemplate, zeroExprs, errName, funcName)
 		if err != nil {
 			return nil, err
 		}
 		retStmt := &dst.ReturnStmt{Results: retExprs}
 		handlerBlock = &dst.BlockStmt{
 			List: []dst.Stmt{retStmt},
+		}
+		for _, imp := range imports {
+			i.addImportDST(dstFile, imp)
 		}
 	}
 
@@ -848,7 +843,7 @@ func (i *Injector) generateRewriteDST(point analysis.InjectionPoint, dstStmt dst
 	return result, nil
 }
 
-func (i *Injector) generateGoRewriteDST(point analysis.InjectionPoint, goStmt *dst.GoStmt, dstCall *dst.CallExpr) (*dst.GoStmt, error) {
+func (i *Injector) generateGoRewriteDST(point analysis.InjectionPoint, goStmt *dst.GoStmt, dstCall *dst.CallExpr, dstFile *dst.File) (*dst.GoStmt, error) {
 	if dstCall == nil {
 		dstCall = dst.Clone(goStmt.Call).(*dst.CallExpr)
 	} else {
@@ -859,13 +854,12 @@ func (i *Injector) generateGoRewriteDST(point analysis.InjectionPoint, goStmt *d
 	errName := "err"
 	tok := token.DEFINE
 
-	// Assignment: err := call()
 	assignStmt, err := generateAssignmentDSTFunc(i, point, dstCall, errName, tok)
 	if err != nil {
 		return nil, err
 	}
 
-	handlerBlock := i.generateTerminalHandlerDST(errName)
+	handlerBlock := i.generateTerminalHandlerDST(errName, dstFile)
 
 	checkStmt := &dst.IfStmt{
 		Cond: &dst.BinaryExpr{
@@ -1037,7 +1031,7 @@ func (i *Injector) extractDstCall(stmt dst.Stmt) *dst.CallExpr {
 	return call
 }
 
-func (i *Injector) generateTerminalHandlerDST(errVar string) *dst.BlockStmt {
+func (i *Injector) generateTerminalHandlerDST(errVar string, dstFile *dst.File) *dst.BlockStmt {
 	var stmts []dst.Stmt
 
 	if i.TestParam != "" {
@@ -1067,6 +1061,8 @@ func (i *Injector) generateTerminalHandlerDST(errVar string) *dst.BlockStmt {
 			},
 		}
 	case "os-exit":
+		i.addImportDST(dstFile, "fmt")
+		i.addImportDST(dstFile, "os")
 		stmts = []dst.Stmt{
 			&dst.ExprStmt{
 				X: &dst.CallExpr{
@@ -1082,6 +1078,7 @@ func (i *Injector) generateTerminalHandlerDST(errVar string) *dst.BlockStmt {
 			},
 		}
 	default: // log-fatal
+		i.addImportDST(dstFile, "log")
 		stmts = []dst.Stmt{
 			&dst.ExprStmt{
 				X: &dst.CallExpr{
@@ -1282,8 +1279,9 @@ func astNodeContainsCall(root ast.Node, call *ast.CallExpr) bool {
 }
 
 func (i *Injector) addImportDST(file *dst.File, path string) {
+	pathStr := fmt.Sprintf(`"%s"`, path)
 	for _, imp := range file.Imports {
-		if imp.Path != nil && imp.Path.Value == fmt.Sprintf(`"%s"`, path) {
+		if imp.Path != nil && imp.Path.Value == pathStr {
 			return
 		}
 	}
@@ -1291,7 +1289,7 @@ func (i *Injector) addImportDST(file *dst.File, path string) {
 		Tok: token.IMPORT,
 		Specs: []dst.Spec{
 			&dst.ImportSpec{
-				Path: &dst.BasicLit{Kind: token.STRING, Value: fmt.Sprintf(`"%s"`, path)},
+				Path: &dst.BasicLit{Kind: token.STRING, Value: pathStr},
 			},
 		},
 	}

@@ -109,6 +109,11 @@ type traversalStep struct {
 }
 
 // determineStep calculates the structural relationship between an AST parent and child.
+//
+// parent: The parent AST node.
+// child: The child AST node.
+//
+// Returns the traversal step needed to reach the child from the parent.
 func determineStep(parent, child ast.Node) (traversalStep, error) {
 	val := reflect.ValueOf(parent)
 	if val.Kind() == reflect.Ptr {
@@ -119,7 +124,6 @@ func determineStep(parent, child ast.Node) (traversalStep, error) {
 		fieldVal := val.Field(i)
 		fieldType := val.Type().Field(i)
 		name := fieldType.Name
-
 		if fieldType.PkgPath != "" {
 			continue
 		}
@@ -147,6 +151,11 @@ func determineStep(parent, child ast.Node) (traversalStep, error) {
 }
 
 // applyStep traverses the DST node using the step instruction derived from the AST.
+//
+// node: The result node from the previous step.
+// step: The instruction on how to proceed.
+//
+// Returns the next node in the hierarchy.
 func applyStep(node dst.Node, step traversalStep) (dst.Node, error) {
 	val := reflect.ValueOf(node)
 	if val.Kind() == reflect.Ptr {
@@ -155,7 +164,7 @@ func applyStep(node dst.Node, step traversalStep) (dst.Node, error) {
 
 	fieldVal := val.FieldByName(step.FieldName)
 	if !fieldVal.IsValid() {
-		return nil, fmt.Errorf("DST node %T does not have field %q", node, step.FieldName)
+		return nil, fmt.Errorf("DST node %T does not have field %q (AST parent likely had it)", node, step.FieldName)
 	}
 
 	if step.Index >= 0 {
@@ -175,14 +184,21 @@ func applyStep(node dst.Node, step traversalStep) (dst.Node, error) {
 	if fieldVal.IsNil() {
 		return nil, fmt.Errorf("DST field %s is nil", step.FieldName)
 	}
+
 	res := fieldVal.Interface()
 	if resNode, ok := res.(dst.Node); ok {
 		return resNode, nil
 	}
+
 	return nil, fmt.Errorf("DST field %s is not a dst.Node (got %T)", step.FieldName, res)
 }
 
 // DecorateFile converts a standard Go AST file into a DST file, preserving comments/spacing.
+//
+// fset: The file set.
+// file: The AST file to decorate.
+//
+// Returns the decorated DST file.
 func DecorateFile(fset *token.FileSet, file *ast.File) (*dst.File, error) {
 	dec := decorator.NewDecorator(fset)
 	return dec.DecorateFile(file)

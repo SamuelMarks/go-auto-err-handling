@@ -21,13 +21,19 @@ var ensureNamedReturnsDST = refactor.EnsureNamedReturnsDST
 // If rewrite forces named returns in the function signature, it also performs normalization
 // of return statements to "naked" returns (assignment + return) to ensure consistency and correctness
 // with the deferred error masking.
+//
+// dstFile: The DST file to rewrite.
+// astFile: The AST file corresponding to the DST file.
+//
+// Returns true if changes were applied.
 func (i *Injector) RewriteDefers(dstFile *dst.File, astFile *ast.File) (bool, error) {
 	if dstFile == nil || astFile == nil {
 		return false, fmt.Errorf("files cannot be nil")
 	}
 
-	targets := make(map[*ast.FuncDecl][]*ast.DeferStmt)
-	litTargets := make(map[*ast.FuncLit][]*ast.DeferStmt)
+	// Phase 1: Scan AST to find candidates.
+	astTargets := make(map[*ast.FuncDecl][]*ast.DeferStmt)
+	astLitTargets := make(map[*ast.FuncLit][]*ast.DeferStmt)
 
 	type scopeCtx struct {
 		decl *ast.FuncDecl
@@ -48,9 +54,9 @@ func (i *Injector) RewriteDefers(dstFile *dst.File, astFile *ast.File) (bool, er
 				if len(stack) > 0 {
 					current := stack[len(stack)-1]
 					if current.decl != nil {
-						targets[current.decl] = append(targets[current.decl], deferStmt)
+						astTargets[current.decl] = append(astTargets[current.decl], deferStmt)
 					} else if current.lit != nil {
-						litTargets[current.lit] = append(litTargets[current.lit], deferStmt)
+						astLitTargets[current.lit] = append(astLitTargets[current.lit], deferStmt)
 					}
 				}
 			}
@@ -69,8 +75,24 @@ func (i *Injector) RewriteDefers(dstFile *dst.File, astFile *ast.File) (bool, er
 
 	applied := false
 
-	// Process FuncDecls
-	for astDecl, defers := range targets {
+	// Phase 2: Pre-resolve AST nodes to DST nodes.
+	// We MUST do this before any mutation (like adding imports or modifying signatures)
+	// because structural mutations can invalidate the index-based mapping FindDstNode relies on.
+
+	type resolvedDecl struct {
+		dstDecl   *dst.FuncDecl
+		dstDefers []*dst.DeferStmt
+	}
+	type resolvedLit struct {
+		dstLit    *dst.FuncLit
+		dstDefers []*dst.DeferStmt
+	}
+
+	mappedDecls := make(map[*ast.FuncDecl]resolvedDecl)
+	mappedLits := make(map[*ast.FuncLit]resolvedLit)
+
+	// Map FuncDecls
+	for astDecl, defers := range astTargets {
 		res, err := findDstNodeFunc(i.Fset, dstFile, astFile, astDecl)
 		if err != nil {
 			return applied, err
@@ -80,15 +102,58 @@ func (i *Injector) RewriteDefers(dstFile *dst.File, astFile *ast.File) (bool, er
 			continue
 		}
 
-		// Ensure named returns allows capturing the error in defer
+		var dstDefers []*dst.DeferStmt
+		for _, astDefer := range defers {
+			resDefer, err := findDstNodeFunc(i.Fset, dstFile, astFile, astDefer)
+			if err != nil {
+				continue
+			}
+			if dstDefer, ok := resDefer.Node.(*dst.DeferStmt); ok {
+				dstDefers = append(dstDefers, dstDefer)
+			}
+		}
+		mappedDecls[astDecl] = resolvedDecl{dstDecl, dstDefers}
+	}
+
+	// Map FuncLits
+	for astLit, defers := range astLitTargets {
+		res, err := findDstNodeFunc(i.Fset, dstFile, astFile, astLit)
+		if err != nil {
+			return applied, err
+		}
+		dstLit, ok := res.Node.(*dst.FuncLit)
+		if !ok {
+			continue
+		}
+
+		var dstDefers []*dst.DeferStmt
+		for _, astDefer := range defers {
+			resDefer, err := findDstNodeFunc(i.Fset, dstFile, astFile, astDefer)
+			if err != nil {
+				continue
+			}
+			if dstDefer, ok := resDefer.Node.(*dst.DeferStmt); ok {
+				dstDefers = append(dstDefers, dstDefer)
+			}
+		}
+		mappedLits[astLit] = resolvedLit{dstLit, dstDefers}
+	}
+
+	// Phase 3: Apply optimizations and rewrites using DST pointers.
+
+	// Process FuncDecls
+	for _, data := range mappedDecls {
+		dstDecl := data.dstDecl
+		if len(data.dstDefers) == 0 {
+			continue
+		}
+
 		changed, err := ensureNamedReturnsDST(dstDecl)
 		if err != nil {
 			return applied, err
 		}
 		if changed {
 			applied = true
-			// Normalize return statements to ensure the new named return variables are used correctly.
-			// Explicit returns (return 1, nil) are converted to (ret1 = 1; ret2 = nil; return).
 			i.normalizeToNakedReturns(dstDecl.Body, dstDecl.Type.Results)
 		}
 
@@ -97,19 +162,15 @@ func (i *Injector) RewriteDefers(dstFile *dst.File, astFile *ast.File) (bool, er
 			continue
 		}
 
-		if i.rewriteDefersInDST(dstDecl.Body, defers, astFile, dstFile, errName) {
+		if i.rewriteDstDefersList(dstDecl.Body, data.dstDefers, dstFile, errName) {
 			applied = true
 		}
 	}
 
 	// Process FuncLits
-	for astLit, defers := range litTargets {
-		res, err := findDstNodeFunc(i.Fset, dstFile, astFile, astLit)
-		if err != nil {
-			return applied, err
-		}
-		dstLit, ok := res.Node.(*dst.FuncLit)
-		if !ok {
+	for _, data := range mappedLits {
+		dstLit := data.dstLit
+		if len(data.dstDefers) == 0 {
 			continue
 		}
 
@@ -130,7 +191,7 @@ func (i *Injector) RewriteDefers(dstFile *dst.File, astFile *ast.File) (bool, er
 			continue
 		}
 
-		if i.rewriteDefersInDST(dstLit.Body, defers, astFile, dstFile, errName) {
+		if i.rewriteDstDefersList(dstLit.Body, data.dstDefers, dstFile, errName) {
 			applied = true
 		}
 	}
@@ -138,24 +199,35 @@ func (i *Injector) RewriteDefers(dstFile *dst.File, astFile *ast.File) (bool, er
 	return applied, nil
 }
 
+// rewriteDefersInDST is kept for legacy/internal compatibility if used elsewhere,
+// but RewriteDefers above is the main entry point.
 func (i *Injector) rewriteDefersInDST(body *dst.BlockStmt, astDefers []*ast.DeferStmt, astFile *ast.File, dstFile *dst.File, errName string) bool {
-	changed := false
+	// Fallback to on-the-fly resolution for legacy calls
+	var dstDefers []*dst.DeferStmt
 	for _, astDefer := range astDefers {
 		res, err := findDstNodeFunc(i.Fset, dstFile, astFile, astDefer)
-		if err != nil {
-			continue
+		if err == nil {
+			if dstDefer, ok := res.Node.(*dst.DeferStmt); ok {
+				dstDefers = append(dstDefers, dstDefer)
+			}
 		}
-		dstDefer, ok := res.Node.(*dst.DeferStmt)
-		if !ok {
-			continue
-		}
+	}
+	return i.rewriteDstDefersList(body, dstDefers, dstFile, errName)
+}
 
+func (i *Injector) rewriteDstDefersList(body *dst.BlockStmt, dstDefers []*dst.DeferStmt, dstFile *dst.File, errName string) bool {
+	changed := false
+	for _, dstDefer := range dstDefers {
 		newDefer := i.generateDeferRewriteDST(dstDefer.Call, errName)
-
 		if replaceDstStmt(body, dstDefer, newDefer) {
 			changed = true
 		}
 	}
+
+	if changed {
+		i.addImportDST(dstFile, "errors")
+	}
+
 	return changed
 }
 

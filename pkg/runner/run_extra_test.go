@@ -18,14 +18,14 @@ func TestRun_LoadAndAnalysisErrors(t *testing.T) {
 	hooks := saveRunnerHooks()
 	defer hooks.restore()
 
-	loadPackagesFn = func([]string, string) ([]*packages.Package, error) {
+	loadPackagesFn = func([]string, string, bool) ([]*packages.Package, error) {
 		return nil, errors.New("load boom")
 	}
 	if err := Run(Options{Paths: []string{"."}}); err == nil || !strings.Contains(err.Error(), "load failed") {
 		t.Fatalf("expected load failed error, got %v", err)
 	}
 
-	loadPackagesFn = func([]string, string) ([]*packages.Package, error) {
+	loadPackagesFn = func([]string, string, bool) ([]*packages.Package, error) {
 		return []*packages.Package{{}}, nil
 	}
 	detectFn = func([]*packages.Package, *filter.Filter, bool) ([]analysis.InjectionPoint, error) {
@@ -40,7 +40,7 @@ func TestRun_CheckBranches(t *testing.T) {
 	hooks := saveRunnerHooks()
 	defer hooks.restore()
 
-	loadPackagesFn = func([]string, string) ([]*packages.Package, error) {
+	loadPackagesFn = func([]string, string, bool) ([]*packages.Package, error) {
 		return []*packages.Package{{}}, nil
 	}
 	detectFn = func([]*packages.Package, *filter.Filter, bool) ([]analysis.InjectionPoint, error) {
@@ -62,14 +62,14 @@ func TestRun_NoPackagesAndNoChanges(t *testing.T) {
 	hooks := saveRunnerHooks()
 	defer hooks.restore()
 
-	loadPackagesFn = func([]string, string) ([]*packages.Package, error) {
+	loadPackagesFn = func([]string, string, bool) ([]*packages.Package, error) {
 		return []*packages.Package{}, nil
 	}
 	if err := Run(Options{Paths: []string{"."}}); err != nil {
 		t.Fatalf("expected no error for empty package list, got %v", err)
 	}
 
-	loadPackagesFn = func([]string, string) ([]*packages.Package, error) {
+	loadPackagesFn = func([]string, string, bool) ([]*packages.Package, error) {
 		return []*packages.Package{{}}, nil
 	}
 	detectFn = func([]*packages.Package, *filter.Filter, bool) ([]analysis.InjectionPoint, error) {
@@ -87,7 +87,7 @@ func TestRun_ApplyRefactorsAndIOErrors(t *testing.T) {
 	hooks := saveRunnerHooks()
 	defer hooks.restore()
 
-	loadPackagesFn = func([]string, string) ([]*packages.Package, error) {
+	loadPackagesFn = func([]string, string, bool) ([]*packages.Package, error) {
 		return []*packages.Package{{}}, nil
 	}
 	detectFn = func([]*packages.Package, *filter.Filter, bool) ([]analysis.InjectionPoint, error) {
@@ -132,7 +132,7 @@ func TestRun_PanicDstError(t *testing.T) {
 	hooks := saveRunnerHooks()
 	defer hooks.restore()
 
-	loadPackagesFn = func([]string, string) ([]*packages.Package, error) {
+	loadPackagesFn = func([]string, string, bool) ([]*packages.Package, error) {
 		fset, astFile := parseTestFile(t)
 		pkg := &packages.Package{
 			ID:     "p",

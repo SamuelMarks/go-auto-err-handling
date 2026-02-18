@@ -12,6 +12,11 @@ import (
 )
 
 // AddErrorToSignature modifies a function declaration signature to include an error return type.
+//
+// fset: The file set associated with the declaration.
+// decl: The function declaration to modify.
+//
+// Returns true if the signature was changed.
 func AddErrorToSignature(fset *token.FileSet, decl *ast.FuncDecl) (bool, error) {
 	if decl == nil {
 		return false, fmt.Errorf("function declaration is nil")
@@ -150,6 +155,10 @@ func AddErrorToSignature(fset *token.FileSet, decl *ast.FuncDecl) (bool, error) 
 }
 
 // AddErrorToSignatureDST modifies a DST function declaration signature to include an error return type.
+//
+// decl: The DST function declaration to modify.
+//
+// Returns true if the signature was changed.
 func AddErrorToSignatureDST(decl *dst.FuncDecl) (bool, error) {
 	if decl == nil {
 		return false, fmt.Errorf("function declaration is nil")
@@ -279,6 +288,10 @@ func AddErrorToSignatureDST(decl *dst.FuncDecl) (bool, error) {
 }
 
 // AddErrorToFuncTypeDST modifies a standalone DST function type signature.
+//
+// ft: The function type to modify.
+//
+// Returns true if modified.
 func AddErrorToFuncTypeDST(ft *dst.FuncType) (bool, error) {
 	if ft == nil {
 		return false, fmt.Errorf("ft is nil")
@@ -293,6 +306,12 @@ func AddErrorToFuncTypeDST(ft *dst.FuncType) (bool, error) {
 }
 
 // EnsureNamedReturns checks AST function declarations for unnamed return values and names them.
+//
+// fset: The file set.
+// decl: The function declaration.
+// info: The type info (optional, used for improved naming).
+//
+// Returns true if changes were made.
 func EnsureNamedReturns(fset *token.FileSet, decl *ast.FuncDecl, info *types.Info) (bool, error) {
 	if decl == nil {
 		return false, fmt.Errorf("function declaration is nil")
@@ -343,6 +362,10 @@ func EnsureNamedReturns(fset *token.FileSet, decl *ast.FuncDecl, info *types.Inf
 }
 
 // EnsureNamedReturnsDST checks DST function declarations for unnamed return values and names them.
+//
+// decl: The DST function declaration.
+//
+// Returns true if changes were made.
 func EnsureNamedReturnsDST(decl *dst.FuncDecl) (bool, error) {
 	if decl == nil {
 		return false, fmt.Errorf("function declaration is nil")

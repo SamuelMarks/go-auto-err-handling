@@ -123,7 +123,7 @@ func (i *Injector) RewritePanics(dstFile *dst.File, astFile *ast.File) (bool, er
 				continue
 			}
 
-			retStmt, err := i.generateReturnFromPanicDST(dstFn, dstPanicCall, astPanic)
+			retStmt, err := i.generateReturnFromPanicDST(dstFn, dstPanicCall, astPanic, dstFile)
 			if err != nil {
 				return applied, err
 			}
@@ -356,7 +356,7 @@ func (i *Injector) hasTrailingErrorReturnDST(fn *dst.FuncDecl) bool {
 	return false
 }
 
-func (i *Injector) generateReturnFromPanicDST(fn *dst.FuncDecl, panicCall *dst.CallExpr, astPanicCall *ast.CallExpr) (*dst.ReturnStmt, error) {
+func (i *Injector) generateReturnFromPanicDST(fn *dst.FuncDecl, panicCall *dst.CallExpr, astPanicCall *ast.CallExpr, dstFile *dst.File) (*dst.ReturnStmt, error) {
 	if len(panicCall.Args) == 0 {
 		return nil, fmt.Errorf("panic with no arguments not supported")
 	}
@@ -371,7 +371,7 @@ func (i *Injector) generateReturnFromPanicDST(fn *dst.FuncDecl, panicCall *dst.C
 	results := i.generateZerosFromDST(fn.Type)
 
 	// Determine if we need to wrap the error
-	errExpr := i.convertPanicArgToErrorDST(dstArg, astArg)
+	errExpr := i.convertPanicArgToErrorDST(dstArg, astArg, dstFile)
 
 	// The last result in 'results' should be the error slot.
 	// If the function returns (int, int, error), generateZerosFromDST produces (0, 0, nil).
@@ -442,7 +442,7 @@ func guessZeroDSTFromExpr(expr ast.Expr) dst.Expr {
 	return dst.NewIdent("nil")
 }
 
-func (i *Injector) convertPanicArgToErrorDST(dstArg dst.Expr, astArg ast.Expr) dst.Expr {
+func (i *Injector) convertPanicArgToErrorDST(dstArg dst.Expr, astArg ast.Expr, dstFile *dst.File) dst.Expr {
 	isError := false
 	isString := false
 
@@ -465,6 +465,8 @@ func (i *Injector) convertPanicArgToErrorDST(dstArg dst.Expr, astArg ast.Expr) d
 	if isError {
 		return dst.Clone(dstArg).(dst.Expr)
 	}
+
+	i.addImportDST(dstFile, "fmt")
 
 	sel := &dst.SelectorExpr{
 		X:   dst.NewIdent("fmt"),

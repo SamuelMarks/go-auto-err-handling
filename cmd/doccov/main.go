@@ -17,29 +17,53 @@ import (
 	"golang.org/x/tools/go/packages"
 )
 
+// coverageStats holds the documentation coverage statistics.
 type coverageStats struct {
-	Total       int
-	Documented  int
-	Percent     float64
-	Uncovered   int
+	// Total is the total number of exported identifiers found.
+	Total int
+	// Documented is the number of exported identifiers that have documentation.
+	Documented int
+	// Percent is the documentation coverage percentage (0-100).
+	Percent float64
+	// Uncovered is the number of exported identifiers missing documentation.
+	Uncovered int
+	// PackageDocs is the number of packages that have package-level documentation.
 	PackageDocs int
 }
 
+// missingDoc represents an exported identifier that lacks documentation.
 type missingDoc struct {
-	Pkg  string
+	// Pkg is the package path.
+	Pkg string
+	// File is the file path definition.
 	File string
+	// Kind is the type of identifier (e.g., func, type, var).
 	Kind string
+	// Name is the name of the identifier.
 	Name string
 }
 
+// main is the CLI entry point.
 func main() {
 	osExit(run(os.Args[1:], os.Stdout, os.Stderr))
 }
 
+// osExit is a hook for os.Exit to allow testing.
 var osExit = os.Exit
+
+// packagesLoad is a hook for packages.Load to allow testing.
 var packagesLoad = packages.Load
+
+// filepathRel is a hook for filepath.Rel to allow testing.
 var filepathRel = filepath.Rel
 
+// run executes the doccov command logic.
+//
+// args: The command line arguments (excluding the program name).
+// stdout: The writer for standard output.
+// stderr: The writer for standard error.
+//
+// Returns the exit code (0 for success, non-zero for error).
 func run(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("doccov", flag.ContinueOnError)
 	fs.SetOutput(stderr)
@@ -89,6 +113,11 @@ func run(args []string, stdout, stderr io.Writer) int {
 	return 0
 }
 
+// computeCoverage analyzes documentation coverage for the given directory.
+//
+// dir: The directory to analyze.
+//
+// Returns the coverage statistics, a list of missing documentation items, and any error encountered.
 func computeCoverage(dir string) (coverageStats, []missingDoc, error) {
 	cfg := &packages.Config{
 		Mode: packages.NeedName | packages.NeedFiles,
@@ -211,6 +240,11 @@ func computeCoverage(dir string) (coverageStats, []missingDoc, error) {
 	return stats, missing, nil
 }
 
+// parsePackageSyntax parses the Go files in a package to AST.
+//
+// pkg: The package to parse.
+//
+// Returns the AST files, FileSet, and any errors encountered during parsing.
 func parsePackageSyntax(pkg *packages.Package) ([]*ast.File, *token.FileSet, []string) {
 	if pkg == nil {
 		return nil, nil, nil
@@ -237,6 +271,12 @@ func parsePackageSyntax(pkg *packages.Package) ([]*ast.File, *token.FileSet, []s
 	return syntax, fset, parseErrs
 }
 
+// percent calculates the percentage of documented items.
+//
+// documented: The number of documented items.
+// total: The total number of items.
+//
+// Returns the percentage as a float (0-100).
 func percent(documented, total int) float64 {
 	if total == 0 {
 		return 100
@@ -244,6 +284,11 @@ func percent(documented, total int) float64 {
 	return (float64(documented) / float64(total)) * 100
 }
 
+// hasPackageDoc checks if any file in the package has package-level documentation.
+//
+// files: The list of AST files in the package.
+//
+// Returns true if package documentation is present.
 func hasPackageDoc(files []*ast.File) bool {
 	for _, file := range files {
 		if hasDoc(file.Doc) {
@@ -253,6 +298,11 @@ func hasPackageDoc(files []*ast.File) bool {
 	return false
 }
 
+// hasDoc checks if a comment group contains text.
+//
+// doc: The comment group to check.
+//
+// Returns true if the comment group is non-nil and not empty.
 func hasDoc(doc *ast.CommentGroup) bool {
 	if doc == nil {
 		return false
@@ -260,6 +310,11 @@ func hasDoc(doc *ast.CommentGroup) bool {
 	return strings.TrimSpace(doc.Text()) != ""
 }
 
+// funcKind returns the kind of function ("method" or "func").
+//
+// decl: The function declaration.
+//
+// Returns "method" if the function has a receiver, "func" otherwise.
 func funcKind(decl *ast.FuncDecl) string {
 	if decl.Recv != nil {
 		return "method"
@@ -267,6 +322,11 @@ func funcKind(decl *ast.FuncDecl) string {
 	return "func"
 }
 
+// valueKind returns the kind of value ("const" or "var").
+//
+// tok: The token type.
+//
+// Returns "const" for const declarations, "var" otherwise.
 func valueKind(tok token.Token) string {
 	if tok == token.CONST {
 		return "const"
@@ -274,6 +334,11 @@ func valueKind(tok token.Token) string {
 	return "var"
 }
 
+// packageDocFile returns the likely file path for package documentation.
+//
+// pkg: The package to inspect.
+//
+// Returns the path of the first file in the package or empty string.
 func packageDocFile(pkg *packages.Package) string {
 	if pkg == nil {
 		return ""
@@ -288,6 +353,12 @@ func packageDocFile(pkg *packages.Package) string {
 	return pkg.Fset.Position(pos).Filename
 }
 
+// fileForPos returns the filename for a given position.
+//
+// pkg: The package context.
+// pos: The token position.
+//
+// Returns the filename associated with the position.
 func fileForPos(pkg *packages.Package, pos token.Pos) string {
 	if pkg == nil || pkg.Fset == nil || pos == token.NoPos {
 		return ""
@@ -295,6 +366,12 @@ func fileForPos(pkg *packages.Package, pos token.Pos) string {
 	return pkg.Fset.Position(pos).Filename
 }
 
+// missingLess compares two missingDoc items for sorting.
+//
+// a: The first item.
+// b: The second item.
+//
+// Returns true if a < b.
 func missingLess(a, b missingDoc) bool {
 	if a.Pkg != b.Pkg {
 		return a.Pkg < b.Pkg
@@ -308,6 +385,11 @@ func missingLess(a, b missingDoc) bool {
 	return a.Name < b.Name
 }
 
+// printMissing outputs the list of missing documentation.
+//
+// stderr: The writer to print to.
+// missing: The list of missing documents.
+// root: The root directory for relative path calculation.
 func printMissing(stderr io.Writer, missing []missingDoc, root string) {
 	sort.Slice(missing, func(i, j int) bool {
 		return missingLess(missing[i], missing[j])

@@ -16,7 +16,7 @@ import (
 )
 
 type runnerHooks struct {
-	loadPackagesFn           func([]string, string) ([]*packages.Package, error)
+	loadPackagesFn           func([]string, string, bool) ([]*packages.Package, error)
 	detectFn                 func([]*packages.Package, *filter.Filter, bool) ([]analysis.InjectionPoint, error)
 	newInterfaceRegistryFn   func([]*packages.Package) *analysis.InterfaceRegistry
 	applyRefactorsFn         func(*dstManager, []analysis.InjectionPoint, Options, *analysis.InterfaceRegistry) (int, error)

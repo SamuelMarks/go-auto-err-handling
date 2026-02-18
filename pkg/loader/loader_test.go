@@ -4,6 +4,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"golang.org/x/tools/go/packages"
 )
 
 // TestLoadPackages verifies that the loader correctly identifies and parses a temporary Go module.
@@ -32,7 +34,7 @@ func main() {
 
 	// 2. Execute LoadPackages
 	patterns := []string{"."}
-	pkgs, err := LoadPackages(patterns, tmpDir)
+	pkgs, err := LoadPackages(patterns, tmpDir, false)
 	if err != nil {
 		t.Fatalf("LoadPackages returned unexpected error: %v", err)
 	}
@@ -90,7 +92,7 @@ func main() {}
 	}
 
 	// 3. Load with "." targeting the empty root
-	pkgs, err := LoadPackages([]string{"."}, tmpDir)
+	pkgs, err := LoadPackages([]string{"."}, tmpDir, false)
 	if err != nil {
 		t.Fatalf("LoadPackages failed: %v", err)
 	}
@@ -112,6 +114,32 @@ func main() {}
 	}
 }
 
+// TestLoadPackages_ExplicitRecursive verifies that recursive flag expands patterns.
+func TestLoadPackages_ExplicitRecursive(t *testing.T) {
+	orig := packagesLoad
+	defer func() { packagesLoad = orig }()
+
+	var captures []string
+	packagesLoad = func(cfg *packages.Config, patterns ...string) ([]*packages.Package, error) {
+		captures = append(captures, patterns...)
+		return []*packages.Package{}, nil
+	}
+
+	// Case: Recursive=true, Pattern="."
+	_, _ = LoadPackages([]string{"."}, "", true)
+	if len(captures) != 1 || captures[0] != "./..." {
+		t.Errorf("Expected expanded pattern './...', got %v", captures)
+	}
+
+	// Reset
+	captures = nil
+	// Case: Recursive=false, Pattern="."
+	_, _ = LoadPackages([]string{"."}, "", false)
+	if len(captures) != 1 || captures[0] != "." {
+		t.Errorf("Expected original pattern '.', got %v", captures)
+	}
+}
+
 // TestLoadPackages_WithSyntaxError verifies that the loader captures syntax errors
 // found in the target package, enabling the logging path in LoadPackages.
 func TestLoadPackages_WithSyntaxError(t *testing.T) {
@@ -130,7 +158,7 @@ func main() {
 		t.Fatalf("failed to write bad.go: %v", err)
 	}
 
-	pkgs, err := LoadPackages([]string{"."}, tmpDir)
+	pkgs, err := LoadPackages([]string{"."}, tmpDir, false)
 	if err != nil {
 		t.Fatalf("LoadPackages failed: %v", err)
 	}
@@ -152,7 +180,7 @@ func TestLoadPackages_ErrorHandling(t *testing.T) {
 	tmpDir := t.TempDir() // Empty dir, no go.mod
 
 	patterns := []string{"."}
-	pkgs, err := LoadPackages(patterns, tmpDir)
+	pkgs, err := LoadPackages(patterns, tmpDir, false)
 
 	// In standard go/packages behavior, running on an empty folder without modules might return an error
 	// or a package struct containing an error, depending on the environment.
