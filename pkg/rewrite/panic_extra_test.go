@@ -32,7 +32,7 @@ func TestIsTerminating_Cases(t *testing.T) {
 		{"switch-default-empty-case", &dst.SwitchStmt{Body: &dst.BlockStmt{List: []dst.Stmt{
 			&dst.CaseClause{List: nil, Body: []dst.Stmt{&dst.ReturnStmt{}}},
 			&dst.CaseClause{List: []dst.Expr{dst.NewIdent("2")}, Body: nil},
-		}}}, true},
+		}}}, false},
 		{"switch-non-case", &dst.SwitchStmt{Body: &dst.BlockStmt{List: []dst.Stmt{
 			&dst.EmptyStmt{},
 		}}}, false},

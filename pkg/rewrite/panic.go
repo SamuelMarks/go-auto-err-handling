@@ -258,11 +258,9 @@ func (i *Injector) isTerminating(stmt dst.Stmt) bool {
 			}
 			// Check list of statements in case
 			if len(cc.Body) == 0 {
-				if !hasDefault {
-					// empty case might fallthrough? No, implicit break.
-					// If empty, it doesn't terminate.
-					return false
-				}
+				// empty case has implicit break.
+				// If empty, it doesn't terminate.
+				return false
 			} else {
 				if !i.isTerminating(&dst.BlockStmt{List: cc.Body}) {
 					return false

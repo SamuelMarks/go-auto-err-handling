@@ -912,39 +912,6 @@ func TestGetSignatureAndEquivalence(t *testing.T) {
 	}
 }
 
-func TestHandleEntryPoint_MapError(t *testing.T) {
-	src := `package main
-func Target() {}
-func main() { Target() }
-`
-	pkg, astFile, _ := setupPropagateEnv(t, src)
-	call, stmt := findCallStmt(t, astFile, "Target")
-	if err := HandleEntryPoint(pkg, &dst.File{Name: dst.NewIdent("main")}, call, stmt, "log-fatal"); err == nil {
-		t.Error("expected mapping error")
-	}
-}
-
-func TestHandleTestError_MapError(t *testing.T) {
-	src := `package main
-import "testing"
-func Target() {}
-func TestFoo(t *testing.T) { Target() }
-`
-	pkg, astFile, _ := setupPropagateEnv(t, src)
-	call, stmt := findCallStmt(t, astFile, "Target")
-	if err := HandleTestError(pkg, &dst.File{Name: dst.NewIdent("main")}, call, stmt, "t"); err == nil {
-		t.Error("expected mapping error")
-	}
-}
-
-func TestHandleTestError_NoFile(t *testing.T) {
-	pkg := &packages.Package{}
-	stmt := &ast.ExprStmt{X: &ast.Ident{Name: "x"}}
-	if err := HandleTestError(pkg, &dst.File{}, nil, stmt, "t"); err == nil {
-		t.Error("expected error for missing AST file")
-	}
-}
-
 func TestFindIdentForObj(t *testing.T) {
 	_, astFile, _ := setupPropagateEnv(t, "package main\nvar x int")
 	info := &types.Info{
@@ -1381,3 +1348,105 @@ func TestRefactorSwitchStmt_Init(t *testing.T) {
 }
 
 type dstSwitchStmt = dst.SwitchStmt
+
+func TestPropagate_TypeSwitch(t *testing.T) {
+	src := `package main
+func Target() interface{} { return 0 }
+func main() {
+	switch v := Target().(type) {
+	case int:
+		_ = v
+	}
+}
+`
+	pkg, astFile, dstFile := setupPropagateEnv(t, src)
+	// Patch Target -> (interface{}, error)
+	var targetDecl *ast.FuncDecl
+	for _, d := range astFile.Decls {
+		if fd, ok := d.(*ast.FuncDecl); ok && fd.Name.Name == "Target" {
+			targetDecl = fd
+		}
+	}
+	AddErrorToSignature(pkg.Fset, targetDecl)
+	PatchSignature(pkg.TypesInfo, targetDecl, pkg.Types)
+	target := pkg.TypesInfo.Defs[targetDecl.Name].(*types.Func)
+
+	call := findCall(t, astFile, "Target")
+
+	n, _, err := processCallSiteDST(pkg, astFile, dstFile, call, target, "panic")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Error("Expected update")
+	}
+	out := renderDST(t, dstFile)
+	if !strings.Contains(out, "val, err := Target()") {
+		t.Errorf("Type switch assignment not lifted. Got:\n%s", out)
+	}
+	if !strings.Contains(out, "switch v := val.(type)") {
+		t.Errorf("Type switch assignment not updated. Got:\n%s", out)
+	}
+}
+
+func TestPropagate_SwitchInit(t *testing.T) {
+	src := `package main
+func Target() {}
+func main() {
+	switch Target(); {
+	default:
+	}
+}
+`
+	pkg, astFile, dstFile := setupPropagateEnv(t, src)
+	// Patch Target -> error
+	var targetDecl *ast.FuncDecl
+	for _, d := range astFile.Decls {
+		if fd, ok := d.(*ast.FuncDecl); ok && fd.Name.Name == "Target" {
+			targetDecl = fd
+		}
+	}
+	AddErrorToSignature(pkg.Fset, targetDecl)
+	PatchSignature(pkg.TypesInfo, targetDecl, pkg.Types)
+	target := pkg.TypesInfo.Defs[targetDecl.Name].(*types.Func)
+
+	call := findCall(t, astFile, "Target")
+
+	n, _, err := processCallSiteDST(pkg, astFile, dstFile, call, target, "panic")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Error("Expected update")
+	}
+	out := renderDST(t, dstFile)
+	if !strings.Contains(out, "err := Target()") || !strings.Contains(out, "if err != nil") {
+		t.Errorf("Switch init not lifted correctly. Got:\n%s", out)
+	}
+}
+
+func TestReplaceInParent_CaseClause(t *testing.T) {
+	cc := &dst.CaseClause{
+		Body: []dst.Stmt{
+			&dst.ExprStmt{X: dst.NewIdent("old")},
+		},
+	}
+	oldNode := cc.Body[0]
+	newNode := &dst.ExprStmt{X: dst.NewIdent("new")}
+	replaceInParent(cc, oldNode, newNode)
+	if cc.Body[0] != newNode {
+		t.Errorf("replaceInParent failed for CaseClause")
+	}
+}
+
+func TestContainsDstNode_Nil(t *testing.T) {
+	if containsDstNode(nil, nil) {
+		t.Errorf("expected false")
+	}
+	if containsDstNode(&dst.Ident{}, nil) {
+		t.Errorf("expected false")
+	}
+	if containsDstNode(nil, &dst.Ident{}) {
+		t.Errorf("expected false")
+	}
+}

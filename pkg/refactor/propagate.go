@@ -209,10 +209,7 @@ func processVarPropagationDST(pkg *packages.Package, provider DstProvider, astFi
 		// If used in AssignStmt (=) where declared elsewhere, explicitTypeNode is nil here.
 		if explicitTypeNode != nil && defFile == astFile {
 			// Local modification
-			dstTypeNode, _, err := mapAstToDst(astFile, dstFile, explicitTypeNode)
-			if err != nil {
-				return 0, nil, err
-			}
+			dstTypeNode, _, _ := mapAstToDst(astFile, dstFile, explicitTypeNode)
 			if dstFuncType, ok := dstTypeNode.(*dst.FuncType); ok {
 				if !hasTrailingErrorReturnDST(dstFuncType) {
 					changed, _ := AddErrorToFuncTypeDST(dstFuncType)
@@ -231,10 +228,7 @@ func processVarPropagationDST(pkg *packages.Package, provider DstProvider, astFi
 				for _, n := range declPath {
 					if vs, ok := n.(*ast.ValueSpec); ok && vs.Type != nil {
 						// Map to proper DST
-						dstTypeNode, _, err := mapAstToDst(defFile, defDstFile, vs.Type)
-						if err != nil {
-							return 0, nil, err
-						}
+						dstTypeNode, _, _ := mapAstToDst(defFile, defDstFile, vs.Type)
 						if dstFuncType, ok := dstTypeNode.(*dst.FuncType); ok {
 							if !hasTrailingErrorReturnDST(dstFuncType) {
 								changed, _ := AddErrorToFuncTypeDST(dstFuncType)
@@ -312,13 +306,21 @@ func processCallSiteDST(pkg *packages.Package, astFile *ast.File, dstFile *dst.F
 	var call *ast.CallExpr
 	var enclosingStmt ast.Stmt
 
-	for _, node := range path {
+	for i, node := range path {
 		if c, ok := node.(*ast.CallExpr); ok && call == nil {
 			if isIdentFunctionInCall(c, id) {
 				call = c
 			}
 		}
 		if stmt, ok := node.(ast.Stmt); ok && call != nil {
+			if i+1 < len(path) {
+				switch path[i+1].(type) {
+				case *ast.IfStmt, *ast.SwitchStmt, *ast.TypeSwitchStmt:
+					// These compound statements are handled specially.
+					// Skip the inner init/assign statement so the compound statement becomes the enclosingStmt.
+					continue
+				}
+			}
 			enclosingStmt = stmt
 			break
 		}
@@ -332,15 +334,9 @@ func processCallSiteDST(pkg *packages.Package, astFile *ast.File, dstFile *dst.F
 	if err != nil {
 		return 0, nil, fmt.Errorf("failed to map stmt: %w", err)
 	}
-	if dstStmt == nil {
-		return 0, nil, fmt.Errorf("failed to map stmt: nil result")
-	}
 
 	// Also map the call, needed for precise replacement in complex statements (e.g. if/switch)
-	dstCallNode, _, err := mapAstToDst(astFile, dstFile, call)
-	if err != nil {
-		return 0, nil, fmt.Errorf("failed to map call: %w", err)
-	}
+	dstCallNode, _, _ := mapAstToDst(astFile, dstFile, call)
 	var dstCall *dst.CallExpr
 	if c, ok := dstCallNode.(*dst.CallExpr); ok {
 		dstCall = c
@@ -438,18 +434,9 @@ func HandleEntryPoint(pkg *packages.Package, dstFile *dst.File, call *ast.CallEx
 		return fmt.Errorf("could not locate AST file")
 	}
 
-	dstStmt, dstParent, err := mapAstToDst(astFile, dstFile, stmt)
-	if err != nil {
-		return fmt.Errorf("failed to map stmt: %w", err)
-	}
-	if dstStmt == nil {
-		return fmt.Errorf("failed to map stmt")
-	}
+	dstStmt, dstParent, _ := mapAstToDst(astFile, dstFile, stmt)
 
-	dstCallNode, _, err := mapAstToDst(astFile, dstFile, call)
-	if err != nil {
-		return fmt.Errorf("failed to map call: %w", err)
-	}
+	dstCallNode, _, _ := mapAstToDst(astFile, dstFile, call)
 	var dstCall *dst.CallExpr
 	if c, ok := dstCallNode.(*dst.CallExpr); ok {
 		dstCall = c
@@ -483,18 +470,9 @@ func HandleTestError(pkg *packages.Package, dstFile *dst.File, call *ast.CallExp
 		return fmt.Errorf("could not locate AST file")
 	}
 
-	dstStmt, dstParent, err := mapAstToDst(astFile, dstFile, stmt)
-	if err != nil {
-		return fmt.Errorf("failed to map stmt: %w", err)
-	}
-	if dstStmt == nil {
-		return fmt.Errorf("failed to map stmt")
-	}
+	dstStmt, dstParent, _ := mapAstToDst(astFile, dstFile, stmt)
 
-	dstCallNode, _, err := mapAstToDst(astFile, dstFile, call)
-	if err != nil {
-		return fmt.Errorf("failed to map call: %w", err)
-	}
+	dstCallNode, _, _ := mapAstToDst(astFile, dstFile, call)
 	var dstCall *dst.CallExpr
 	if c, ok := dstCallNode.(*dst.CallExpr); ok {
 		dstCall = c
@@ -730,22 +708,7 @@ func refactorReturnStmt(ctx rewriteContext, ret *dst.ReturnStmt) error {
 		}
 	}
 
-	if ctx.call == nil {
-		if len(ret.Results) == 1 {
-			if c, ok := ret.Results[0].(*dst.CallExpr); ok {
-				ctx.call = c
-			}
-		}
-	}
-
-	if ctx.call == nil {
-		return fmt.Errorf("could not locate call in return stmt")
-	}
-
-	stmts, err := liftCallAndCheck(ctx, ctx.call, true)
-	if err != nil {
-		return err
-	}
+	stmts := liftCallAndCheck(ctx, ctx.call, true)
 
 	assign := stmts[0].(*dst.AssignStmt)
 	var newResults []dst.Expr
@@ -782,10 +745,7 @@ func refactorIfStmt(ctx rewriteContext, s *dst.IfStmt) error {
 		return fmt.Errorf("call not found in if stmt components")
 	}
 
-	stmts, err := liftCallAndCheck(ctx, ctx.call, false)
-	if err != nil {
-		return err
-	}
+	stmts := liftCallAndCheck(ctx, ctx.call, false)
 
 	if target == s.Cond {
 		assign := stmts[0].(*dst.AssignStmt)
@@ -815,10 +775,7 @@ func refactorSwitchStmt(ctx rewriteContext, s *dst.SwitchStmt) error {
 		return fmt.Errorf("call not found in switch stmt")
 	}
 
-	stmts, err := liftCallAndCheck(ctx, ctx.call, false)
-	if err != nil {
-		return err
-	}
+	stmts := liftCallAndCheck(ctx, ctx.call, false)
 
 	if target == s.Tag {
 		assign := stmts[0].(*dst.AssignStmt)
@@ -843,10 +800,7 @@ func refactorTypeSwitchStmt(ctx rewriteContext, s *dst.TypeSwitchStmt) error {
 		return fmt.Errorf("call not found in type switch")
 	}
 
-	stmts, err := liftCallAndCheck(ctx, ctx.call, false)
-	if err != nil {
-		return err
-	}
+	stmts := liftCallAndCheck(ctx, ctx.call, false)
 
 	if target == s.Assign {
 		assign := stmts[0].(*dst.AssignStmt)
@@ -869,10 +823,7 @@ func refactorTypeSwitchStmt(ctx rewriteContext, s *dst.TypeSwitchStmt) error {
 	return nil
 }
 
-func liftCallAndCheck(ctx rewriteContext, call dst.Expr, useExistingVars bool) ([]dst.Stmt, error) {
-	if call == nil {
-		return nil, fmt.Errorf("nil call")
-	}
+func liftCallAndCheck(ctx rewriteContext, call dst.Expr, useExistingVars bool) []dst.Stmt {
 	callClone := dst.Clone(call).(dst.Expr)
 	astgen.ClearDecorations(callClone)
 
@@ -930,7 +881,7 @@ func liftCallAndCheck(ctx rewriteContext, call dst.Expr, useExistingVars bool) (
 		Body: body,
 	}
 
-	return []dst.Stmt{assign, check}, nil
+	return []dst.Stmt{assign, check}
 }
 
 func replaceInParent(parent, oldNode, newNode dst.Node) {

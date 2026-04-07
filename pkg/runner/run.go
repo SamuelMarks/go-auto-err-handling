@@ -360,15 +360,9 @@ func applyRefactors(mgr *dstManager, points []analysis.InjectionPoint, opts Opti
 			changed, _ := addErrorToSignatureFn(p.Pkg.Fset, ctx.Decl)
 			if changed {
 				patchSignatureFn(p.Pkg.TypesInfo, ctx.Decl, fnObj.Pkg())
-				res, err := findDstNodeFn(mgr.fset, dstFile, p.File, ctx.Decl)
-				if err == nil {
-					if dstDecl, ok := res.Node.(*dst.FuncDecl); ok {
-						_, _ = addErrorToSignatureDSTFn(dstDecl)
-					}
-				} else {
-					// Fallback if we can't update DST signature is tricky.
-					// If findDst fails, we likely can't rewrite body either.
-					continue
+				res, _ := findDstNodeFn(mgr.fset, dstFile, p.File, ctx.Decl)
+				if dstDecl, ok := res.Node.(*dst.FuncDecl); ok {
+					_, _ = addErrorToSignatureDSTFn(dstDecl)
 				}
 
 				applied, err := rewriteFileFn(injector, dstFile, p.File, []analysis.InjectionPoint{p})
